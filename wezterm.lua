@@ -492,6 +492,11 @@ local attention_elsewhere
 -- wait on git. Throttled inside, so this costs nothing on the ticks in between.
 local ws_git_refresh
 
+-- Also assigned down there: stamps the workspace you are looking at, which is what gives
+-- LEADER+w its alt-tab order. The status bar is the only thing that fires often enough to
+-- notice you arriving by any route - the picker, LEADER+n/p, or clicking a window.
+local ws_touch
+
 wezterm.on("update-right-status", function(window, _)
 	local parts = {}
 	local width = 0
@@ -530,6 +535,15 @@ wezterm.on("update-right-status", function(window, _)
 	-- from the last snapshot, so the snapshot has to already exist.
 	if ws_git_refresh then
 		ws_git_refresh()
+	end
+
+	if ws_touch then
+		local ok, focused = pcall(function()
+			return window:is_focused()
+		end)
+		if ok and focused then
+			ws_touch(window:active_workspace())
+		end
 	end
 
 	local workspace = window:active_workspace()
@@ -1362,6 +1376,12 @@ end
 -- of what busy means; and a single number could not say whether six chats were blocked, done
 -- or cold, which is the only thing you press this key to find out.
 --
+-- The order is alt-tab: most recently used first, so row one is the workspace you just came
+-- from and LEADER+w Enter flips back to it. Deliberately not ranked by who wants you - a list
+-- that reorders itself between presses cannot be learned, and the glyph and its colour say
+-- who wants you without moving anything. The workspace you are in sits at the bottom, out of
+-- the way, for the same reason alt-tab starts on the second window rather than the first.
+--
 -- Nothing here forks. Every count comes from the mux and from the state files under
 -- ~/.claude/wezterm-state that pane_status already reads for the tab bar, so the picker
 -- opens in the time it takes to draw. Reading pane screens is what would make it accurate
@@ -1374,9 +1394,10 @@ end
 -- work goes.
 -- ============================================================
 
--- Drawn, and ranked, in the order NEED puts them: whatever wants you most first, so reading
--- down the ⚠ column is the whole decision. "ended" is pane_status's stale split in two,
--- because a session that has exited is a pane to close rather than a chat to go back to.
+-- Drawn in the order NEED ranks them, whatever wants you most first, so the ⚠ column is
+-- always in the same place and the row it is on is the only thing that changes. "ended" is
+-- pane_status's stale split in two, because a session that has exited is a pane to close
+-- rather than a chat to go back to.
 local WS_STATES = {
 	{ key = "asking", glyph = "⚠", colour = TAB_COLOURS.asking },
 	{ key = "fresh", glyph = "✓", colour = TAB_COLOURS.fresh },
@@ -1396,6 +1417,57 @@ local WS_GIT_W = 22
 ---zero, so two of them cannot run together.
 local function ws_pad(used, target)
 	return string.rep(" ", math.max(1, target - used))
+end
+
+-- Most recent first. Kept in a file rather than in memory because editing this config
+-- re-evaluates it, and an in-memory order would reset to alphabetical on every save - which
+-- is the one thing an alt-tab order cannot do.
+local ws_mru_path = wezterm.home_dir .. "/.claude/cache/wezterm-mru"
+local WS_MRU_MAX = 40
+local ws_mru
+
+local function ws_mru_read()
+	if ws_mru ~= nil then
+		return ws_mru
+	end
+	ws_mru = {}
+	local file = io.open(ws_mru_path, "r")
+	if file then
+		for line in file:lines() do
+			if line ~= "" then
+				table.insert(ws_mru, line)
+			end
+		end
+		file:close()
+	end
+	return ws_mru
+end
+
+---Move a workspace to the front, and write it out only when the front actually changed: this
+---runs once a second off the status bar.
+ws_touch = function(ws)
+	if ws == nil or ws == "" then
+		return
+	end
+	local list = ws_mru_read()
+	if list[1] == ws then
+		return
+	end
+	for i, name in ipairs(list) do
+		if name == ws then
+			table.remove(list, i)
+			break
+		end
+	end
+	table.insert(list, 1, ws)
+	while #list > WS_MRU_MAX do
+		table.remove(list)
+	end
+	local file = io.open(ws_mru_path, "w")
+	if file then
+		file:write(table.concat(list, "\n") .. "\n")
+		file:close()
+	end
 end
 
 ---One directory per workspace: whatever its first pane is sitting in. They nearly all share
@@ -1494,7 +1566,7 @@ workspace_picker = function(window, pane)
 
 	local function room(ws)
 		if rooms[ws] == nil then
-			local r = { chats = 0, weight = -1, at = 0, topic = "" }
+			local r = { chats = 0, named = -1, weight = -1, at = 0, topic = "" }
 			for _, st in ipairs(WS_STATES) do
 				r[st.key] = 0
 			end
@@ -1529,12 +1601,18 @@ workspace_picker = function(window, pane)
 					if status ~= "ended" then
 						r.chats = r.chats + 1
 					end
-					-- The loudest session speaks for the workspace; among equals the one that
-					-- moved most recently, since that is the thread you were actually on.
+					-- Which session speaks for the workspace: a titled one first, since "new" as a
+					-- topic says less than the counts beside it already do, then the loudest,
+					-- then the one that moved most recently - the thread you were actually on.
+					local label = pane_label({ title = title })
 					local weight = NEED[status] or 0
+					local named = (label ~= nil and label ~= "new") and 1 or 0
 					local at = (rec and rec.at) or 0
-					if weight > r.weight or (weight == r.weight and at > r.at) then
-						local label = pane_label({ title = title })
+					if named > r.named
+						or (named == r.named and weight > r.weight)
+						or (named == r.named and weight == r.weight and at > r.at)
+					then
+						r.named = named
 						r.weight = weight
 						r.at = at
 						r.topic = label or r.topic
@@ -1544,19 +1622,36 @@ workspace_picker = function(window, pane)
 		end
 	end
 
-	-- First count that differs decides, in WS_STATES order: six blocked chats beats one
-	-- blocked chat, and any blocked chat beats a workspace that only has finished ones.
+	local current = window:active_workspace()
+
+	-- Alt-tab: where you have been, most recent first, then a fixed tail of everywhere you
+	-- have not, then where you already are.
+	local rank = {}
+	for i, name in ipairs(ws_mru_read()) do
+		if rank[name] == nil then
+			rank[name] = i
+		end
+	end
 	table.sort(order, function(a, b)
-		local x, y = rooms[a], rooms[b]
-		for _, st in ipairs(WS_STATES) do
-			if x[st.key] ~= y[st.key] then
-				return x[st.key] > y[st.key]
-			end
+		if (a == current) ~= (b == current) then
+			return b == current -- you are already there
+		end
+		local ra, rb = rank[a], rank[b]
+		if (ra ~= nil) ~= (rb ~= nil) then
+			return ra ~= nil -- somewhere you have been beats somewhere you have not
+		end
+		if ra and rb then
+			return ra < rb
+		end
+		-- Not visited yet, so nothing to be recent about: chats first, then the empties,
+		-- which are somewhere to start work rather than somewhere to go back to.
+		local ca, cb = rooms[a].chats > 0, rooms[b].chats > 0
+		if ca ~= cb then
+			return ca
 		end
 		return a < b
 	end)
 
-	local current = window:active_workspace()
 	local dirs = workspace_dirs()
 	local git = read_git_snapshot()
 	local choices = {}
@@ -1581,7 +1676,7 @@ workspace_picker = function(window, pane)
 			{ Foreground = { Color = colour } },
 			{ Text = marker .. " " },
 			{ Foreground = { Color = r.chats > 0 and colour or TAB_COLOURS.stale } },
-			{ Text = fleet_pad((ws == current and "▸ " or "  ") .. ws, WS_NAME_W) },
+			{ Text = (ws == current and "▸ " or "  ") .. ws .. ws_pad(2 + #ws, WS_NAME_W) },
 			{ Foreground = { Color = TAB_COLOURS.index } },
 			{ Text = fleet_pad(detail, WS_COUNT_W) },
 		}
@@ -1596,14 +1691,16 @@ workspace_picker = function(window, pane)
 			end
 		end
 
+		-- The dirty count is never the part to drop, so the branch is measured against what
+		-- is left after it: a long branch name loses its tail rather than pushing the topic.
 		local repo = git[dirs[ws] or ""]
 		local git_text, git_w = "", 0
 		if repo then
-			git_text = shorten(repo.branch, WS_GIT_W - 5)
-			git_w = #git_text - (git_text:sub(-3) == "…" and 2 or 0)
+			local dirty_w = repo.dirty > 0 and (2 + #tostring(repo.dirty)) or 0
+			git_text = shorten(repo.branch, WS_GIT_W - 1 - dirty_w)
+			git_w = #git_text - (git_text:sub(-3) == "…" and 2 or 0) + dirty_w
 			if repo.dirty > 0 then
 				git_text = git_text .. " ✎" .. repo.dirty
-				git_w = git_w + 2 + #tostring(repo.dirty)
 			end
 		end
 		table.insert(label, { Foreground = { Color = TAB_COLOURS.index } })
@@ -1611,8 +1708,11 @@ workspace_picker = function(window, pane)
 
 		-- The topic last, so fuzzy matching reaches it: "wezterm" finds the desk the wezterm
 		-- work is on without you remembering what that workspace ended up being called.
-		table.insert(label, { Foreground = { Color = marker == "·" and TAB_COLOURS.stale or TAB_COLOURS.active } })
-		table.insert(label, { Text = r.topic })
+		if r.topic ~= "" then
+			local cold = r.weight <= NEED.stale
+			table.insert(label, { Foreground = { Color = cold and TAB_COLOURS.stale or TAB_COLOURS.active } })
+			table.insert(label, { Text = r.topic })
+		end
 
 		table.insert(choices, { id = ws, label = wezterm.format(label) })
 	end
@@ -1620,7 +1720,7 @@ workspace_picker = function(window, pane)
 	window:perform_action(
 		act.InputSelector({
 			title = "Workspaces",
-			description = "⚠ blocked · ✓ just finished · ✳ waiting on you · ◐ working · · cold",
+			description = "Alt-tab order. ⚠ blocked · ✓ just finished · ✳ waiting on you · ◐ working · · cold · › exited",
 			fuzzy = true,
 			fuzzy_description = "workspace: ",
 			choices = choices,
@@ -1628,6 +1728,7 @@ workspace_picker = function(window, pane)
 				if not ws then
 					return
 				end
+				ws_touch(ws) -- the status bar would catch this a second later; do not wait
 				-- A workspace with a GUI window of its own gets raised; one whose mux
 				-- window is detached, or a name typed into the picker, falls through to a
 				-- switch in the current window.
