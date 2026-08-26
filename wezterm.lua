@@ -1758,6 +1758,31 @@ workspace_picker = function(window, pane)
 	ws_git_refresh()
 end
 
+-- Zoom hides every pane but one, so a board opened into a zoomed tab would be invisible and
+-- the next press would open a second one.
+local function tab_is_zoomed(tab)
+	for _, p in ipairs(tab:panes_with_info()) do
+		if p.is_zoomed then
+			return true
+		end
+	end
+	return false
+end
+
+-- The far left of the tab, however the tab is arranged. Splitting off this pane rather than
+-- off the focused one is what puts the board down the left edge instead of wherever you
+-- happened to be standing when you pressed the key.
+local function leftmost_pane(tab)
+	local best, found
+	for _, p in ipairs(tab:panes_with_info()) do
+		if not best or p.left < best.left or (p.left == best.left and p.top < best.top) then
+			best = p
+			found = p.pane
+		end
+	end
+	return found
+end
+
 -- A tab with nothing ongoing in it is somewhere the board can just live, rather than
 -- somewhere it has to make room. "Ongoing" means a pane actually running Claude: a tab of
 -- shells, or one whose sessions have exited, is scratch space.
@@ -1779,10 +1804,21 @@ table.insert(config.keys, {
 	action = wezterm.action_callback(function(window, pane)
 		local tab = window:active_tab()
 		local open = board_in_tab(tab)
+		-- Zoomed on something else, so the board may be there and hidden. Unzoom and look
+		-- again rather than opening a second one on top of it.
+		if not open and tab_is_zoomed(tab) then
+			pcall(function()
+				tab:set_zoomed(false)
+			end)
+			open = board_in_tab(tab)
+		end
 
 		-- One key both ways. Quitting rather than killing, because the board may be running
 		-- in a shell pane that was already there and is not ours to close.
 		if open then
+			pcall(function()
+				tab:set_zoomed(false)
+			end)
 			pcall(function()
 				open:send_text("q")
 			end)
@@ -1807,27 +1843,46 @@ table.insert(config.keys, {
 			return
 		end
 
-		-- A plain left split of the focused pane. A top_level split - a full-height column
-		-- down the left of the whole tab - reads better and was the first attempt, but
-		-- wezterm redistributes the reclaimed width unevenly and can wedge the tab: three
-		-- of four panes collapsed to a single column, adjust-pane-size snapped straight
-		-- back, and further splits failed with "No space for split!" until the window was
-		-- resized. Not worth risking a tab of live work for a nicer default.
+		-- Split off the leftmost pane rather than the focused one, so the board is the left
+		-- hand column of the tab wherever you were standing, and zoom it: full width is the
+		-- size you actually read the fleet at, and LEADER+z drops back to the tab with the
+		-- board still down its left edge.
 		--
-		-- So the board takes half of the pane you are on and leaves the rest alone. That is
-		-- narrow in a four-way split, which is why the board drops to its compact layout
-		-- under 88 columns, and why LEADER+z is the answer when you want it big. Unzoomed
-		-- on purpose: zoom is a thing to reach for, not a thing to arrive in.
+		-- Not a top_level split, which is the obvious way to get a full height column and
+		-- the way that wedged a live tab: wezterm redistributes the reclaimed width
+		-- unevenly, three of four panes collapsed to a single column, adjust-pane-size
+		-- snapped straight back, and further splits failed with "No space for split!" until
+		-- the window was resized.
+		local host = leftmost_pane(tab) or pane
+		local board
 		local ok = pcall(function()
-			pane:split({
+			board = host:split({
 				direction = "Left",
 				args = { "/bin/zsh", "-lc", board_script },
 				set_environment_variables = env,
 			})
 		end)
+		-- The leftmost pane can be too narrow to halve. The pane you are on is a worse
+		-- place for it but a better one than a toast saying no.
+		if not ok and host ~= pane then
+			ok = pcall(function()
+				board = pane:split({
+					direction = "Left",
+					args = { "/bin/zsh", "-lc", board_script },
+					set_environment_variables = env,
+				})
+			end)
+		end
 		if not ok then
 			window:toast_notification("wezterm", "could not open the board", nil, 2000)
+			return
 		end
+		pcall(function()
+			if board then
+				board:activate()
+			end
+			tab:set_zoomed(true)
+		end)
 	end),
 })
 

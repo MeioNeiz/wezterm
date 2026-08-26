@@ -117,7 +117,8 @@ Grouping starts from the tab a session physically sits in, so the view is your o
 t cycles it: tab, then state, then the prefix before a colon in the session name, which is
 an axis you create yourself with /rename billing:invoices.
 
-In wezterm LEADER+b brings this up and puts it away; LEADER+; is the quick fuzzy jump.
+In wezterm LEADER+b opens this zoomed down the left of the tab and puts it away again;
+LEADER+z unzooms to the tab with the board still beside it, LEADER+; is the quick fuzzy jump.
 USAGE
 }
 
