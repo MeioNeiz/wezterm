@@ -158,6 +158,9 @@ work=$(mktemp -d) || exit 1
 ALTSCREEN=false
 CURSOR_HIDDEN=false
 cleanup() {
+	# esc_tail leaves the terminal raw for a tenth of a second at a time, so a kill landing
+	# inside one would otherwise hand back a tty with no echo and no line editing.
+	[[ -n ${TTY_SAVED:-} ]] && stty "$TTY_SAVED" </dev/tty 2>/dev/null
 	$CURSOR_HIDDEN && printf '\033[?25h'
 	$ALTSCREEN && printf '\033[?1049l'
 	rm -rf "$work"
@@ -1590,11 +1593,30 @@ fi
 ORIGIN=${CC_BOARD_ORIGIN:-}
 
 # ESC arrives both as a key in its own right and as the head of an arrow sequence, so a lone
-# ESC is only ESC once the follow-up read has timed out. This bash takes whole seconds only,
-# so that wait is a second; arrow bytes arrive together and return at once, and q is there
-# for anyone who does not want to wait for Escape.
+# ESC is only ESC once the follow-up read has come up empty.
+#
+# That wait used to be a second, because bash 3.2's read -t takes whole seconds and rejects
+# a fraction, and it is not fixable by asking the terminal driver to wait in tenths either:
+# bash forces VMIN 1 VTIME 0 for any read of its own with -n or -s, whatever stty last said.
+# So the tail is read by dd under VTIME instead. A tenth of a second is far longer than the
+# gap between bytes the terminal wrote in one go, and far shorter than anyone notices; an
+# arrow comes back at once because its tail is already buffered. Three forks, but only on a
+# keypress that starts with an escape.
+TTY_SAVED=""
+ESCTAIL=""
+esc_tail() {
+	ESCTAIL=""
+	if [[ -z $TTY_SAVED ]]; then
+		IFS= read -rsn2 -t 1 ESCTAIL
+		return
+	fi
+	stty -icanon -echo min 0 time 1 </dev/tty 2>/dev/null
+	ESCTAIL=$(dd bs=16 count=1 </dev/tty 2>/dev/null)
+	stty "$TTY_SAVED" </dev/tty 2>/dev/null
+}
+
 read_key() {
-	local timeout=$1 k rest
+	local timeout=$1 k
 	if [[ -n $timeout ]]; then
 		IFS= read -rsn1 -t "$timeout" k || {
 			printf 'TIMEOUT'
@@ -1608,16 +1630,16 @@ read_key() {
 	fi
 	case $k in
 	$'\e')
-		IFS= read -rsn2 -t 1 rest || {
-			printf 'ESC'
-			return
-		}
-		case $rest in
-		'[A') printf 'UP' ;;
-		'[B') printf 'DOWN' ;;
-		'[C') printf 'RIGHT' ;;
-		'[D') printf 'LEFT' ;;
-		*) printf 'ESC' ;;
+		esc_tail
+		case $ESCTAIL in
+		'') printf 'ESC' ;;
+		'[A' | OA) printf 'UP' ;;
+		'[B' | OB) printf 'DOWN' ;;
+		'[C' | OC) printf 'RIGHT' ;;
+		'[D' | OD) printf 'LEFT' ;;
+		# A modified arrow, a function key, a mouse report. Not a key this has anything to
+		# do with, and certainly not a reason to quit.
+		*) printf 'OTHER' ;;
 		esac
 		;;
 	'') printf 'ENTER' ;;
@@ -1714,6 +1736,8 @@ move_marked() {
 # Naming the pane so LEADER+b can find this one and put it away, and so format-tab-title
 # treats it as furniture rather than as another topic competing for the tab's title.
 printf '\033]0;%s\007' "${CC_BOARD_TITLE:-▤ board}"
+
+TTY_SAVED=$( { stty -g </dev/tty; } 2>/dev/null) || TTY_SAVED=""
 
 printf '\033[?1049h\033[?25l'
 ALTSCREEN=true
