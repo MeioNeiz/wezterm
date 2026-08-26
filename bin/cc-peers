@@ -1,0 +1,155 @@
+#!/bin/bash
+# Live Claude Code sessions on this machine, newest last; --help says what for. Read
+# by Claude to turn "the window doing the ingest migration" into an address, and by
+# the wezterm picker (LEADER+@) to type one into a prompt.
+#
+# The registry outlives the process that wrote it, so dead pids are dropped here
+# rather than offered as addresses that will never answer.
+
+set -u
+
+readonly REGISTRY="$HOME/.claude/sessions"
+readonly PANE_MAP="$HOME/.claude/wezterm-sessions"
+readonly PANE_STATE="$HOME/.claude/wezterm-state"
+readonly TITLE_CACHE="$HOME/.claude/cache/statusline"
+
+usage() {
+	cat <<'USAGE'
+cc-peers - live Claude Code sessions on this machine
+
+  cc-peers         aligned table: NAME, STATE, PANE, DIR, TITLE
+  cc-peers --tsv   name, session id, state, pane, dir, title
+
+NAME is the address SendMessage routes by: SendMessage({to: "<name>", message: "..."}).
+Match a window by TITLE rather than asking which one is meant.
+
+Names default to the cwd basename plus a random suffix, so panes in one repo all look
+alike. /rename <name> in a pane sets a real one, bare /rename derives it from the
+conversation, and either way it is unique among live sessions. Each pane's statusLine
+ends with its own @name; in wezterm, LEADER+@ types another session's name at the
+cursor and CTRL+SHIFT+SPACE lifts one off the screen.
+USAGE
+}
+
+tsv=false
+case ${1:-} in
+--tsv) tsv=true ;;
+-h | --help)
+	usage
+	exit 0
+	;;
+"") ;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac
+
+# Same priority Claude's own titles use, and the same 256KB tail the statusLine
+# reads: title lines are rewritten throughout a session, so the tail almost always
+# has the current one.
+session_title() {
+	local id=$1 dir=$2 slug transcript title
+	slug=$(printf '%s' "$dir" | sed 's/[^A-Za-z0-9]/-/g')
+	transcript="$HOME/.claude/projects/$slug/$id.jsonl"
+	if [[ ! -r $transcript ]]; then
+		transcript=$(ls -t "$HOME"/.claude/projects/*/"$id.jsonl" 2>/dev/null | head -1)
+	fi
+	if [[ -r $transcript ]]; then
+		title=$(tail -c 262144 "$transcript" | awk '
+			/"type":"custom-title"/ { custom = $0 }
+			/"type":"ai-title"/     { ai = $0 }
+			END { if (custom != "") print custom; else if (ai != "") print ai }
+		' | jq -r '.customTitle // .aiTitle // empty' 2>/dev/null)
+	fi
+	[[ -z $title && -r $TITLE_CACHE/$id ]] && title=$(<"$TITLE_CACHE/$id")
+	# A session can run for hours without ever being titled, and its opening ask
+	# still identifies it better than "untitled" does.
+	if [[ -z $title && -r $transcript ]]; then
+		title=$(grep -m 60 '"type":"user"' "$transcript" | jq -r '
+			select((.isMeta // false) | not)
+			| .message.content
+			| if type == "string" then .
+			  elif type == "array" then [ .[] | select(.type == "text") | .text ] | join(" ")
+			  else empty end
+			| select(type == "string" and (startswith("<") | not))
+			| gsub("\\s+"; " ")
+		' 2>/dev/null | head -1 | cut -c1-60)
+	fi
+	# A window bootstrapped by a peer handover has no ordinary prompt at all - the
+	# message lands as isMeta, which the pass above skips - so name it after the
+	# sender and the handover's opening line. Splitting on ">" and rejoining
+	# survives a body containing one.
+	if [[ -z $title && -r $transcript ]]; then
+		title=$(grep -m 40 'cross-session-message from=' "$transcript" | jq -r '
+			.message.content
+			| select(type == "string")
+			| (capture("from-name=\"(?<who>[^\"]+)\"") // {who: "peer"}).who as $who
+			| (split(">") | .[1:] | join(">") | sub("^\\s+"; "") | split("\n")[0]
+			   | gsub("\\s+"; " ")) as $body
+			| select($body != "")
+			| "\($who): \($body)"
+		' 2>/dev/null | head -1 | cut -c1-60)
+	fi
+	printf '%s' "${title:-untitled}"
+}
+
+# Which wezterm pane holds a session, from the SessionStart hook's map. Reversed
+# because the map is keyed by pane, and one stale pane id can still point at a
+# session that has since moved, so the newest file wins.
+pane_of() {
+	local id=$1 file
+	for file in $(ls -t "$PANE_MAP" 2>/dev/null); do
+		[[ $(<"$PANE_MAP/$file") == "$id" ]] && { printf '%s' "$file"; return; }
+	done
+}
+
+# The registry knows busy/idle/shell; only the Notification hook knows a pane is
+# sitting on a permission prompt, which is the one state worth interrupting. That
+# hook never fires again to say the prompt was answered, so it only wins while it is
+# the newer of the two writes.
+pane_status() {
+	local pane=$1 status=$2 seen=$3 state at detail
+	[[ -n $pane && -r $PANE_STATE/$pane ]] || { printf '%s' "$status"; return; }
+	IFS=$'\t' read -r state at detail <"$PANE_STATE/$pane"
+	if [[ $state == asking ]] && ((${at:-0} * 1000 > seen)); then
+		printf 'asking%s' "${detail:+ ${detail}}"
+	else
+		printf '%s' "$status"
+	fi
+}
+
+rows=()
+for file in "$REGISTRY"/*.json; do
+	[[ -r $file ]] || continue
+	# Unit separator rather than tab: tab is IFS whitespace, so bash would fold any
+	# empty field and shift the rest of the row left.
+	IFS=$'\x1f' read -r pid id cwd name status started seen < <(
+		jq -r '[ (.pid // ""), (.sessionId // ""), (.cwd // ""), (.name // ""),
+		         (.status // "?"), (.startedAt // 0),
+		         (.statusUpdatedAt // .updatedAt // 0) ]
+		       | map(tostring) | join("\u001f")' "$file" 2>/dev/null
+	)
+	[[ -n ${pid:-} && -n ${name:-} ]] || continue
+	kill -0 "$pid" 2>/dev/null || continue
+
+	pane=$(pane_of "$id")
+	rows+=("$started	$name	$id	$(pane_status "$pane" "$status" "${seen:-0}")	${pane:--}	${cwd##*/}	$(session_title "$id" "$cwd")")
+done
+
+if ((${#rows[@]} == 0)); then
+	$tsv || echo "No live Claude sessions." >&2
+	exit 0
+fi
+
+printf '%s\n' "${rows[@]}" | sort -n | cut -f2- |
+	if $tsv; then
+		cat
+	else
+		# Marking this session so the list reads as "the others are over there".
+		awk -F'\t' -v self="${CLAUDE_CODE_SESSION_ID:-}" '
+			BEGIN { print "NAME\tSTATE\tPANE\tDIR\tTITLE" }
+			{ mark = ($2 == self) ? " ←you" : ""
+			  print $1 mark "\t" $3 "\t" $4 "\t" $5 "\t" $6 }
+		' | column -t -s $'\t'
+	fi

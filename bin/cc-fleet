@@ -1,0 +1,353 @@
+#!/bin/bash
+# The fleet-level view cc-peers cannot give: every live Claude session grouped by the
+# wezterm workspace it lives in, ranked by how much it wants you, and aged by the last
+# time *you* typed into it rather than by anything an agent did on its own.
+#
+# cc-peers answers "what is the address of the migration window". This answers "where is
+# my work" and, more usefully, "which of these are finished and only costing me tab-bar
+# room". Neither question is answerable by eye once a workspace is six tabs deep.
+#
+# Roster, titles and pane mapping come from cc-peers, so the fiddly title precedence has
+# one implementation. This layer adds workspace (wezterm), last-human-turn and turn count
+# (~/.claude/history.jsonl records every prompt against its session id), and the reap
+# decision built on those.
+#
+# Fields are joined on a unit separator, not a tab: tab is IFS whitespace, so bash would
+# fold every empty field and shift the rest of the row left.
+
+set -u
+
+readonly PEERS="$HOME/.claude/bin/cc-peers"
+readonly HISTORY="$HOME/.claude/history.jsonl"
+readonly STALE_DEFAULT=8
+readonly US=$'\x1f'
+
+# Assembling the roster costs ~2s: cc-peers spends a jq per registry file and another per
+# transcript tail, and 38 sessions is 76 process spawns. Fine for a command you type,
+# far too slow for a keypress, so the row set is cached for a few seconds. Nothing here
+# changes meaningfully inside that window except state, and a picker showing state from
+# eight seconds ago still lands you in the right pane.
+readonly CACHE="$HOME/.claude/cache/fleet-rows"
+readonly CACHE_TTL=8
+
+readonly BLUE=$'\033[38;2;135;215;255m'
+readonly MAUVE=$'\033[38;2;203;166;247m'
+readonly GREEN=$'\033[38;2;166;227;161m'
+readonly YELLOW=$'\033[38;2;249;226;175m'
+readonly DIM=$'\033[38;2;108;112;134m'
+readonly BOLD=$'\033[1m'
+readonly RESET=$'\033[0m'
+
+usage() {
+	cat <<'USAGE'
+cc-fleet - every live Claude session, grouped by wezterm workspace
+
+  cc-fleet                 dashboard: workspace, state, how long since you last spoke
+  cc-fleet --stale [H]     only sessions you have not prompted in H hours (default 8)
+  cc-fleet --reap [H]      what closing those would cost; add --yes to close them
+  cc-fleet --tsv           workspace, window, tab, pane, name, state, detail, idle_secs,
+                           turns, dir, title, id - one row per session, for scripting
+  cc-fleet --fresh         skip the few-second row cache
+  cc-fleet --stale-ok      serve the cache at any age and refresh behind you; for a
+                           caller that must not block, like the wezterm board
+  cc-fleet --json          the same rows as JSON, for Claude and other readers
+
+Age is time since *your* last prompt, not since the session last did anything: an agent
+chattering to itself for an hour does not make the work live. Closing a pane loses no
+conversation - every one comes back with `claude --resume <id>`.
+
+In wezterm: LEADER+; fuzzy-jumps to any session in any workspace, LEADER+@ types another
+session's address into the prompt.
+USAGE
+}
+
+mode=dashboard
+stale_hours=$STALE_DEFAULT
+confirm=false
+fresh=false
+stale_ok=false
+
+while (($#)); do
+	case $1 in
+	--tsv) mode=tsv ;;
+	--json) mode=json ;;
+	--stale) mode=stale ;;
+	--reap) mode=reap ;;
+	--yes | -y) confirm=true ;;
+	--fresh) fresh=true ;;
+	--stale-ok) stale_ok=true ;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	[0-9]*) stale_hours=$1 ;;
+	*)
+		usage >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+now=$(date +%s)
+stale_secs=$((stale_hours * 3600))
+
+# awk -v cannot carry a multi-line value, so the two joined tables go through files.
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
+
+# pane id -> workspace, window, tab, cwd. A pane wezterm has since forgotten leaves its
+# session grouped under "-", which still beats dropping the row: the session is live, it
+# just is not on screen anywhere.
+wezterm cli list --format json 2>/dev/null | jq -r '
+	.[] | [ (.pane_id|tostring), .workspace, (.window_id|tostring), (.tab_id|tostring),
+	        (.cwd // "" | sub("^file://[^/]*"; "")) ] | join("")' \
+	>"$work/panes" 2>/dev/null
+
+# session id -> epoch of your last prompt, and how many you have sent.
+jq -r 'select(.sessionId and .timestamp)
+	| [ .sessionId, ((.timestamp / 1000) | floor | tostring) ] | @tsv' "$HISTORY" 2>/dev/null |
+	awk -F'\t' -v us="$US" '
+		{ n[$1]++; if ($2 > last[$1]) last[$1] = $2 }
+		END { for (s in n) print s us last[s] us n[s] }
+	' >"$work/prompts"
+
+# Rank, then row. Rank leads so every consumer below can sort on one numeric column:
+# how loudly this session is asking to be looked at.
+assemble_rows() {
+	"$PEERS" --tsv 2>/dev/null | awk -F'\t' -v now="$now" -v cut="$stale_secs" -v US="$US" \
+	-v panefile="$work/panes" -v promptfile="$work/prompts" '
+BEGIN {
+	while ((getline line < panefile) > 0) {
+		n = split(line, f, US)
+		if (n >= 4) { ws[f[1]] = f[2]; win[f[1]] = f[3]; tb[f[1]] = f[4]; cwd[f[1]] = f[5] }
+	}
+	while ((getline line < promptfile) > 0) {
+		n = split(line, f, US)
+		if (n >= 3) { seen[f[1]] = f[2]; turns[f[1]] = f[3] }
+	}
+	need["asking"] = 5; need["busy"] = 4; need["shell"] = 2; need["idle"] = 1
+}
+{
+	name = $1; id = $2; state = $3; pane = $4; dir = $5; title = $6
+	split(state, s, " ")
+	kind = s[1]
+	detail = (s[2] != "") ? s[2] : ""
+
+	# No prompt on record means a session bootstrapped by a peer handover and never typed
+	# into. Ageing that from its start would read as fresh forever, so leave it unknown
+	# and let the reap rule treat it as untouched.
+	idle = (id in seen) ? now - seen[id] : -1
+	rank = need[kind] + 0
+	# A freshly prompted idle session outranks a stale one: you were just there.
+	if (kind == "idle" && idle >= 0 && idle < cut) rank = 3
+	print rank US (pane in ws ? ws[pane] : "-") US (pane in win ? win[pane] : "-") \
+		US (pane in tb ? tb[pane] : "-") US pane US name US kind US detail US idle \
+		US (id in turns ? turns[id] : 0) US dir US title US id \
+		US (pane in cwd ? cwd[pane] : "")
+}'
+}
+
+# A half-written cache would be read as a truncated roster, so it lands atomically.
+write_cache() {
+	[[ -n $1 ]] || return
+	mkdir -p "${CACHE%/*}" 2>/dev/null &&
+		printf '%s\n' "$1" >"$CACHE.$$" 2>/dev/null &&
+		mv -f "$CACHE.$$" "$CACHE" 2>/dev/null
+}
+
+rows=""
+cache_age=$((CACHE_TTL + 1))
+if [[ -r $CACHE ]]; then
+	cache_age=$((now - $(stat -f %m "$CACHE" 2>/dev/null || echo 0)))
+fi
+
+if $fresh; then
+	rows=$(assemble_rows)
+	write_cache "$rows"
+elif ((cache_age <= CACHE_TTL)); then
+	rows=$(<"$CACHE")
+elif $stale_ok && [[ -r $CACHE ]]; then
+	# The roster costs a second to assemble - a jq per registry file and another per
+	# transcript tail - which an interactive caller cannot stop to pay. Names, titles and
+	# panes barely move in that second, so a stale answer now beats a correct answer later:
+	# serve what is on disk and put the rebuild behind you.
+	rows=$(<"$CACHE")
+	# One refresh at a time, however many boards and pickers ask at once. The lock is a
+	# directory because mkdir is atomic everywhere; a stale one is cleared after a minute.
+	if [[ -d $CACHE.lock ]] &&
+		(($(stat -f %m "$CACHE.lock" 2>/dev/null || echo 0) < now - 60)); then
+		rmdir "$CACHE.lock" 2>/dev/null
+	fi
+	if mkdir "$CACHE.lock" 2>/dev/null; then
+		(
+			trap 'rmdir "$CACHE.lock" 2>/dev/null' EXIT
+			write_cache "$(assemble_rows)"
+		) >/dev/null 2>&1 &
+		disown 2>/dev/null || true
+	fi
+else
+	rows=$(assemble_rows)
+	write_cache "$rows"
+fi
+
+[[ -n $rows ]] || {
+	echo "No live Claude sessions." >&2
+	exit 0
+}
+
+if [[ $mode == tsv ]]; then
+	printf '%s\n' "$rows" | cut -d"$US" -f2-13 | tr "$US" '\t'
+	exit 0
+fi
+
+if [[ $mode == json ]]; then
+	# For a reader rather than a terminal: a session another Claude is asked about should not
+	# have to be recovered out of a padded table. idle_seconds is -1 when you have never
+	# prompted it, which is different from zero and worth keeping distinguishable.
+	printf '%s\n' "$rows" | cut -d"$US" -f2-13 |
+		jq -Rs --arg us "$US" 'split("\n") | map(select(length > 0) | split($us))
+			| map({ workspace: .[0], window: .[1], tab_id: .[2], pane: .[3], name: .[4],
+			        state: .[5], blocked_on: .[6], idle_seconds: (.[7] | tonumber?),
+			        your_turns: (.[8] | tonumber?), dir: .[9], title: .[10], id: .[11] })'
+	exit 0
+fi
+
+# "3d" beats "268214s" at a glance, and five cells is all it needs.
+age() {
+	local s=$1
+	((s < 0)) && {
+		printf 'never'
+		return
+	}
+	if ((s < 90)); then printf 'now'
+	elif ((s < 5400)); then printf '%dm' $((s / 60))
+	elif ((s < 172800)); then printf '%dh' $((s / 3600))
+	else printf '%dd' $((s / 86400)); fi
+}
+
+# Not doing anything, and you have not spoken to it in stale_hours. "busy" and "asking"
+# are never reapable however old: one is mid-turn, the other is holding a prompt open.
+reapable=$(printf '%s\n' "$rows" | awk -F"$US" -v cut="$stale_secs" '
+	($7 == "idle" || $7 == "shell") && ($9 < 0 || $9 >= cut)' | sort -t"$US" -k9,9nr)
+
+if [[ $mode == stale || $mode == reap ]]; then
+	if [[ -z $reapable ]]; then
+		printf '%sNothing idle beyond %sh.%s\n' "$GREEN" "$stale_hours" "$RESET"
+		exit 0
+	fi
+	count=$(printf '%s\n' "$reapable" | wc -l | tr -d ' ')
+	printf '%s%s chats with no prompt from you in over %sh%s\n\n' \
+		"$BOLD" "$count" "$stale_hours" "$RESET"
+	while IFS="$US" read -r _ ws _ _ pane name _ _ idle turns _ title _ _; do
+		printf '  %s%5s%s  %s%-18s%s %s%-13s %3st%s  %s\n' \
+			"$DIM" "$(age "$idle")" "$RESET" "$YELLOW" "$name" "$RESET" \
+			"$DIM" "${ws:0:13}" "$turns" "$RESET" "${title:0:56}"
+	done <<<"$reapable"
+
+	if [[ $mode == stale ]]; then
+		printf '\n%sReap them with:  cc-fleet --reap %s%s\n' "$DIM" "$stale_hours" "$RESET"
+		exit 0
+	fi
+
+	printf '\n%sClosing these frees %s panes; every conversation survives.%s\n' \
+		"$DIM" "$count" "$RESET"
+	printf '%s  claude --resume <id>   brings any of them back, in any pane.%s\n' "$DIM" "$RESET"
+	if ! $confirm; then
+		printf '\n%sDry run. Add --yes to close them.%s\n' "$YELLOW" "$RESET"
+		exit 0
+	fi
+	killed=0
+	while IFS="$US" read -r _ _ _ _ pane _ _ _ _ _ _ _ _ _; do
+		[[ $pane == "-" ]] && continue
+		wezterm cli kill-pane --pane-id "$pane" 2>/dev/null && ((killed++))
+	done <<<"$reapable"
+	printf '%sClosed %s panes.%s\n' "$GREEN" "$killed" "$RESET"
+	exit 0
+fi
+
+# Dashboard. Workspaces ordered by their neediest session, then by the most recently
+# prompted one, so whatever you were last working on sits at the top.
+workspaces=$(printf '%s\n' "$rows" | awk -F"$US" '
+	{
+		idle = ($9 < 0) ? 999999999 : $9
+		if (!($2 in rank) || $1 > rank[$2]) rank[$2] = $1
+		if (!($2 in recent) || idle < recent[$2]) recent[$2] = idle
+	}
+	END { for (w in rank) printf "%d\t%d\t%s\n", 9 - rank[w], recent[w], w }' |
+	sort -t$'\t' -k1,1n -k2,2n | cut -f3)
+
+total=0
+needy=0
+while IFS= read -r ws; do
+	group=$(printf '%s\n' "$rows" | awk -F"$US" -v w="$ws" '$2 == w' |
+		sort -t"$US" -k1,1nr -k9,9n)
+	n=$(printf '%s\n' "$group" | wc -l | tr -d ' ')
+	wants=$(printf '%s\n' "$group" | awk -F"$US" '$7 == "asking" || $7 == "busy"' | wc -l | tr -d ' ')
+	old=$(printf '%s\n' "$group" | awk -F"$US" -v cut="$stale_secs" \
+		'($7 == "idle" || $7 == "shell") && ($9 < 0 || $9 >= cut)' | wc -l | tr -d ' ')
+	total=$((total + n))
+	needy=$((needy + wants))
+
+	# One git call per workspace, not per session: with 24 panes sharing a checkout,
+	# per-session git state would be the same answer 24 times.
+	repo=$(printf '%s\n' "$group" | awk -F"$US" 'NR == 1 { print $14 }')
+	gitbit=""
+	if [[ -n $repo && -d $repo ]]; then
+		branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+		if [[ -n $branch ]]; then
+			dirty=$(git -C "$repo" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+			gitbit="  ${branch}"
+			((dirty > 0)) && gitbit="${gitbit} ✎${dirty}"
+		fi
+	fi
+
+	printf '\n%s%s%s %s%s chat%s' "$BOLD$BLUE" "$ws" "$RESET" "$DIM" "$n" \
+		"$([[ $n == 1 ]] || echo s)"
+	((wants > 0)) && printf '%s · %s wants you%s' "$MAUVE" "$wants" "$DIM"
+	((old > 0)) && printf ' · %s idle >%sh' "$old" "$stale_hours"
+	printf '%s%s\n' "$gitbit" "$RESET"
+
+	while IFS="$US" read -r rank _ _ _ pane name kind detail idle turns _ title _ _; do
+		case $kind in
+		asking)
+			glyph="⚠"
+			colour=$MAUVE
+			;;
+		busy)
+			glyph="◐"
+			colour=$GREEN
+			;;
+		shell)
+			glyph="›"
+			colour=$DIM
+			;;
+		*)
+			# rank 3 is a session you prompted inside the stale window: live work.
+			if ((rank >= 3)); then
+				glyph="✳"
+				colour=$YELLOW
+			else
+				glyph="·"
+				colour=$DIM
+			fi
+			;;
+		esac
+		label=$kind
+		[[ -n $detail ]] && label="$kind $detail"
+		body=""
+		[[ $glyph == "·" ]] && body=$DIM
+		printf '  %s%s %-18s%s %s%-13s %5s %3st%s  %s%s%s %s%s%s\n' \
+			"$colour" "$glyph" "$name" "$RESET" \
+			"$DIM" "${label:0:13}" "$(age "$idle")" "$turns" "$RESET" \
+			"$body" "${title:0:50}" "$RESET" "$DIM" "$pane" "$RESET"
+	done <<<"$group"
+done <<<"$workspaces"
+
+stale_count=0
+[[ -n $reapable ]] && stale_count=$(printf '%s\n' "$reapable" | wc -l | tr -d ' ')
+printf '\n%s%s chats%s %s· %s workspaces' "$BOLD" "$total" "$RESET" "$DIM" \
+	"$(printf '%s\n' "$workspaces" | wc -l | tr -d ' ')"
+((needy > 0)) && printf '%s · %s wants you%s' "$MAUVE" "$needy" "$DIM"
+((stale_count > 0)) && printf ' · %s idle >%sh — cc-fleet --stale' "$stale_count" "$stale_hours"
+printf '%s\n' "$RESET"

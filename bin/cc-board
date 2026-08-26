@@ -1,0 +1,1265 @@
+#!/bin/bash
+# Raid frames for a fleet of Claude sessions: a block per conversation, grouped, coloured by
+# what it wants from you, with context drawn as the bar it actually is.
+#
+# The list this replaced was readable but it was still a list, and a list of thirty-eight
+# things is something you page through rather than see. A grid is read differently - you
+# scan for the colour that is wrong instead of reading rows - which is why raid UIs are laid
+# out this way and why, at this size, it is the difference between seeing the fleet and
+# searching it.
+#
+# It also organises, not just reports. Grouping defaults to the tab each session physically
+# sits in, so the view shows you your own layout and where it has gone wrong; m marks and M
+# moves the marked panes into the tab you came from, which is the whole "put similar things
+# together" job done from one screen rather than by dragging panes about.
+#
+# What it knows that nothing else here does is whether a session stopped because it finished
+# or because it asked you something. The Stop hook fires either way, so an unanswered
+# question wears the same glyph as a delivered result in the tab bar and in cc-fleet alike,
+# and can sit there for a day. A pane's own screen is the only place that distinction
+# survives, so the board reads it back and flags a closing line that ends in a question.
+#
+#   h j k l    move          enter  jump to it        m  mark
+#   v          grid / list   x      close it          M  move marked here
+#   t          regroup       /      filter            r  refresh      q leave
+#
+# Two things govern how this is written. The frame is built as one string and written only
+# when it differs from the last, repainting in place rather than clearing - a repaint per
+# poll with a clear-screen in front of it is what a flickering TUI is. And nothing in the
+# render path forks: measuring a column used to shell out to tr and wc, which at five
+# columns and sixty rows was a thousand processes a frame, and ${#s} already counts
+# characters rather than bytes in a UTF-8 locale.
+#
+# Written for the bash macOS ships, which is 3.2: no mapfile, no ${var,,}, no associative
+# arrays, printf -v rather than command substitution, and read -t takes whole seconds only.
+# Fields travel on a unit separator because tab is IFS whitespace, so an empty field would
+# fold and shift every later field left - which is what a session with no blocked-on tool
+# has.
+
+set -u
+
+readonly FLEET="$HOME/.claude/bin/cc-fleet"
+readonly US=$'\x1f'
+readonly STALE_SECS=$((8 * 3600))
+readonly REFRESH_SECS=6
+
+readonly BLUE=$'\033[38;2;135;215;250m'
+readonly MAUVE=$'\033[38;2;203;166;247m'
+readonly GREEN=$'\033[38;2;166;227;161m'
+readonly YELLOW=$'\033[38;2;249;226;175m'
+readonly ORANGE=$'\033[38;2;250;179;135m'
+readonly RED=$'\033[38;2;243;139;168m'
+readonly DIM=$'\033[38;2;108;112;134m'
+readonly FAINT=$'\033[38;2;69;71;90m'
+readonly SELECTED=$'\033[48;2;49;50;68m'
+readonly MARKED=$'\033[48;2;69;71;90m'
+readonly BOLD=$'\033[1m'
+readonly RESET=$'\033[0m'
+
+# Erase to end of line, and to end of screen. Repainting with these rather than with a
+# clear-screen is what stops the frame blinking: old text is overwritten in place instead of
+# being removed and then replaced.
+readonly EOL=$'\033[K'
+readonly EOS=$'\033[J'
+readonly HOME_POS=$'\033[H'
+
+usage() {
+	cat <<'USAGE'
+cc-board - raid frames for every Claude session in a workspace
+
+  cc-board                 the workspace this pane is in
+  cc-board <workspace>     a named workspace instead
+  cc-board --all           the whole machine, grouped by workspace
+  cc-board --list          start in list view rather than grid
+  cc-board --once          print one frame and exit
+  cc-board --watch         redraw on a loop, no keyboard
+  cc-board --tsv           workspace, pane, name, state, asks, idle, pct, title, last-line -
+                           the enriched roster, for the wezterm pickers and for scripts
+
+  h j k l  move            enter  jump to it          m  mark / unmark
+  v        grid or list    x      close it            M  move marked into your tab
+  t        regroup         /      filter              r  refresh        q leave
+
+Each frame is state, name, time since your last prompt, the topic, and context drawn as a
+bar - green, amber past half, red past 80%. A mauve frame is waiting on you: either blocked
+on a permission prompt, or its closing line was a question nobody answered.
+
+Grouping starts from the tab a session physically sits in, so the view is your own layout.
+t cycles it: tab, then state, then the prefix before a colon in the session name, which is
+an axis you create yourself with /rename billing:invoices.
+
+In wezterm LEADER+b brings this up and puts it away; LEADER+; is the quick fuzzy jump.
+USAGE
+}
+
+workspace=""
+mode=interactive
+view=grid
+all=false
+
+while (($#)); do
+	case $1 in
+	--once) mode=once ;;
+	--tsv) mode=tsv ;;
+	--watch) mode=watch ;;
+	--list) view=list ;;
+	--all) all=true ;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	-*)
+		usage >&2
+		exit 2
+		;;
+	*) workspace=$1 ;;
+	esac
+	shift
+done
+
+work=$(mktemp -d) || exit 1
+cleanup() {
+	printf '\033[?25h\033[?1049l'
+	rm -rf "$work"
+}
+trap cleanup EXIT INT TERM
+
+if [[ -z $workspace ]] && ! $all && [[ -n ${WEZTERM_PANE:-} ]]; then
+	workspace=$(wezterm cli list --format json 2>/dev/null |
+		jq -r --arg p "$WEZTERM_PANE" \
+			'.[] | select((.pane_id|tostring) == $p) | .workspace' 2>/dev/null)
+fi
+
+# Where LEADER+b was pressed, so M knows which tab "here" means. Absent when the board is
+# started by hand, in which case M has nowhere to move things to and says so.
+ORIGIN=${CC_BOARD_ORIGIN:-}
+
+# ---------------------------------------------------------------- reading the panes
+
+# Candidate closing lines, nearest the input box first. Several, not one, because the
+# bottom-most line is usually Claude's own thinking summary rather than anything it said, and
+# the sentence worth reading is the one above it. Which of them is chrome is decided in the
+# shell, where a multibyte glyph is compared as a whole sequence.
+readonly LASTLINE_AWK='
+{ buf[NR] = $0 }
+END {
+	rules = 0
+	found = 0
+	for (i = NR; i > 0 && found < 6; i--) {
+		line = buf[i]
+		gsub(/^[ \t]+|[ \t]+$/, "", line)
+		# A literal multibyte sequence, not a bracket expression: this awk (20200816) has no
+		# \x escapes in regexes, and a class of multibyte glyphs matches their bytes
+		# individually, stripping one byte and corrupting the line. Three cells of rule is
+		# enough to recognise one.
+		if (line ~ /^───/ || line ~ /^━━━/ || line ~ /^---/) { rules++; continue }
+		if (rules < 2) continue
+		if (line == "") continue
+		if (line ~ /new task\?/) continue
+		if (line ~ /\(click\)/) continue
+		if (line ~ /Update installed/) continue
+		if (line ~ /Tip: /) continue
+		print line
+		found++
+	}
+}'
+
+# Layout markers Claude puts at the head of a continuation or activity line, and the blocks
+# its startup banner is drawn from. The line is speech; the marker is furniture.
+LEADERS=("▎" "⎿" "│" "⏺" "✽" "✻" "✳" "◐" "◓" "◑" "◒" "·" ">"
+	"▝" "▘" "▖" "▗" "▛" "▜" "▙" "▟" "█" "▐" "▌" "▀" "▄")
+
+# Result in a global rather than on stdout: called per candidate per pane, and a command
+# substitution here is a fork each time.
+STRIPPED=""
+strip_leaders() {
+	local line=$1 lead changed=true
+	while $changed; do
+		changed=false
+		line=${line#"${line%%[![:space:]]*}"}
+		for lead in "${LEADERS[@]}"; do
+			if [[ $line == "$lead"* ]]; then
+				line=${line#"$lead"}
+				changed=true
+			fi
+		done
+	done
+	STRIPPED=${line%"${line##*[![:space:]]}"}
+}
+
+# Claude's progress and thinking summaries, which sit below whatever it last said and would
+# otherwise be reported as the thing it said. Matched by shape, not by verb: the vocabulary
+# rotates ("Noodling", "Baked", "Churned", "Shenaniganing", …) and is not worth chasing.
+is_chrome() {
+	case $1 in
+	# Nothing alphabetic in it: a rule, a progress bar, part of the banner.
+	*[a-zA-Z]*) ;;
+	*) return 0 ;;
+	esac
+	case $1 in
+	# No space anywhere: a path, a filename, a command fragment. Not a closing sentence.
+	*" "*) ;;
+	*) return 0 ;;
+	esac
+	case $1 in
+	"Tip: "*) return 0 ;;
+	*"Claude Code v"*) return 0 ;;
+	*"· done "[0-9]*) return 0 ;;
+	[A-Z]*" for "[0-9]*) return 0 ;;
+	[A-Z]*"… ("*) return 0 ;;
+	"("*")") return 0 ;;
+	esac
+	return 1
+}
+
+read_pane() {
+	local pane=$1 text ctx line last=""
+	text=$(wezterm cli get-text --pane-id "$pane" 2>/dev/null)
+	while IFS= read -r line; do
+		strip_leaders "$line"
+		line=$STRIPPED
+		((${#line} < 3)) && continue
+		is_chrome "$line" && continue
+		last=$line
+		break
+	done < <(printf '%s\n' "$text" | awk "$LASTLINE_AWK")
+	ctx=$(printf '%s\n' "$text" | grep -o '[0-9]\+% of [0-9]\+[kM]' | tail -1)
+	# "30% of 1M" -> "30". Two steps because ${ctx%%% *} is a correct but unreadable way to
+	# say the same thing.
+	ctx=${ctx%% *}
+	printf '%s%s%s\n' "$last" "$US" "${ctx%\%}" >"$work/tail.$pane"
+}
+
+# ---------------------------------------------------------------- the model
+
+E_PANE=()
+E_NAME=()
+E_KIND=()
+E_DETAIL=()
+E_IDLE=()
+E_TITLE=()
+E_LAST=()
+E_PCT=()
+E_ASKS=()
+E_WS=()
+E_TAB=()
+E_MARK=()
+E_TABLABEL=()
+E_POS=()
+BRANCH=""
+DIRTY=0
+WAITING=0
+LOADED_AT=0
+
+# wezterm's CLI reports tab_id, an internal identifier, but the tab bar, LEADER+1..9 and
+# format-tab-title all count positions from one - so "tab 9" meant nothing to anyone looking
+# at their fourth tab. Ascending tab_id within a window is that order, since wezterm hands
+# ids out as tabs are created; only a tab bar reordered by hand would disagree, and nothing
+# in this config binds MoveTab. A tab you have named with LEADER+, is labelled by its name
+# instead, which beats any number.
+# Where each pane physically sits in its tab. top_row and left_col come straight from
+# wezterm, so sorting on them is the order your eye reads the tab in - which is what makes
+# the board a map of the screen rather than a re-ranking of it.
+POSMAP=""
+build_posmap() {
+	local pane row col
+	POSMAP="|"
+	while IFS="$US" read -r pane row col; do
+		[[ -n $pane ]] || continue
+		POSMAP="${POSMAP}${pane}=$((row * 100000 + col))|"
+	done < <(wezterm cli list --format json 2>/dev/null | jq -r '
+		.[] | [ (.pane_id|tostring), ((.top_row // 0)|tostring), ((.left_col // 0)|tostring) ]
+		| join("\u001f")' 2>/dev/null)
+}
+
+pos_of() {
+	local rest
+	rest=${POSMAP#*"|$1="}
+	if [[ $rest == "$POSMAP" ]]; then
+		POS=999999999
+	else
+		POS=${rest%%"|"*}
+	fi
+}
+
+TABMAP=""
+build_tabmap() {
+	local wid tid title idx=0 prev="" label
+	TABMAP="|"
+	while IFS="$US" read -r wid tid title; do
+		[[ -n $tid ]] || continue
+		if [[ $wid != "$prev" ]]; then
+			idx=0
+			prev=$wid
+		fi
+		idx=$((idx + 1))
+		# A tab title starting with a Claude status glyph was pinned by the save layer from
+		# whatever the pane was doing, so it is a whole sentence and it duplicates what the
+		# frames below already say. Only a name you typed yourself earns a place in the
+		# header, and even then only the first few words of it.
+		label="tab $idx"
+		case $title in
+		"" | [✳✻✽◐◓◑◒]*) ;;
+		*) label="tab $idx · ${title:0:22}" ;;
+		esac
+		TABMAP="${TABMAP}${tid}=${label}|"
+	done < <(wezterm cli list --format json 2>/dev/null | jq -r '
+		[ .[] | { w: .window_id, t: .tab_id, ti: (.tab_title // "") } ]
+		| unique_by([.w, .t]) | sort_by(.w, .t)
+		| .[] | [ (.w|tostring), (.t|tostring), .ti ] | join("\u001f")' 2>/dev/null)
+}
+
+tab_label() {
+	local rest
+	rest=${TABMAP#*"|$1="}
+	if [[ $rest == "$TABMAP" ]]; then
+		TABLABEL="tab ?"
+	else
+		TABLABEL=${rest%%"|"*}
+	fi
+}
+
+load() {
+	local roster ws tab pane name kind detail idle title last pct cwd asks i keepmark
+	# --stale-ok rather than a plain read: assembling the roster costs a second - a jq per
+	# registry file and another per transcript tail - and a board that stops to pay that
+	# every few seconds is a board that ignores your keystrokes while it does. cc-fleet
+	# serves what it has and rebuilds behind us. r forces the wait.
+	if [[ -n ${1:-} ]]; then
+		roster=$("$FLEET" --tsv --fresh 2>/dev/null | tr '\t' "$US")
+	else
+		roster=$("$FLEET" --tsv --stale-ok 2>/dev/null | tr '\t' "$US")
+	fi
+	if ! $all && [[ -n $workspace ]]; then
+		roster=$(printf '%s\n' "$roster" | awk -F"$US" -v w="$workspace" '$1 == w')
+	fi
+
+	# asking first, then working, then whatever you prompted most recently. Same ordering
+	# the LEADER+; picker uses, so the two views agree about what matters.
+	roster=$(printf '%s\n' "$roster" | awk -F"$US" -v OFS="$US" '
+		NF >= 11 {
+			w = ($6 == "asking") ? 4 : ($6 == "busy") ? 3 : ($6 == "shell") ? 1 : 2
+			idle = ($8 < 0) ? 999999999 : $8
+			print w, idle, $0
+		}' | sort -t"$US" -k1,1nr -k2,2n | cut -d"$US" -f3-)
+
+	build_tabmap
+	build_posmap
+
+	rm -f "$work"/tail.* 2>/dev/null
+	while IFS="$US" read -r _ _ _ pane _; do
+		[[ -z $pane || $pane == "-" ]] && continue
+		read_pane "$pane" &
+	done <<<"$roster"
+
+	# Marks belong to the session, not to its position, so they survive a reload.
+	keepmark=""
+	for ((i = 0; i < ${#E_PANE[@]}; i++)); do
+		[[ ${E_MARK[i]} == yes ]] && keepmark="${keepmark} ${E_PANE[i]} "
+	done
+	wait
+
+	E_PANE=()
+	E_NAME=()
+	E_KIND=()
+	E_DETAIL=()
+	E_IDLE=()
+	E_TITLE=()
+	E_LAST=()
+	E_PCT=()
+	E_ASKS=()
+	E_WS=()
+	E_TAB=()
+	E_MARK=()
+	E_TABLABEL=()
+	E_POS=()
+	WAITING=0
+
+	while IFS="$US" read -r ws _ tab pane name kind detail idle _ _ title _; do
+		[[ -n $name ]] || continue
+		last=""
+		pct=""
+		[[ -r "$work/tail.$pane" ]] && IFS="$US" read -r last pct <"$work/tail.$pane"
+		# Never prompted, so nothing it could have said: whatever is on that screen is the
+		# startup banner. Cheaper and more honest than pattern-matching the banner.
+		((idle < 0)) && last=""
+		asks=no
+		if [[ $kind == asking || $last == *'?' ]]; then
+			asks=yes
+			WAITING=$((WAITING + 1))
+		fi
+		E_PANE[${#E_PANE[@]}]=$pane
+		E_NAME[${#E_NAME[@]}]=$name
+		E_KIND[${#E_KIND[@]}]=$kind
+		E_DETAIL[${#E_DETAIL[@]}]=$detail
+		E_IDLE[${#E_IDLE[@]}]=$idle
+		E_TITLE[${#E_TITLE[@]}]=$title
+		E_LAST[${#E_LAST[@]}]=$last
+		E_PCT[${#E_PCT[@]}]=$pct
+		E_ASKS[${#E_ASKS[@]}]=$asks
+		E_WS[${#E_WS[@]}]=$ws
+		E_TAB[${#E_TAB[@]}]=$tab
+		tab_label "$tab"
+		E_TABLABEL[${#E_TABLABEL[@]}]=$TABLABEL
+		pos_of "$pane"
+		E_POS[${#E_POS[@]}]=$POS
+		if [[ $keepmark == *" $pane "* ]]; then
+			E_MARK[${#E_MARK[@]}]=yes
+		else
+			E_MARK[${#E_MARK[@]}]=no
+		fi
+	done <<<"$roster"
+
+	# One git call for the workspace, not one per session: they nearly all share a working
+	# tree, which is itself worth seeing in the ✎ count.
+	BRANCH=""
+	DIRTY=0
+	if ((${#E_PANE[@]} > 0)); then
+		cwd=$(wezterm cli list --format json 2>/dev/null |
+			jq -r --arg p "${E_PANE[0]}" \
+				'.[] | select((.pane_id|tostring) == $p)
+				 | (.cwd // "" | sub("^file://[^/]*"; ""))' 2>/dev/null)
+		if [[ -n $cwd && -d $cwd ]]; then
+			BRANCH=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
+			[[ -n $BRANCH ]] &&
+				DIRTY=$(git -C "$cwd" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+		fi
+	fi
+	LOADED_AT=$(date +%s)
+}
+
+# ---------------------------------------------------------------- fork-free primitives
+
+ROWS=40
+COLS=120
+measure() {
+	local size
+	size=$( { stty size </dev/tty; } 2>/dev/null ) || size=""
+	ROWS=${size%% *}
+	COLS=${size##* }
+	[[ $ROWS =~ ^[0-9]+$ ]] || ROWS=40
+	[[ $COLS =~ ^[0-9]+$ ]] || COLS=120
+}
+
+# Clipped to a column and padded out to it, in place. ${#s} counts characters rather than
+# bytes in a UTF-8 locale, so no external help is needed to measure a string with a ✎ or an
+# ellipsis in it. Result in PAD, because a command substitution per column per cell was the
+# entire cost of a frame.
+PAD=""
+pad_to() {
+	local text=$1 width=$2 n trimmed
+	((width < 1)) && {
+		PAD=""
+		return
+	}
+	n=${#text}
+	if ((n > width)); then
+		text=${text:0:width-1}
+		trimmed=${text% *}
+		[[ $trimmed != "$text" ]] && ((${#trimmed} * 3 >= width * 2)) && text=$trimmed
+		text="${text}…"
+		n=${#text}
+	fi
+	if ((n < width)); then
+		printf -v PAD '%s%*s' "$text" $((width - n)) ''
+	else
+		PAD=$text
+	fi
+}
+
+AGE=""
+set_age() {
+	local s=$1
+	if ((s < 0)); then AGE=never
+	elif ((s < 90)); then AGE=now
+	elif ((s < 5400)); then printf -v AGE '%dm' $((s / 60))
+	elif ((s < 172800)); then printf -v AGE '%dh' $((s / 3600))
+	else printf -v AGE '%dd' $((s / 86400)); fi
+}
+
+# Context as the resource bar it is: how much of the window is spent, amber past half, red
+# past eighty. The one number that predicts a session falling over, and the reason a grid
+# beats a list here - twenty bars are one glance, twenty percentages are twenty readings.
+readonly BAR_CELLS=10
+CTXBAR=""
+set_ctxbar() {
+	local pct=$1 width=$2 filled colour bar="" i
+	((width < 4)) && {
+		CTXBAR=""
+		return
+	}
+	if [[ ! $pct =~ ^[0-9]+$ ]]; then
+		printf -v bar '%*s' "$width" ''
+		CTXBAR="${FAINT}${bar//?/·}${RESET}"
+		return
+	fi
+	filled=$((pct * width / 100))
+	((filled > width)) && filled=$width
+	((filled == 0 && pct > 0)) && filled=1
+	colour=$GREEN
+	((pct >= 50)) && colour=$ORANGE
+	((pct >= 80)) && colour=$RED
+	for ((i = 0; i < width; i++)); do
+		if ((i < filled)); then bar="${bar}█"; else bar="${bar}░"; fi
+	done
+	CTXBAR="${colour}${bar}${RESET}"
+}
+
+# ---------------------------------------------------------------- grouping and filtering
+
+# tab is first because it is your actual layout: seeing four unrelated conversations sharing
+# a tab is what tells you the layout has drifted. state is the triage view. prefix is the
+# axis you make yourself, with /rename billing:invoices.
+GROUPINGS=(tab state prefix)
+grouping=tab
+$all && grouping=workspace
+
+# Sort key for a group heading. In a function rather than inline because bash 3.2's parser
+# mistakes a case pattern's closing paren for the end of an enclosing process substitution
+# and then rejects the ;; that follows it.
+SORTKEY=""
+group_sort_key() {
+	local g=$1 key
+	case $grouping in
+	tab)
+		# "tab 4" and "tab 4 · whatever you named it" both sort on the number.
+		key=${g#tab }
+		key=${key%% *}
+		[[ $key =~ ^[0-9]+$ ]] || key=9999
+		printf -v SORTKEY '%04d' "$key"
+		;;
+	state)
+		case $g in
+		"waiting on you") key=0 ;;
+		working) key=1 ;;
+		live) key=2 ;;
+		*) key=3 ;;
+		esac
+		printf -v SORTKEY '%04d' "$key"
+		;;
+	prefix)
+		# Sessions you have not given a prefix to are the leftovers, so they go last.
+		if [[ $g == unprefixed ]]; then SORTKEY="zzzz"; else SORTKEY=$g; fi
+		;;
+	*) SORTKEY=$g ;;
+	esac
+}
+
+GROUP=""
+group_of() {
+	local i=$1 name
+	case $grouping in
+	workspace) GROUP=${E_WS[i]} ;;
+	tab) GROUP=${E_TABLABEL[i]} ;;
+	state)
+		if [[ ${E_ASKS[i]} == yes ]]; then GROUP="waiting on you"
+		elif [[ ${E_KIND[i]} == busy ]]; then GROUP="working"
+		elif ((${E_IDLE[i]} >= 0 && ${E_IDLE[i]} < STALE_SECS)); then GROUP="live"
+		else GROUP="cold"; fi
+		;;
+	prefix)
+		name=${E_NAME[i]}
+		case $name in
+		*:*) GROUP=${name%%:*} ;;
+		*) GROUP="unprefixed" ;;
+		esac
+		;;
+	esac
+}
+
+filter=""
+selected=0
+IDX=()
+
+# Indices surviving the filter, then stably sorted into groups so the grid can lay them out
+# in one pass. nocasematch rather than lowercasing the haystack: ${var,,} is bash 4.
+GROUP_NAME=()
+GROUP_START=()
+build_visible() {
+	local i hay pass=() g seen order=() n
+	shopt -s nocasematch
+	for ((i = 0; i < ${#E_NAME[@]}; i++)); do
+		if [[ -n $filter ]]; then
+			hay="${E_NAME[i]} ${E_TITLE[i]} ${E_LAST[i]} ${E_KIND[i]}"
+			[[ $hay == *"$filter"* ]] || continue
+		fi
+		pass[${#pass[@]}]=$i
+	done
+	shopt -u nocasematch
+
+	# Group order used to be first-appearance, which inherited the roster's ranking - so the
+	# tabs came out in order of whichever one held the most urgent session, and "why is tab 4
+	# above tab 1" had no answer worth giving. Each grouping now has the order that grouping
+	# implies: tabs and workspaces in their own order, states by urgency, prefixes
+	# alphabetically with the unprefixed left at the end.
+	seen=""
+	for i in ${pass[@]+"${pass[@]}"}; do
+		group_of "$i"
+		if [[ $seen != *"${US}${GROUP}${US}"* ]]; then
+			seen="${seen}${US}${GROUP}${US}"
+			order[${#order[@]}]=$GROUP
+		fi
+	done
+
+	if ((${#order[@]} > 1)); then
+		local sorted=()
+		while IFS= read -r g; do
+			sorted[${#sorted[@]}]=${g#*"$US"}
+		done < <(
+			for g in "${order[@]}"; do
+				group_sort_key "$g"
+				printf '%s%s%s\n' "$SORTKEY" "$US" "$g"
+			done | LC_ALL=C sort
+		)
+		order=("${sorted[@]}")
+	fi
+
+	IDX=()
+	GROUP_NAME=()
+	GROUP_START=()
+	local members j k tmp
+	for g in ${order[@]+"${order[@]}"}; do
+		GROUP_NAME[${#GROUP_NAME[@]}]=$g
+		GROUP_START[${#GROUP_START[@]}]=${#IDX[@]}
+		members=()
+		for i in ${pass[@]+"${pass[@]}"}; do
+			group_of "$i"
+			[[ $GROUP == "$g" ]] || continue
+			members[${#members[@]}]=$i
+		done
+		# Grouped by tab, the frames sit in the order the panes do on screen, so the row of
+		# frames lines up with the row of panes behind it. Any other grouping keeps the
+		# roster's urgency order, since there is no layout for it to mirror.
+		#
+		# Insertion sort rather than a pipe to sort: a group is a handful of panes, and this
+		# runs on every redraw.
+		if [[ $grouping == tab ]] && ((${#members[@]} > 1)); then
+			for ((j = 1; j < ${#members[@]}; j++)); do
+				tmp=${members[j]}
+				k=$((j - 1))
+				while ((k >= 0)) && ((E_POS[members[k]] > E_POS[tmp])); do
+					members[k + 1]=${members[k]}
+					k=$((k - 1))
+				done
+				members[k + 1]=$tmp
+			done
+		fi
+		for i in ${members[@]+"${members[@]}"}; do
+			IDX[${#IDX[@]}]=$i
+		done
+	done
+	n=${#IDX[@]}
+	GROUP_START[${#GROUP_START[@]}]=$n
+}
+
+# ---------------------------------------------------------------- state glyph and colour
+
+GLYPH=""
+COLOUR=""
+style_of() {
+	local i=$1
+	if [[ ${E_ASKS[i]} == yes ]]; then
+		GLYPH="⚠"
+		COLOUR=$MAUVE
+	elif [[ ${E_KIND[i]} == busy ]]; then
+		GLYPH="◐"
+		COLOUR=$GREEN
+	elif [[ ${E_KIND[i]} == shell ]]; then
+		GLYPH="›"
+		COLOUR=$DIM
+	elif ((${E_IDLE[i]} >= 0 && ${E_IDLE[i]} < STALE_SECS)); then
+		GLYPH="✳"
+		COLOUR=$YELLOW
+	else
+		GLYPH="·"
+		COLOUR=$FAINT
+	fi
+}
+
+HEADER=""
+build_header() {
+	local head="${workspace:-all workspaces}" right marks=0 i
+	for ((i = 0; i < ${#E_MARK[@]}; i++)); do
+		[[ ${E_MARK[i]} == yes ]] && marks=$((marks + 1))
+	done
+	# Built up in priority order and stopped when it stops fitting, rather than assembled and
+	# left to wrap: the count and what is waiting are worth the room at any width, the branch
+	# and the grouping are not.
+	local seg budget
+	budget=$((COLS - ${#head} - 6))
+	right="${#E_NAME[@]} chat"
+	((${#E_NAME[@]} == 1)) || right="${right}s"
+	((WAITING > 0)) && {
+		seg=" · ${WAITING} waiting"
+		((${#right} + ${#seg} <= budget)) && right="${right}${seg}"
+	}
+	((marks > 0)) && {
+		seg=" · ${marks} marked"
+		((${#right} + ${#seg} <= budget)) && right="${right}${seg}"
+	}
+	seg=" · by ${grouping}"
+	((${#right} + ${#seg} <= budget)) && right="${right}${seg}"
+	if [[ -n $BRANCH ]]; then
+		seg=" · ${BRANCH}"
+		((DIRTY > 0)) && seg="${seg} ✎${DIRTY}"
+		((${#right} + ${#seg} <= budget)) && right="${right}${seg}"
+	fi
+	local gap=$((COLS - ${#head} - ${#right} - 4))
+	((gap < 1)) && gap=1
+	local spacer
+	printf -v spacer '%*s' "$gap" ''
+	HEADER="${HOME_POS}${BLUE}▤  ${BOLD}${head}${RESET}${spacer}${DIM}${right}${RESET}${EOL}"$'\n'
+	if [[ -n $filter ]]; then
+		HEADER+="${YELLOW}  /${filter}${RESET}${DIM}  ${#IDX[@]} of ${#E_NAME[@]}${RESET}${EOL}"$'\n'
+	else
+		HEADER+="${EOL}"$'\n'
+	fi
+}
+
+# ---------------------------------------------------------------- grid
+
+# Where each visible position landed, so h j k l can move in two dimensions across groups of
+# uneven length. ROW_START holds the position each display row begins at.
+ROW_START=()
+PER_ROW=1
+
+FRAME=""
+build_grid() {
+	local footer=$1
+	# Three cells of gutter, with a rule down the middle of it. Without a divider the cells
+	# run into each other and a row of four reads as one paragraph; with one, the eye finds
+	# the column edges without being told where they are.
+	local gutter=3 cell_w per_row sep
+	# Aimed at a readable topic rather than maximum density: about nine frames across a
+	# full-width tab, which puts a fleet of forty on one screen with room for the sentence.
+	# Aimed at a cell wide enough for a whole sentence rather than at maximum density: four
+	# frames across a full-width tab gives about a hundred columns each, which is where a
+	# closing line stops being a fragment. A fleet of forty still lands in ten rows.
+	per_row=$((COLS / 88))
+	((per_row < 1)) && per_row=1
+	((per_row > 5)) && per_row=5
+	cell_w=$(((COLS - (per_row - 1) * gutter) / per_row))
+	((cell_w < 20)) && cell_w=20
+	PER_ROW=$per_row
+
+	build_header
+	FRAME=$HEADER
+	ROW_START=()
+
+	if ((${#IDX[@]} == 0)); then
+		FRAME+="${EOL}"$'\n'"${DIM}  nothing here${RESET}${EOL}"$'\n'
+		frame_footer "$footer"
+		return
+	fi
+
+	# Two lines a frame, with the topic on the first one beside the bar. The topic is short
+	# and the state fields are shorter, so putting them on separate lines left a cell that
+	# was half empty on one row and clipped on the next; together they fill line one and
+	# hand the whole width of line two to what Claude actually said. Which is the point:
+	# the topic says which conversation this is, the closing line says whether it is
+	# finished or waiting on you.
+	local g pos start end i col l1 l2 cursor bg mark meta bar_w name_w topic_w msg_w
+	bar_w=$BAR_CELLS
+	name_w=16
+	((cell_w < 44)) && {
+		bar_w=6
+		name_w=12
+	}
+	topic_w=$((cell_w - 5 - name_w - 6 - bar_w - 5))
+	((topic_w < 8)) && topic_w=8
+	# The message line is "  ▸ " plus the text, and that prefix is four cells: budgeting the
+	# text at cell_w - 6 made every message line two columns narrower than its name line, so
+	# the columns drifted apart by two per cell and the grid stopped being a grid.
+	msg_w=$((cell_w - 4))
+
+	for ((g = 0; g < ${#GROUP_NAME[@]}; g++)); do
+		start=${GROUP_START[g]}
+		end=${GROUP_START[g + 1]}
+		((end > start)) || continue
+		FRAME+="${DIM}  ${GROUP_NAME[g]} · $((end - start))${RESET}${EOL}"$'\n'
+
+		pos=$start
+		while ((pos < end)); do
+			l1=""
+			l2=""
+			ROW_START[${#ROW_START[@]}]=$pos
+			for ((col = 0; col < per_row && pos < end; col++, pos++)); do
+				i=${IDX[pos]}
+				style_of "$i"
+				cursor=" "
+				bg=""
+				mark=" "
+				if [[ ${E_MARK[i]} == yes ]]; then
+					mark="▪"
+					bg=$MARKED
+				fi
+				((pos == selected)) && {
+					cursor="❯"
+					bg=$SELECTED
+				}
+				set_age "${E_IDLE[i]}"
+				meta=$AGE
+				set_ctxbar "${E_PCT[i]}" "$bar_w"
+
+				if ((col > 0)); then
+					l1+="${FAINT} │ ${RESET}"
+					l2+="${FAINT} │ ${RESET}"
+				fi
+
+				l1+="${bg}${BLUE}${cursor}${DIM}${mark}${COLOUR}${GLYPH} "
+				pad_to "${E_NAME[i]}" "$name_w"
+				l1+="${PAD}${DIM}"
+				pad_to "$meta" 6
+				l1+="${PAD}${CTXBAR}${bg}${DIM} "
+				pad_to "${E_PCT[i]:+${E_PCT[i]}%}" 4
+				l1+="${PAD} ${COLOUR}"
+				pad_to "${E_TITLE[i]}" "$topic_w"
+				l1+="${PAD}${RESET}"
+
+				# Mauve when the closing line is a question: that frame is not finished, it
+				# is waiting, and this line is the only place that says so.
+				if [[ -z ${E_LAST[i]} ]]; then
+					l2+="$bg"
+					pad_to "" "$cell_w"
+				elif [[ ${E_ASKS[i]} == yes ]]; then
+					l2+="${bg}  ${MAUVE}▸ "
+					pad_to "${E_LAST[i]}" "$msg_w"
+				else
+					l2+="${bg}  ${DIM}▸ "
+					pad_to "${E_LAST[i]}" "$msg_w"
+				fi
+				l2+="${PAD}${RESET}"
+
+			done
+			FRAME+="${l1}${EOL}"$'\n'"${l2}${EOL}"$'\n'
+		done
+	done
+	ROW_START[${#ROW_START[@]}]=${#IDX[@]}
+	frame_footer "$footer"
+}
+
+# ---------------------------------------------------------------- list
+
+build_list() {
+	local footer=$1
+	# Every column shrinks or goes away as the pane narrows, and the total is held to the
+	# width rather than assumed to fit: opened as a split of one pane in a four-way tab this
+	# gets forty columns, and a row budgeted for a hundred wraps into gibberish there.
+	local name_w=17 age_w=6 ctx_w=6
+	((COLS < 76)) && {
+		name_w=13
+		ctx_w=0
+	}
+	((COLS < 56)) && {
+		name_w=11
+		age_w=5
+		ctx_w=0
+	}
+	local fixed=$((2 + 2 + name_w + 1 + age_w + 1))
+	((ctx_w > 0)) && fixed=$((fixed + ctx_w + 1))
+	local wide=true
+	((COLS < 108)) && wide=false
+	local topic_w last_w
+	if $wide; then
+		topic_w=$((COLS - fixed - 2))
+		((topic_w > 44)) && topic_w=44
+		last_w=$((COLS - fixed - topic_w - 2))
+		((last_w < 12)) && last_w=12
+	else
+		topic_w=$((COLS - fixed))
+		((topic_w < 6)) && topic_w=6
+		last_w=$((COLS - 6))
+		((last_w < 6)) && last_w=6
+	fi
+
+	build_header
+	FRAME=$HEADER
+	ROW_START=()
+	PER_ROW=1
+
+	if ((${#IDX[@]} == 0)); then
+		FRAME+="${EOL}"$'\n'"${DIM}  nothing here${RESET}${EOL}"$'\n'
+		frame_footer "$footer"
+		return
+	fi
+
+	local capacity=$((ROWS - 6))
+	$wide || capacity=$((capacity / 2))
+	((capacity < 1)) && capacity=1
+	local first=0
+	((selected >= capacity)) && first=$((selected - capacity + 1))
+	local shown=$((${#IDX[@]} - first))
+	((shown > capacity)) && shown=$capacity
+
+	local pos i cursor bg meta line quote_colour topic_colour
+	for ((pos = first; pos < first + shown; pos++)); do
+		i=${IDX[pos]}
+		ROW_START[${#ROW_START[@]}]=$pos
+		style_of "$i"
+		cursor="  "
+		bg=""
+		[[ ${E_MARK[i]} == yes ]] && bg=$MARKED
+		((pos == selected)) && {
+			cursor="${BLUE}❯ "
+			bg=$SELECTED
+		}
+		set_age "${E_IDLE[i]}"
+		meta=$AGE
+		topic_colour=$RESET
+		[[ $GLYPH == "·" ]] && topic_colour=$FAINT
+		quote_colour=$DIM
+		[[ ${E_ASKS[i]} == yes ]] && quote_colour=$MAUVE
+
+		line="${bg}${cursor}${COLOUR}${GLYPH} "
+		pad_to "${E_NAME[i]}" "$name_w"
+		line+="${PAD}${RESET}${bg} ${DIM}"
+		pad_to "$meta" "$age_w"
+		line+="$PAD"
+		if ((ctx_w > 0)); then
+			pad_to "${E_PCT[i]:+${E_PCT[i]}%}" "$ctx_w"
+			line+=" $PAD"
+		fi
+		line+="${topic_colour}${bg}"
+		pad_to "${E_TITLE[i]}" "$topic_w"
+		line+="${PAD}${RESET}${bg} "
+		if $wide; then
+			pad_to "${E_LAST[i]}" "$last_w"
+			FRAME+="${line}${quote_colour}${bg}${PAD}${bg}${EOL}${RESET}"$'\n'
+		else
+			FRAME+="${line}${EOL}${RESET}"$'\n'
+			if [[ -n ${E_LAST[i]} ]]; then
+				pad_to "${E_LAST[i]}" "$last_w"
+				FRAME+="      ${quote_colour}${PAD}${RESET}${EOL}"$'\n'
+			fi
+		fi
+	done
+	ROW_START[${#ROW_START[@]}]=$((first + shown))
+	if ((first + shown < ${#IDX[@]})); then
+		FRAME+="${DIM}  $((${#IDX[@]} - first - shown)) more below${RESET}${EOL}"$'\n'
+	fi
+	frame_footer "$footer"
+}
+
+build_frame() {
+	# The grid needs about ninety columns for one frame to hold a sentence; below that its
+	# cells clip to nothing useful and the list, which gives the whole width to one session
+	# at a time, reads far better. Opened as a split of one pane in a four-way tab that is
+	# the normal case, so it switches itself rather than waiting to be told.
+	if [[ $view == grid ]] && ((COLS < 88)); then
+		build_list "$1"
+		return
+	fi
+	if [[ $view == grid ]]; then
+		build_grid "$1"
+	else
+		build_list "$1"
+	fi
+}
+
+# The last two rows of any frame. Clipped to the width rather than left to wrap: in a forty
+# column split the key list is three wrapped lines of noise, and the legend is not worth its
+# room at all.
+frame_footer() {
+	FRAME+="${EOL}"$'\n'
+	if ((COLS >= 100)); then
+		pad_to "$LEGEND" $((COLS - 2))
+		FRAME+="${DIM}  ${PAD}${RESET}${EOL}"$'\n'
+	fi
+	pad_to "$1" $((COLS - 2))
+	FRAME+="${FAINT}  ${PAD}${RESET}${EOL}${EOS}"
+}
+
+readonly KEYS="h j k l move · enter jump · m mark · M move marked here · t regroup · v view · x close · / filter · q quit"
+readonly LEGEND="⚠ waiting on you   ◐ working   ✳ live   · cold      bar = context used, amber past half, red past 80%"
+
+# ---------------------------------------------------------------- non-interactive modes
+
+# The roster plus what only a pane read can tell you: whether it is waiting on you, how full
+# its context is, and its closing line. The wezterm pickers want all three, and cc-fleet
+# cannot supply them because it never looks at a screen.
+if [[ $mode == tsv ]]; then
+	measure
+	load
+	for ((i = 0; i < ${#E_NAME[@]}; i++)); do
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"${E_WS[i]}" "${E_PANE[i]}" "${E_NAME[i]}" "${E_KIND[i]}" "${E_ASKS[i]}" \
+			"${E_IDLE[i]}" "${E_PCT[i]}" "${E_TITLE[i]}" "${E_LAST[i]}"
+	done
+	exit 0
+fi
+
+if [[ $mode == once ]]; then
+	measure
+	load
+	build_visible
+	build_frame "$KEYS"
+	printf '%s\n' "$FRAME"
+	exit 0
+fi
+
+if [[ $mode == watch ]]; then
+	printf '\033[?25l'
+	painted=""
+	while :; do
+		measure
+		load
+		build_visible
+		build_frame "$KEYS"
+		if [[ $FRAME != "$painted" ]]; then
+			printf '%s' "$FRAME"
+			painted=$FRAME
+		fi
+		sleep "$REFRESH_SECS"
+	done
+fi
+
+# ---------------------------------------------------------------- interactive
+
+# ESC arrives both as a key in its own right and as the head of an arrow sequence, so a lone
+# ESC is only ESC once the follow-up read has timed out. This bash takes whole seconds only,
+# so that wait is a second; arrow bytes arrive together and return at once, and q is there
+# for anyone who does not want to wait for Escape.
+read_key() {
+	local timeout=$1 k rest
+	if [[ -n $timeout ]]; then
+		IFS= read -rsn1 -t "$timeout" k || {
+			printf 'TIMEOUT'
+			return
+		}
+	else
+		IFS= read -rsn1 k || {
+			printf 'TIMEOUT'
+			return
+		}
+	fi
+	case $k in
+	$'\e')
+		IFS= read -rsn2 -t 1 rest || {
+			printf 'ESC'
+			return
+		}
+		case $rest in
+		'[A') printf 'UP' ;;
+		'[B') printf 'DOWN' ;;
+		'[C') printf 'RIGHT' ;;
+		'[D') printf 'LEFT' ;;
+		*) printf 'ESC' ;;
+		esac
+		;;
+	'') printf 'ENTER' ;;
+	$'\x7f') printf 'BACK' ;;
+	*) printf 'CHAR%s' "$k" ;;
+	esac
+}
+
+# Vertical movement in a grid whose rows are broken by groups: find the display row holding
+# the cursor, keep the column offset, and land in the same column of the next one.
+move_vertical() {
+	local delta=$1 r target off
+	if ((PER_ROW <= 1)); then
+		selected=$((selected + delta))
+		return
+	fi
+	for ((r = 0; r + 1 < ${#ROW_START[@]}; r++)); do
+		((selected >= ROW_START[r] && selected < ROW_START[r + 1])) && break
+	done
+	off=$((selected - ROW_START[r]))
+	target=$((r + delta))
+	((target < 0)) && target=0
+	((target + 1 >= ${#ROW_START[@]})) && target=$((${#ROW_START[@]} - 2))
+	((target < 0)) && return
+	selected=$((ROW_START[target] + off))
+	((selected >= ROW_START[target + 1])) && selected=$((ROW_START[target + 1] - 1))
+}
+
+# Selection follows the session, not the position. The list re-sorts as sessions change
+# state, so a cursor that stayed put would come to rest on a different conversation between
+# one refresh and the next - and x closes whatever it is resting on.
+reload() {
+	local keep="" i
+	((${#IDX[@]} > 0)) && keep=${E_PANE[${IDX[selected]}]}
+	load ${1:+fresh}
+	build_visible
+	if [[ -n $keep ]]; then
+		for ((i = 0; i < ${#IDX[@]}; i++)); do
+			if [[ ${E_PANE[${IDX[i]}]} == "$keep" ]]; then
+				selected=$i
+				return
+			fi
+		done
+	fi
+}
+
+jump() {
+	wezterm cli activate-pane --pane-id "$1" 2>/dev/null
+}
+
+# The organising move: everything marked becomes a split alongside the pane the board was
+# opened from, so scattered conversations end up on one tab. Reversible - move them back the
+# same way - and it never touches the conversations themselves.
+move_marked() {
+	local i moved=0 target=$ORIGIN
+	if [[ -z $target ]]; then
+		MESSAGE="no tab to move into: the board was started by hand, not with LEADER+b"
+		return
+	fi
+	for ((i = 0; i < ${#E_PANE[@]}; i++)); do
+		[[ ${E_MARK[i]} == yes ]] || continue
+		[[ ${E_PANE[i]} == "$target" ]] && continue
+		if wezterm cli split-pane --pane-id "$target" --move-pane-id "${E_PANE[i]}" \
+			--right >/dev/null 2>&1; then
+			moved=$((moved + 1))
+		fi
+	done
+	if ((moved == 0)); then
+		MESSAGE="nothing marked to move — m marks the session under the cursor"
+	else
+		MESSAGE="moved $moved into your tab"
+	fi
+}
+
+# Naming the pane so LEADER+b can find this one and put it away, and so format-tab-title
+# treats it as furniture rather than as another topic competing for the tab's title.
+printf '\033]0;%s\007' "${CC_BOARD_TITLE:-▤ board}"
+
+printf '\033[?1049h\033[?25l'
+measure
+
+# Painted before the first load, which costs about a second the first time: without it the
+# tab opens black and reads as hung.
+printf '%s' "${HOME_POS}${BLUE}▤  ${BOLD}${workspace:-all workspaces}${RESET}${EOL}
+${EOL}
+${DIM}  reading the workspace…${RESET}${EOL}${EOS}"
+
+load
+build_visible
+filtering=false
+paused=false
+MESSAGE=""
+painted=""
+LAST_KEY_AT=0
+
+while :; do
+	measure
+	build_visible
+	((selected >= ${#IDX[@]})) && selected=$((${#IDX[@]} - 1))
+	((selected < 0)) && selected=0
+
+	if [[ -n $MESSAGE ]]; then
+		build_frame "$MESSAGE"
+	elif $filtering; then
+		build_frame "filtering — enter to keep it, esc to clear it"
+	else
+		build_frame "$KEYS"
+	fi
+	if [[ $FRAME != "$painted" ]]; then
+		printf '%s' "$FRAME"
+		painted=$FRAME
+	fi
+
+	# Blocked with no timeout once a jump has moved the window elsewhere: this tab is off
+	# screen, so polling it would read twenty panes for nobody. The next keypress means you
+	# are back.
+	if $paused; then
+		read_key "" >/dev/null
+		paused=false
+		MESSAGE=""
+		reload fresh
+		continue
+	fi
+
+	key=$(read_key 1)
+	now=$(date +%s)
+
+	if [[ $key == TIMEOUT ]]; then
+		# Only while you are not driving it. Reading twenty panes takes a third of a second,
+		# and spending that between two presses of j is what makes a list feel like it is
+		# fighting you.
+		if ! $filtering &&
+			((now - LAST_KEY_AT >= 2)) &&
+			((now - LOADED_AT >= REFRESH_SECS)); then
+			reload
+		fi
+		continue
+	fi
+
+	LAST_KEY_AT=$now
+	MESSAGE=""
+
+	if $filtering; then
+		case $key in
+		ENTER) filtering=false ;;
+		ESC)
+			filtering=false
+			filter=""
+			;;
+		BACK) filter=${filter%?} ;;
+		UP) move_vertical -1 ;;
+		DOWN) move_vertical 1 ;;
+		CHAR*) filter="${filter}${key#CHAR}" ;;
+		esac
+		continue
+	fi
+
+	case $key in
+	LEFT | CHARh) selected=$((selected - 1)) ;;
+	RIGHT | CHARl) selected=$((selected + 1)) ;;
+	UP | CHARk) move_vertical -1 ;;
+	DOWN | CHARj) move_vertical 1 ;;
+	CHARg) selected=0 ;;
+	CHARG) selected=$((${#IDX[@]} - 1)) ;;
+	CHAR/) filtering=true ;;
+	CHARr) reload fresh ;;
+	CHARv)
+		if [[ $view == grid ]]; then view=list; else view=grid; fi
+		;;
+	CHARt)
+		# workspace grouping only means anything when more than one is on screen.
+		if $all; then
+			MESSAGE="grouped by workspace — that is the only grouping across all of them"
+		else
+			local_next=0
+			for ((gi = 0; gi < ${#GROUPINGS[@]}; gi++)); do
+				[[ ${GROUPINGS[gi]} == "$grouping" ]] && local_next=$(((gi + 1) % ${#GROUPINGS[@]}))
+			done
+			grouping=${GROUPINGS[local_next]}
+		fi
+		;;
+	CHARm)
+		((${#IDX[@]} == 0)) && continue
+		i=${IDX[selected]}
+		if [[ ${E_MARK[i]} == yes ]]; then
+			E_MARK[i]=no
+		else
+			E_MARK[i]=yes
+		fi
+		selected=$((selected + 1))
+		;;
+	CHARM) move_marked ;;
+	ENTER)
+		((${#IDX[@]} == 0)) && continue
+		i=${IDX[selected]}
+		if [[ ${E_PANE[i]} == "-" ]]; then
+			MESSAGE="${E_NAME[i]} is live but has no pane on screen"
+			continue
+		fi
+		jump "${E_PANE[i]}"
+		paused=true
+		;;
+	CHARx)
+		((${#IDX[@]} == 0)) && continue
+		i=${IDX[selected]}
+		build_frame "close ${E_NAME[i]}? the conversation survives — claude --resume brings it back.  y/n"
+		printf '%s' "$FRAME"
+		painted=$FRAME
+		confirm=$(read_key "")
+		if [[ $confirm == CHARy ]]; then
+			wezterm cli kill-pane --pane-id "${E_PANE[i]}" 2>/dev/null
+			MESSAGE="closed ${E_NAME[i]}"
+			reload fresh
+		fi
+		;;
+	CHARq) break ;;
+	ESC) break ;;
+	esac
+done
