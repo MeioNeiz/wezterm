@@ -22,10 +22,10 @@
 #
 # It also organises, not just reports. Grouping defaults to the tab each session physically
 # sits in, so the view shows you your own layout and where it has gone wrong; m marks and M
-# moves the marked panes into the tab you came from.
+# moves the marked panes onto the end of whichever tab the board is sitting in.
 #
 #   h j k l    move          enter  jump to it        m  mark
-#   v          grid / rows   x      close it          M  move marked here
+#   v          grid / rows   x      close it          M  move marked onto this tab
 #   t          regroup       c      hide cold         / filter    r refresh    q leave
 #
 # The first frame costs about twenty milliseconds. It is drawn from `wezterm cli list` and
@@ -58,6 +58,9 @@ readonly PANE_STATE="$HOME/.claude/wezterm-state"
 readonly US=$'\x1f'
 readonly STALE_SECS=$((8 * 3600))
 readonly REFRESH_SECS=6
+# How long a prompt cache lives. An hour for these sessions; override it if that changes.
+readonly CACHE_TTL=${CC_CACHE_TTL:-3600}
+NOW=0
 
 readonly BLUE=$'\033[38;2;135;215;250m'
 readonly MAUVE=$'\033[38;2;203;166;247m'
@@ -100,7 +103,7 @@ cc-board - every Claude session in a workspace, on one screen
                            the enriched roster, for the wezterm pickers and for scripts
 
   h j k l  move            enter  jump to it          m  mark / unmark
-  v        grid or rows    x      close it            M  move marked into your tab
+  v        grid or rows    x      close it            M  move marked onto this tab
   t        regroup         c      hide cold           /  filter    r refresh    q leave
 
 Grid view is a frame per session: state, name, time since your last prompt, the topic, and
@@ -284,6 +287,8 @@ E_TAB=()
 E_TABLABEL=()
 E_POS=()
 E_DIR=()
+E_ID=()
+E_SINCE=()
 E_HAVE=()
 BRANCH=""
 DIRTY=0
@@ -312,31 +317,102 @@ idx_of() {
 # Notification hooks write that pane's state beside it. Between them they say which panes on
 # screen are Claude and what each one is doing - for nothing, since both are already on
 # disk. Read with the read builtin over a glob: forty-five files, no forks.
-SESSION_PANES="|"
-STATEMAP="|"
+# Lookup tables as variables named after their key rather than as one long "|k=v|" string.
+# ${string#*"|$k="} is the obvious way to do it and it costs about a millisecond a call
+# here: bash matches patterns character by character in a UTF-8 locale, so the cost is the
+# whole map every time, and a map holding session ids is two kilobytes. Sixty-nine of those
+# per scan was a tenth of a second. Indirect expansion is a hash lookup.
+MAPKEYS=()
+map_reset() {
+	local k
+	for k in ${MAPKEYS[@]+"${MAPKEYS[@]}"}; do unset "$k"; done
+	MAPKEYS=()
+}
+map_set() {
+	printf -v "$1" '%s' "$2"
+	MAPKEYS[${#MAPKEYS[@]}]=$1
+}
+
+SESSION_IDS="|"
 scan_hook_maps() {
-	local f p sid st
-	SESSION_PANES="|"
+	local f p sid st at
+	SESSION_IDS="|"
 	for f in "$PANE_MAP"/*; do
 		[[ -r $f ]] || continue
 		IFS= read -r sid <"$f" || continue
 		[[ -n $sid ]] || continue
 		p=${f##*/}
-		SESSION_PANES="${SESSION_PANES}${p}|"
+		[[ $p =~ ^[0-9]+$ ]] || continue
+		SESSION_IDS="${SESSION_IDS}${sid}|"
+		map_set "hk_sid_$p" "$sid"
 	done
-	STATEMAP="|"
 	for f in "$PANE_STATE"/*; do
 		[[ -r $f ]] || continue
-		IFS=$'\t' read -r st _ <"$f" || continue
+		IFS=$'\t' read -r st at _ <"$f" || continue
 		p=${f##*/}
-		STATEMAP="${STATEMAP}${p}=${st:-idle}|"
+		[[ $p =~ ^[0-9]+$ ]] || continue
+		map_set "hk_st_$p" "${st:-idle},${at:-0}"
 	done
 }
 
+# State, and when the hook wrote it - which for a working session is when it started, and so
+# how long it has been at it. A session that has been working for forty minutes is a
+# different thing from one that started ten seconds ago, and nothing else here says which.
+PSTATE=""
+PSINCE=0
 state_of_pane() {
-	local rest
-	rest=${STATEMAP#*"|$1="}
-	if [[ $rest == "$STATEMAP" ]]; then PSTATE=""; else PSTATE=${rest%%"|"*}; fi
+	local k="hk_st_$1" entry
+	PSTATE=""
+	PSINCE=0
+	entry=${!k:-}
+	[[ -n $entry ]] || return
+	PSTATE=${entry%%,*}
+	PSINCE=${entry#*,}
+	[[ $PSINCE =~ ^[0-9]+$ ]] || PSINCE=0
+}
+
+SID=""
+sid_of_pane() {
+	local k="hk_sid_$1"
+	SID=${!k:-}
+}
+
+# Whether a session's prompt cache is still alive, which is the difference between picking
+# it up instantly and paying to re-read the whole conversation. The clock it runs on is the
+# last call to the API, which is not the age column: that counts from *your* last prompt and
+# ignores an hour of agent work after it.
+#
+# The registry's statusUpdatedAt is that clock, near enough - it is stamped when a session
+# stops working, which is when its last request finished, and it tracked the last assistant
+# message to the minute in every session tested. Not the transcript's mtime, which looks
+# like the same thing and is not: those get appended to long after the last exchange, and
+# every session on this machine looked warm.
+#
+# One jq over every registry file on the machine, five milliseconds, against a tail and a
+# grep and a jq per session.
+scan_registry() {
+	local id at
+	while IFS='=' read -r id at; do
+		[[ -n $id && -n $at ]] || continue
+		map_set "ck_${id//-/_}" "$at"
+	done < <(jq -r '
+		select(.sessionId != null)
+		| [ .sessionId, ((((.statusUpdatedAt // .updatedAt // 0) / 1000) | floor | tostring)) ]
+		| join("=")' "$HOME"/.claude/sessions/*.json 2>/dev/null)
+}
+
+# Seconds of prompt cache left, or -1 when there is nothing to go on.
+CACHE_LEFT=-1
+cache_left_of() {
+	local k at
+	CACHE_LEFT=-1
+	[[ -n $1 ]] || return
+	k="ck_${1//-/_}"
+	at=${!k:-}
+	[[ $at =~ ^[0-9]+$ ]] || return
+	((at == 0)) && return
+	CACHE_LEFT=$((at + CACHE_TTL - NOW))
+	((CACHE_LEFT < 0)) && CACHE_LEFT=0
 }
 
 # A wezterm pane title is the Claude topic with its status glyph in front, which makes it the
@@ -364,12 +440,11 @@ pane_topic() {
 # ids out as tabs are created; only a tab bar reordered by hand would disagree, and nothing
 # in this config binds MoveTab. A tab you have named with LEADER+, is labelled by its name
 # instead, which beats any number.
-TABMAP="|"
 TABLABEL=""
 tab_label() {
-	local rest
-	rest=${TABMAP#*"|$1="}
-	if [[ $rest == "$TABMAP" ]]; then TABLABEL="tab ?"; else TABLABEL=${rest%%"|"*}; fi
+	local k="tabl_$1"
+	TABLABEL=${!k:-}
+	[[ -n $TABLABEL ]] || TABLABEL="tab ?"
 }
 
 # One wezterm call and one jq for the tab names, the pane list and every pane's position.
@@ -378,8 +453,8 @@ tab_label() {
 scan_panes() {
 	local kind a b c d e f g idx=0 prev="" label n=0
 
+	map_reset
 	scan_hook_maps
-	TABMAP="|"
 	IDXMAP="|"
 	E_PANE=()
 	E_NAME=()
@@ -396,7 +471,11 @@ scan_panes() {
 	E_TABLABEL=()
 	E_POS=()
 	E_DIR=()
+	E_ID=()
+	E_SINCE=()
 	E_HAVE=()
+	NOW=$(date +%s)
+	scan_registry
 
 	while IFS="$US" read -r kind a b c d e f g; do
 		case $kind in
@@ -416,11 +495,12 @@ scan_panes() {
 			"" | [✳✻✽◐◓◑◒]*) ;;
 			*) label="tab $idx · ${c:0:22}" ;;
 			esac
-			TABMAP="${TABMAP}${b}=${label}|"
+			map_set "tabl_$b" "$label"
 			;;
 		P)
 			# a=pane b=workspace c=tab_id d=top_row e=left_col f=title g=cwd
-			[[ $SESSION_PANES == *"|$a|"* ]] || continue
+			sid_of_pane "$a"
+			[[ -n $SID ]] || continue
 			state_of_pane "$a"
 			# A pane whose Stop hook last said "ended" is a shell that used to be Claude.
 			[[ $PSTATE == ended ]] && continue
@@ -431,6 +511,8 @@ scan_panes() {
 			E_TAB[n]=$c
 			E_POS[n]=$((d * 100000 + e))
 			E_DIR[n]=$g
+			E_ID[n]=$SID
+			E_SINCE[n]=$PSINCE
 			E_TITLE[n]=$TOPIC
 			E_NAME[n]=""
 			case $PSTATE in
@@ -497,13 +579,13 @@ merge_tails() {
 # address a session by and how long since you last spoke to it. Everything that decides
 # whether you need to look at a pane is already on screen by the time it lands.
 merge_roster() {
-	local rows=$1 ws tab pane name kind detail idle turns title i n
+	local rows=$1 ws tab pane name kind detail idle turns title id i n
 	[[ -n $rows ]] || return
 	ROSTER=$rows
 	if ! $all && [[ -n $workspace ]]; then
 		rows=$(printf '%s\n' "$rows" | awk -F"$US" -v w="$workspace" '$1 == w')
 	fi
-	while IFS="$US" read -r ws _ tab pane name kind detail idle turns _ title _; do
+	while IFS="$US" read -r ws _ tab pane name kind detail idle turns _ title id; do
 		[[ -n $name ]] || continue
 		idx_of "$pane"
 		i=$IDXOF
@@ -519,12 +601,15 @@ merge_roster() {
 			E_TAB[i]=$tab
 			E_POS[i]=999999999
 			E_DIR[i]=""
+			E_ID[i]=""
+			E_SINCE[i]=0
 			E_TITLE[i]=""
 			E_LAST[i]=""
 			E_PCT[i]=""
 			E_TABLABEL[i]="no pane"
 		fi
 		E_NAME[i]=$name
+		[[ -n $id ]] && E_ID[i]=$id
 		E_KIND[i]=$kind
 		E_DETAIL[i]=$detail
 		E_IDLE[i]=$idle
@@ -549,7 +634,7 @@ merge_roster() {
 	done
 	UNCONFIRMED=$nextmiss
 	if ((k < ${#E_PANE[@]})); then
-		local P=() N=() K=() D=() I=() U=() T=() L=() C=() A=() W=() B=() BL=() O=() R=() H=()
+		local P=() N=() K=() D=() I=() U=() T=() L=() C=() A=() W=() B=() BL=() O=() R=() H=() ID=() SN=()
 		IDXMAP="|"
 		for ((n = 0; n < k; n++)); do
 			i=${keep[n]}
@@ -557,6 +642,7 @@ merge_roster() {
 			I[n]=${E_IDLE[i]}; U[n]=${E_TURNS[i]}; T[n]=${E_TITLE[i]}; L[n]=${E_LAST[i]}
 			C[n]=${E_PCT[i]}; A[n]=${E_ASKS[i]}; W[n]=${E_WS[i]}; B[n]=${E_TAB[i]}
 			BL[n]=${E_TABLABEL[i]}; O[n]=${E_POS[i]}; R[n]=${E_DIR[i]}; H[n]=${E_HAVE[i]}
+			ID[n]=${E_ID[i]}; SN[n]=${E_SINCE[i]}
 			IDXMAP="${IDXMAP}${P[n]}=${n}|"
 		done
 		E_PANE=(${P[@]+"${P[@]}"}); E_NAME=(${N[@]+"${N[@]}"}); E_KIND=(${K[@]+"${K[@]}"})
@@ -564,7 +650,7 @@ merge_roster() {
 		E_TITLE=(${T[@]+"${T[@]}"}); E_LAST=(${L[@]+"${L[@]}"}); E_PCT=(${C[@]+"${C[@]}"})
 		E_ASKS=(${A[@]+"${A[@]}"}); E_WS=(${W[@]+"${W[@]}"}); E_TAB=(${B[@]+"${B[@]}"})
 		E_TABLABEL=(${BL[@]+"${BL[@]}"}); E_POS=(${O[@]+"${O[@]}"}); E_DIR=(${R[@]+"${R[@]}"})
-		E_HAVE=(${H[@]+"${H[@]}"})
+		E_HAVE=(${H[@]+"${H[@]}"}); E_ID=(${ID[@]+"${ID[@]}"}); E_SINCE=(${SN[@]+"${SN[@]}"})
 	fi
 	ROSTER_MERGED=true
 	recompute_flags
@@ -585,7 +671,8 @@ recompute_flags() {
 		fi
 		is_cold "$i" && COLD=$((COLD + 1))
 	done
-	LOADED_AT=$(date +%s)
+	NOW=$(date +%s)
+	LOADED_AT=$NOW
 }
 
 is_cold() {
@@ -1082,32 +1169,35 @@ NAME_W=0
 AGE_W=5
 BAR_W=8
 PCT_W=0
+CACHE_W=0
 LAST_W=0
 LABEL_W=20
 row_widths() {
+	CACHE_W=1
+	((COLS < 40)) && CACHE_W=0
 	if ((COLS >= 120)); then
 		NAME_W=16 AGE_W=5 BAR_W=10 PCT_W=4
 		LABEL_W=40
-		LAST_W=$((COLS - 4 - NAME_W - 1 - 1 - AGE_W - 1 - BAR_W - 1 - PCT_W - LABEL_W - 2))
+		LAST_W=$((COLS - 4 - NAME_W - 1 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1 - PCT_W - LABEL_W - 2))
 		((LAST_W < 24)) && {
 			LABEL_W=$((LABEL_W + LAST_W - 24))
 			LAST_W=24
 		}
 	elif ((COLS >= 96)); then
 		NAME_W=16 AGE_W=5 BAR_W=10 PCT_W=4 LAST_W=0
-		LABEL_W=$((COLS - 4 - NAME_W - 1 - 1 - AGE_W - 1 - BAR_W - 1 - PCT_W - 1))
+		LABEL_W=$((COLS - 4 - NAME_W - 1 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1 - PCT_W - 1))
 	elif ((COLS >= 64)); then
 		NAME_W=0 AGE_W=5 BAR_W=8 PCT_W=4 LAST_W=0
-		LABEL_W=$((COLS - 4 - 1 - AGE_W - 1 - BAR_W - 1 - PCT_W - 1))
+		LABEL_W=$((COLS - 4 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1 - PCT_W - 1))
 	elif ((COLS >= 44)); then
 		NAME_W=0 AGE_W=5 BAR_W=6 PCT_W=0 LAST_W=0
-		LABEL_W=$((COLS - 4 - 1 - AGE_W - 1 - BAR_W - 1))
+		LABEL_W=$((COLS - 4 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1))
 	elif ((COLS >= 32)); then
 		NAME_W=0 AGE_W=4 BAR_W=4 PCT_W=0 LAST_W=0
-		LABEL_W=$((COLS - 4 - 1 - AGE_W - 1 - BAR_W - 1))
+		LABEL_W=$((COLS - 4 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1))
 	else
 		NAME_W=0 AGE_W=3 BAR_W=0 PCT_W=0 LAST_W=0
-		LABEL_W=$((COLS - 4 - 1 - AGE_W - 1))
+		LABEL_W=$((COLS - 4 - 1 - CACHE_W - AGE_W - 1))
 	fi
 	((LABEL_W < 6)) && LABEL_W=6
 }
@@ -1159,7 +1249,16 @@ emit_row() {
 		pad_to "${E_NAME[i]}" "$NAME_W"
 		line+=" ${FAINT}${PAD}"
 	fi
-	line+="${DIM} "
+	line+=" "
+	# One cell for whether the prompt cache is still alive. Marked when it is, rather than
+	# when it is not: past an hour most of a fleet this size is cold, and a column of
+	# warnings that is nearly always lit says nothing. This one lights on the few you can
+	# still pick up for free.
+	if ((CACHE_W > 0)); then
+		cache_left_of "${E_ID[i]}"
+		if ((CACHE_LEFT > 0)); then line+="${BLUE}•${bg}"; else line+=" "; fi
+	fi
+	line+="${DIM}"
 	pad_left "$meta" "$AGE_W"
 	line+="$PADL"
 	if ((BAR_W > 0)); then
@@ -1219,9 +1318,8 @@ emit_expansion() {
 	fi
 
 	# Where it is and what to call it. Last, because you only need it once you have decided
-	# to do something about the thing above it.
-	# Before the roster lands there is no name, and the pane is the only handle there is -
-	# in which case it is the label, not an extra segment appended to itself.
+	# to do something about the thing above it. Ordered by what you would want first if you
+	# had: the name to address it by, what it is doing, and whether picking it up is free.
 	meta=${E_NAME[i]}
 	local haspane=false
 	[[ -z $meta ]] && {
@@ -1233,22 +1331,35 @@ emit_expansion() {
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
 	elif [[ ${E_KIND[i]} == busy ]]; then
 		seg=" · working"
+		if ((${E_SINCE[i]:-0} > 0 && NOW > E_SINCE[i])); then
+			set_age $((NOW - E_SINCE[i]))
+			seg=" · working ${AGE}"
+		fi
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
 	fi
-	if [[ $grouping != tab ]]; then
-		seg=" · ${E_TABLABEL[i]}"
+	cache_left_of "${E_ID[i]}"
+	if ((CACHE_LEFT >= 60)); then
+		seg=" · cache $((CACHE_LEFT / 60))m left"
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
-	fi
-	if [[ ${E_PANE[i]} != "-" ]] && ! $haspane; then
-		seg=" · pane ${E_PANE[i]}"
+	elif ((CACHE_LEFT >= 0)); then
+		seg=" · cache gone"
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
 	fi
 	if ((PCT_W == 0)) && [[ -n ${E_PCT[i]} ]]; then
 		seg=" · ${E_PCT[i]}% context"
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
 	fi
+	if [[ ${E_PANE[i]} != "-" ]] && ! $haspane; then
+		seg=" · pane ${E_PANE[i]}"
+		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
+	fi
+	if [[ $grouping != tab ]]; then
+		seg=" · ${E_TABLABEL[i]}"
+		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
+	fi
 	if [[ -n ${E_TURNS[i]} ]] && ((E_TURNS[i] > 0)); then
-		seg=" · ${E_TURNS[i]} turns"
+		seg=" · ${E_TURNS[i]} turn"
+		((E_TURNS[i] == 1)) || seg="${seg}s"
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
 	fi
 	pad_to "$meta" "$w"
@@ -1453,7 +1564,7 @@ HELPKEYS=(
 	"enter|jump to that pane"
 	"g  G|first, last"
 	"m|mark it"
-	"M|move every mark in beside your pane"
+	"M|move every mark onto the end of this tab"
 	"t|regroup: tab, state, name prefix"
 	"c|hide the cold ones"
 	"v|grid or rows"
@@ -1461,6 +1572,13 @@ HELPKEYS=(
 	"/|filter on topic, name or last line"
 	"r|refresh now"
 	"q  esc|leave"
+)
+
+HELPNOTES=(
+	"⚠ waiting on you · ◐ working · ✳ live · · cold"
+	"the bar is context used, amber past half, red past 80%"
+	"• its prompt cache is still warm, so picking it up costs nothing"
+	"x closes a pane; the chat survives, claude --resume brings it back"
 )
 
 showhelp=false
@@ -1479,9 +1597,10 @@ build_help() {
 		FRAME+="${line}${EOL}"$'\n'
 	done
 	FRAME+="${EOL}"$'\n'
-	pad_to "x closes a pane; the chat survives, claude --resume brings it back" \
-		$((COLS - 4))
-	FRAME+="${FAINT}  ${PAD}${RESET}${EOL}"$'\n'
+	for entry in "${HELPNOTES[@]}"; do
+		pad_to "$entry" $((COLS - 4))
+		FRAME+="${FAINT}  ${PAD}${RESET}${EOL}"$'\n'
+	done
 	frame_footer "any key to go back"
 }
 
@@ -1490,7 +1609,6 @@ build_help() {
 FOOTER_LINES=2
 build_frame() {
 	FOOTER_LINES=2
-	((COLS >= 100)) && FOOTER_LINES=3
 	if $showhelp; then
 		build_help
 		return
@@ -1514,19 +1632,14 @@ frame_footer() {
 	((COLS < 100)) && keys=$KEYS_MID
 	((COLS < 62)) && keys=$KEYS_NARROW
 	FRAME+="${EOL}"$'\n'
-	if ((COLS >= 100)); then
-		pad_to "$LEGEND" $((COLS - 2))
-		FRAME+="${RULE}  ${PAD}${RESET}${EOL}"$'\n'
-	fi
 	if [[ $1 != "$KEYS" ]]; then keys=$1; fi
 	pad_to "$keys" $((COLS - 2))
 	FRAME+="${FAINT}  ${PAD}${RESET}${EOL}${EOS}"
 }
 
-readonly KEYS="h j k l move · enter jump · m mark · M move marked here · t regroup · c hide cold · v view · x close · / filter · ? keys · q quit"
-readonly KEYS_MID="j k move · enter jump · m mark · t regroup · / filter · ? keys · q quit"
+readonly KEYS="h j k l move · enter jump · m mark · M move marked onto this tab · t regroup · c hide cold · v view · x close · / filter · ? keys · q quit"
+readonly KEYS_MID="j k move · enter jump · m mark · M move here · t regroup · / filter · ? keys · q quit"
 readonly KEYS_NARROW="j k move · ⏎ jump · / find · ? keys · q quit"
-readonly LEGEND="⚠ waiting on you   ◐ working   ✳ live   · cold      bar = context used, amber past half, red past 80%"
 
 # ---------------------------------------------------------------- non-interactive modes
 
@@ -1588,8 +1701,8 @@ if [[ -z $workspace ]] && ! $all && [[ -n ${WEZTERM_PANE:-} ]]; then
 			'.[] | select((.pane_id|tostring) == $p) | .workspace' 2>/dev/null)
 fi
 
-# Where LEADER+b was pressed, so M knows which tab "here" means. Absent when the board is
-# started by hand, in which case M has nowhere to move things to and says so.
+# Where LEADER+b was pressed. Only a fallback now that M asks which tab the board is
+# actually in: it still matters for a board running somewhere with no pane of its own.
 ORIGIN=${CC_BOARD_ORIGIN:-}
 
 # ESC arrives both as a key in its own right and as the head of an arrow sequence, so a lone
@@ -1709,13 +1822,32 @@ jump() {
 	wezterm cli activate-pane --pane-id "$1" 2>/dev/null
 }
 
-# The organising move: everything marked becomes a split alongside the pane the board was
-# opened from, so scattered conversations end up on one tab. Reversible - move them back the
-# same way - and it never touches the conversations themselves.
+# Where "here" is. The board moves between tabs - LEADER+b brings the running pane to
+# whichever tab you press it in - so the tab to move things into is the one the board is
+# sitting in now, not the one it was launched from. Asked fresh rather than read off the
+# last scan, because the move may have happened a moment ago.
+HOME_TARGET=""
+find_home_target() {
+	HOME_TARGET=""
+	[[ -n ${WEZTERM_PANE:-} ]] || return
+	# Rightmost, and the marked panes are split to its right, so they land on the end of the
+	# tab rather than being inserted into the middle of work already arranged.
+	HOME_TARGET=$(wezterm cli list --format json 2>/dev/null |
+		jq -r --arg me "$WEZTERM_PANE" '
+			(.[] | select((.pane_id|tostring) == $me) | .tab_id) as $tab
+			| [ .[] | select(.tab_id == $tab) | select((.pane_id|tostring) != $me) ]
+			| sort_by(-.left_col, .top_row) | .[0].pane_id // empty | tostring' 2>/dev/null)
+}
+
+# The organising move: everything marked becomes a split on the end of the tab the board is
+# in, so scattered conversations end up together. Reversible - move them back the same way -
+# and it never touches the conversations themselves.
 move_marked() {
-	local i moved=0 target=$ORIGIN
+	local i moved=0 target
+	find_home_target
+	target=${HOME_TARGET:-$ORIGIN}
 	if [[ -z $target ]]; then
-		MESSAGE="no tab to move into: the board was started by hand, not with LEADER+b"
+		MESSAGE="nowhere to put them: the board is the only pane in its tab"
 		return
 	fi
 	for ((i = 0; i < ${#E_PANE[@]}; i++)); do
@@ -1724,12 +1856,16 @@ move_marked() {
 		if wezterm cli split-pane --pane-id "$target" --move-pane-id "${E_PANE[i]}" \
 			--right >/dev/null 2>&1; then
 			moved=$((moved + 1))
+			# A move keeps the pane id, so walking the target along puts the next one to the
+			# right of the last. Without it they arrive in reverse.
+			target=${E_PANE[i]}
+			MARKED_PANES=${MARKED_PANES/"|${E_PANE[i]}|"/"|"}
 		fi
 	done
 	if ((moved == 0)); then
 		MESSAGE="nothing marked to move: m marks the session under the cursor"
 	else
-		MESSAGE="moved $moved into your tab"
+		MESSAGE="moved $moved into this tab"
 	fi
 }
 

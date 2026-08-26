@@ -16,6 +16,12 @@ State the scripts read, none of it theirs:
 - `~/.claude/history.jsonl`         every prompt I have sent, for the age column
 - `~/.claude/cache/fleet-rows`      cc-fleet's row cache, 8s
 
+`statusUpdatedAt` in the registry is when a session's last request finished, so it is the
+clock the prompt cache runs on (`CACHE_TTL`, an hour). A transcript's mtime looks like the
+same thing and is not - they get appended to long after the last exchange, and by that
+measure every session on the machine looks warm. One jq over every registry file is 5ms;
+a tail and a jq per session is half a second.
+
 ## the point of cc-board
 
 Only a pane read can tell a session that finished from one that stopped to ask a question:
@@ -38,6 +44,10 @@ the background if its cache is cold). Never make the first frame wait on the ros
 - **awk is 20200816 and byte-based**: a bracket expression of multibyte glyphs matches their
   individual bytes and strips one, corrupting the line. No `\x` escapes in regexes. Match
   multibyte text as a literal sequence, or do it in the shell
+- lookup tables go in variables named after the key (`printf -v "hk_$k"`, read `${!k:-}`),
+  not in one `|k=v|` string. `${map#*"|$k="}` matches character by character in a UTF-8
+  locale, so it costs the whole map per call - about 1ms on a 2KB one, and 69 of those per
+  scan was 100ms. Keep a list of the names and `unset` them before each rebuild
 - `${#var}` counts characters under en_GB.UTF-8, so display width needs no external help.
   **Keep the render path fork-free**: `printf -v` and globals, never command substitution.
   Shelling out to tr/wc for width was a thousand forks a frame and visibly flickered

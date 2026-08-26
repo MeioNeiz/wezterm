@@ -1769,6 +1769,26 @@ local function tab_is_zoomed(tab)
 	return false
 end
 
+-- The one board, wherever it currently is. There is never more than one: LEADER+b in a tab
+-- that has not got it moves the running pane here rather than starting another, so the
+-- filter, the marks, the grouping and the cursor survive, and one process is reading pane
+-- screens rather than one per tab you happened to press the key in.
+local function board_in_window(window)
+	local ok, tabs = pcall(function()
+		return window:mux_window():tabs()
+	end)
+	if not ok or not tabs then
+		return nil, nil
+	end
+	for _, t in ipairs(tabs) do
+		local p = board_in_tab(t)
+		if p then
+			return p, t
+		end
+	end
+	return nil, nil
+end
+
 -- The far left of the tab, however the tab is arranged. Splitting off this pane rather than
 -- off the focused one is what puts the board down the left edge instead of wherever you
 -- happened to be standing when you pressed the key.
@@ -1839,6 +1859,41 @@ table.insert(config.keys, {
 					"CC_BOARD_ORIGIN=" .. env.CC_BOARD_ORIGIN ..
 					" CC_BOARD_TITLE='" .. BOARD_TITLE .. "' " .. board_script .. "\n"
 				)
+			end)
+			return
+		end
+
+		-- Open somewhere else in this workspace: move it here rather than starting a second
+		-- one. Nothing in the lua API moves a pane between tabs, so this is the same
+		-- `split-pane --move-pane-id` the board's own M key uses.
+		local elsewhere, from_tab = board_in_window(window)
+		if elsewhere then
+			pcall(function()
+				from_tab:set_zoomed(false)
+			end)
+			local host = leftmost_pane(tab) or pane
+			local moved = false
+			pcall(function()
+				moved = wezterm.run_child_process({
+					wezterm.executable_dir .. "/wezterm", "cli", "split-pane",
+					"--pane-id", tostring(host:pane_id()),
+					"--move-pane-id", tostring(elsewhere:pane_id()),
+					"--left",
+				})
+			end)
+			if moved then
+				pcall(function()
+					elsewhere:activate()
+					tab:set_zoomed(true)
+				end)
+				return
+			end
+			-- Could not move it - no room in this tab, most likely. Leave it where it is and
+			-- go to it, which is worse than bringing it here and better than a second board.
+			pcall(function()
+				elsewhere:activate()
+				from_tab:activate()
+				from_tab:set_zoomed(true)
 			end)
 			return
 		end
