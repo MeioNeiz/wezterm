@@ -1535,6 +1535,51 @@ table.insert(config.keys, {
 -- to the panes that are not already on screen in front of you.
 local fleet_attention = { at = 0, asking = 0, fresh = 0 }
 
+---What each session has said about itself, out of cc-note. Only `mute` matters in this
+---file: a muted session is one Jacob has said he does not want chased, so it must not
+---count towards the "wants you elsewhere" marker in the status bar - that marker exists
+---to catch a blocked pane in a workspace he is not looking at, and one he has already
+---decided to leave is noise in exactly the place noise is most expensive.
+---
+---Re-read on the same 3s timer the identity pins use, and for the same reason: this runs
+---off the status bar tick, which is once a second per window.
+local notes_flags = {}
+local notes_at = 0
+
+local function load_notes()
+	local now = os.time()
+	if now - notes_at < 3 then
+		return
+	end
+	notes_at = now
+	local fresh = {}
+	local file = io.open(wezterm.home_dir .. "/.claude/fleet/notes.tsv", "r")
+	if file then
+		for line in file:lines() do
+			-- sid, updated_at, flags, progress, status
+			local sid, flags = line:match("^([^\t]+)\t[^\t]*\t([^\t]*)")
+			if sid and flags then
+				fresh[sid] = flags
+			end
+		end
+		file:close()
+	end
+	notes_flags = fresh
+end
+
+---@return boolean true when this pane's session has been muted
+local function pane_muted(pane_id)
+	local sid = read_session_id(pane_id)
+	if not sid then
+		return false
+	end
+	local flags = notes_flags[sid]
+	if not flags then
+		return false
+	end
+	return flags:find("mute", 1, true) ~= nil
+end
+
 attention_elsewhere = function(window)
 	local now = os.time()
 	if now - fleet_attention.at < 3 then
@@ -1543,6 +1588,7 @@ attention_elsewhere = function(window)
 	fleet_attention.at = now
 	fleet_attention.asking = 0
 	fleet_attention.fresh = 0
+	load_notes()
 
 	local here = {}
 	local ok = pcall(function()
@@ -1561,7 +1607,7 @@ attention_elsewhere = function(window)
 			for _, tab in ipairs(mux_window:tabs()) do
 				for _, p in ipairs(tab:panes()) do
 					local id = p:pane_id()
-					if not here[id] then
+					if not here[id] and not pane_muted(id) then
 						local rec = read_pane_state(id)
 						if rec and rec.state == "asking" then
 							fleet_attention.asking = fleet_attention.asking + 1

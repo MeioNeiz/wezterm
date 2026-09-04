@@ -10,6 +10,10 @@ Everything here is symlinked into place, so edit the file in this repo, not the 
     bin/cc-colour <- ~/.claude/bin/cc-colour   which pane is which: the identity palette
     bin/wz        <- ~/.claude/bin/wz          panes as a queryable surface, and the event log
     bin/cc-tint   <- ~/.claude/bin/cc-tint     paints a pane's own colours, SessionStart hook
+    bin/cc-note   <- ~/.claude/bin/cc-note     what a session says about itself
+    bin/cc-spawn  <- ~/.claude/bin/cc-spawn    starts a session in a pane, cleanly
+    bin/cc-handover <- ~/.claude/bin/cc-handover  moves work off a session that is full
+    skills/fleet  <- ~/.claude/skills/fleet    the skill Claude reads to drive all of it
 
 wezterm.lua reads the scripts through their ~/.claude/bin paths, so the links matter.
 
@@ -30,6 +34,14 @@ State these scripts write themselves, all of it theirs:
   new session would have reused the colour of the one it replaced. Hand pins win
 - `~/.claude/cache/cc-tint-painted/<pane>`  `<session-id>\t<hue>`, what cc-tint last painted
   onto that pane. There is no reading a pane's colour back, so this is the only record
+- `~/.claude/cache/titles/<sid>`    `mtime\x1fchecked_at\x1ftitle`, cc-peers' title memo
+- `~/.claude/fleet/notes.tsv`       cc-note: `sid, at, flags, progress, status`, one line
+  per annotated session. Read by the statusLine, cc-fleet and the tab bar, so every field
+  is written with a `-` placeholder rather than left empty: tab is IFS whitespace and an
+  empty column folds into its neighbour
+- `~/.claude/fleet/todo/<sid>`, `~/.claude/fleet/log/<sid>`  read only on demand, never
+  by anything on a timer
+- `~/.claude/fleet/handover/<name>-<stamp>.md`  the briefs cc-handover writes
 
 `statusUpdatedAt` in the registry is when a session's last request finished, so it is the
 clock the prompt cache runs on (`CACHE_TTL`, an hour). A transcript's mtime looks like the
@@ -91,6 +103,11 @@ state string has to be told about it too.
 
 Do not go looking again.
 
+- **`luajit` is not a syntax checker for `wezterm.lua`.** It is Lua 5.1 and the file uses
+  `//`, so it fails at the first integer division with "unexpected symbol near '/'" -
+  at HEAD, and on any edit, which makes it look like whatever you just changed. The real
+  check is `wezterm cli list`, which evaluates the config in the CLI process. luajit is
+  still right for the *identity block* extracted on its own, which is what it is for.
 - **OSC 1337 `SetUserVar` does nothing on this build** (wezterm 20260803). It is the
   obvious CLI-to-Lua bridge and it is not there: no `user-var-changed` event fires and
   `pane:get_user_vars()` stays empty, from inside the pane and from outside it, with
@@ -327,6 +344,63 @@ wants a statusline change in this file, and it should wait until the tab bar wor
 
 Truncation happens in bash, never in awk. See the awk rule below: `substr` cuts a multibyte
 glyph in half and every tab title starts with one.
+
+## the writable layer
+
+Everything else here is derived: the registry is Claude's, the hook files are Claude's,
+the transcript is Claude's. None of them can hold "waiting on the DNS change", "step 3 of
+7" or "leave this one alone", which is what `cc-note` is for.
+
+Keyed by session id rather than by pane, so a note follows the conversation through a
+pane move, a `--resume` and a reboot - and `/clear` mints a new id, which is exactly when
+a note should stop applying. `CLAUDE_CODE_SESSION_ID` is set in every session's shell, so
+a session annotating itself costs no lookup at all.
+
+It renders in three places and deliberately not in a fourth:
+
+- **the statusLine**, straight after the title, because the far end of the line is where
+  a narrow pane truncates and a note the session left for itself outranks the branch it
+  is on. Read with a bash loop rather than a grep - this path stays fork-free.
+- **cc-fleet**, where a status note takes the topic column: it is newer than the topic
+  Claude derived and it says what is actually holding the work up. Read at render time
+  rather than folded into `assemble_rows`, because that result is cached for eight
+  seconds and a note is the one field you change and expect to see immediately.
+- **the window status bar**, where `mute` means a session stops counting towards the
+  "wants you elsewhere" marker. That marker exists to catch a blocked pane in a workspace
+  you are not looking at; one you have already decided to leave is noise in the place
+  noise is most expensive.
+- **not the tab bar.** Four false starts up there are documented above and every one of
+  them was adding a channel. Progress and status have somewhere better to live.
+
+## handing work over
+
+`cc-handover` is the one that earns its place daily. The manual version is scrolling back
+and copying the last message into a fresh pane, which loses what was actually asked, what
+was said mid-turn, the branch, the files it had open, and everything the session recorded
+for itself. All of that is already on disk.
+
+Two things that are not obvious and cost a while to find:
+
+- **a session spawned from inside another inherits its whole Claude environment**, and
+  `CLAUDE_CODE_CHILD_SESSION` turns transcript saving off. The child then has no
+  transcript, so it never gets a title, `cc-peers` cannot name it, its statusLine has
+  nothing to show, and it can never be handed over itself - which is the one thing the
+  script exists to prevent. It announces itself as one line of warning in a pane nobody
+  is watching. `cc-spawn` clears the environment, and is why every launcher goes through
+  it rather than calling `wezterm cli spawn -- claude` directly.
+- **a message typed while a turn is running is a `queue-operation` record**, not a user
+  turn, so every "last prompt" reader is blind to it. It is usually the steer that
+  changed what the work was. The brief carries everything queued since the last real
+  prompt, in order.
+
+Also: the `last-prompt` record beside the transcript is Claude's own UI copy and arrives
+already truncated with an ellipsis, so the brief greps the whole file for the last real
+user turn instead. One grep over a 1.4MB transcript is 13ms; the tail is no good here
+because a long turn pushes the prompt that started it well past 400KB back.
+
+`wezterm cli spawn -- <argv>` passes arguments straight to exec with no shell in between,
+so a multi-KB markdown brief with newlines, backticks and quotes in it arrives
+byte-identical. Checked, because the obvious assumption is that it would not.
 
 ## the tab bar
 
