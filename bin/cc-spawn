@@ -1,0 +1,126 @@
+#!/bin/bash
+# Start a Claude session in a new pane, with a task. The one place that knows how.
+#
+# There is nothing clever here except the environment, and that part is not optional: a
+# session spawned from inside another one inherits its whole Claude environment, and
+# CLAUDE_CODE_CHILD_SESSION turns transcript saving off. The child then has no
+# transcript, so it never gets a title, cc-peers cannot name it, the statusLine has
+# nothing to show and it can never be handed over itself - and none of that announces
+# itself beyond one line of warning in a pane nobody is watching.
+#
+# So every launcher goes through here rather than calling `wezterm cli spawn` directly.
+
+set -u
+
+# Cleared, not filtered: a session an agent starts should be the session a human would
+# have started from a plain shell.
+readonly CLEAN_ENV=(env
+	-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID
+	-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_MESSAGING_SOCKET
+	-u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_EXECPATH
+	-u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT)
+
+usage() {
+	cat <<'USAGE'
+cc-spawn - start a Claude session in a new pane, with a task
+
+  cc-spawn [options] <prompt...>
+
+  --cwd <dir>        where it runs (default: this pane's directory)
+  --from <target>    the pane to split from (default: this one)
+  --right | --left | --top | --bottom     split (default: right)
+  --tab | --window   a new tab in the same window, or a new window
+  --shell            a plain shell rather than Claude, for a pane to watch things in
+  --dry-run          print what it would run
+
+Prints the new pane id. The environment is cleaned first, which is the whole point:
+without it the new session inherits CLAUDE_CODE_CHILD_SESSION and saves no transcript.
+
+  cc-spawn --cwd ~/work/api 'read src/auth.ts and list every path that skips the guard'
+  cc-spawn --tab --cwd ~/work/api 'run the failing test and tell me why it fails'
+USAGE
+}
+
+die() {
+	echo "cc-spawn: $*" >&2
+	exit 1
+}
+
+cwd=""
+from=""
+where="--right"
+shell=false
+dry=false
+while (($#)); do
+	case $1 in
+	--cwd) shift; cwd=${1:-}; [[ -n $cwd ]] || die "--cwd needs a directory" ;;
+	--from) shift; from=${1:-}; [[ -n $from ]] || die "--from needs a pane" ;;
+	--right | --left | --top | --bottom) where=$1 ;;
+	--down) where="--bottom" ;;
+	--up) where="--top" ;;
+	--tab) where="tab" ;;
+	--window) where="window" ;;
+	--shell) shell=true ;;
+	--dry-run) dry=true ;;
+	-h | --help) usage; exit 0 ;;
+	--) shift; break ;;
+	-*) die "unknown option $1" ;;
+	*) break ;;
+	esac
+	shift
+done
+
+$shell || (($#)) || die "need a prompt (or --shell)"
+
+# A name resolves through cc-roster; a bare number is already a pane.
+pane=""
+if [[ -n $from ]]; then
+	case $from in
+	*[!0-9]*) pane=$(cc-roster --pane "$from" 2>/dev/null) ;;
+	*) pane=$from ;;
+	esac
+	[[ -n $pane && $pane != "-" ]] || die "no pane for \"$from\""
+else
+	pane=${WEZTERM_PANE:-}
+fi
+
+if [[ -z $cwd ]]; then
+	if [[ -n $pane ]]; then
+		cwd=$(wezterm cli list --format json 2>/dev/null |
+			jq -r --arg p "$pane" '.[] | select(.pane_id == ($p | tonumber))
+				| .cwd // "" | sub("^file://[^/]*"; "")' 2>/dev/null | head -1)
+	fi
+	[[ -n $cwd ]] || cwd=$PWD
+fi
+[[ -d $cwd ]] || die "no such directory: $cwd"
+
+prompt="$*"
+if $shell; then
+	cmd=("$SHELL")
+else
+	cmd=("${CLEAN_ENV[@]}" claude "$prompt")
+fi
+
+if [[ $where != window ]]; then
+	[[ -n $pane ]] ||
+		die "no pane to split from (run this inside wezterm, or pass --from, or --window)"
+fi
+
+if $dry; then
+	printf 'would spawn %s in %s\n' "$where" "$cwd"
+	if $shell; then
+		printf '  %s\n' "$SHELL"
+	else
+		printf '  %s claude <prompt, %s chars>\n' "${CLEAN_ENV[*]}" "${#prompt}"
+	fi
+	exit 0
+fi
+
+case $where in
+tab) new=$(wezterm cli spawn --pane-id "$pane" --cwd "$cwd" -- "${cmd[@]}") ;;
+window) new=$(wezterm cli spawn --new-window --cwd "$cwd" -- "${cmd[@]}") ;;
+*) new=$(wezterm cli split-pane --pane-id "$pane" "$where" --cwd "$cwd" -- "${cmd[@]}") ;;
+esac
+
+[[ -n $new ]] || die "wezterm would not open a pane"
+printf '%s\n' "$new"

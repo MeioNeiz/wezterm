@@ -29,6 +29,7 @@ readonly US=$'\x1f'
 # eight seconds ago still lands you in the right pane.
 readonly CACHE="$HOME/.claude/cache/fleet-rows"
 readonly CACHE_TTL=8
+readonly NOTES="$HOME/.claude/fleet/notes.tsv"
 
 # Shared with cc-board, the tab bar and the statusLine: same palette, same hash.
 # shellcheck source=bin/cc-colour
@@ -225,6 +226,22 @@ if [[ $mode == json ]]; then
 	exit 0
 fi
 
+# What each session said about itself, keyed by id. A variable per key rather than one
+# joined string: ${map#*"|$k="} matches character by character in a UTF-8 locale and
+# costs the whole map per lookup. Dashes are not legal in a name, so they become
+# underscores; a session id is short enough for the substitution to be free.
+#
+# Not folded into assemble_rows on purpose: that result is cached for eight seconds and
+# a note is the one field here you change and expect to see immediately.
+if [[ -r $NOTES ]]; then
+	while IFS=$'\t' read -r n_sid _ n_flags n_prog n_stat; do
+		[[ -n $n_sid ]] || continue
+		printf -v "nf_${n_sid//-/_}" '%s' "${n_flags:--}"
+		printf -v "np_${n_sid//-/_}" '%s' "${n_prog:--}"
+		printf -v "ns_${n_sid//-/_}" '%s' "${n_stat:--}"
+	done <"$NOTES"
+fi
+
 # "3d" beats "268214s" at a glance, and five cells is all it needs.
 age() {
 	local s=$1
@@ -350,6 +367,23 @@ while IFS= read -r ws; do
 		[[ -n $detail ]] && label="$kind $detail"
 		body=""
 		[[ $glyph == "·" ]] && body=$DIM
+
+		# A note the session left for itself is newer than the topic Claude derived for
+		# it, and it is the one that says what is actually holding the work up, so it
+		# takes the line. The topic is still on cc-board and in the tab bar.
+		key=${id//-/_}
+		nstat="ns_$key"; nprog="np_$key"; nflag="nf_$key"
+		note=${!nstat:--}
+		prog=${!nprog:--}
+		flags=${!nflag:--}
+		if [[ $note != "-" ]]; then
+			title="▸ $note"
+			body=$YELLOW
+		fi
+		[[ $prog != "-" ]] && label="$label $prog"
+		case ",$flags," in
+		*,mute,*) glyph="◌" ;;
+		esac
 		# The glyph says what it wants, the name says which chat it is. Same split as the
 		# board and the tab bar, so the colour means one thing wherever it turns up.
 		id_colour "$id"

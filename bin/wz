@@ -31,6 +31,8 @@ reading
   wz read <target> [-n <lines>]       text on a pane's screen; -n pulls scrollback
   wz grep [-a] [-i] [-s] [-n <l>] <p> search every pane's text; -s focuses the first hit
   wz top [-a]                         cpu and memory per pane, busiest first
+  wz last <target> [--json]           what a session last actually said, and whether
+                                      it stopped to ask you something
 
 watching
   wz events [--after N] [--cursor-file F] [--follow] [--name E] [--limit N]
@@ -198,6 +200,67 @@ cmd_read() {
 	else
 		wezterm cli get-text --pane-id "$pane"
 	fi
+}
+
+# The state files cannot tell a session that finished from one that stopped to ask a
+# question: the Stop hook fires either way. The usual answer is to read the pane, which
+# works and is what cc-board does, but the transcript says it better - the screen is
+# whatever fits, and it is gone once the pane is closed or the scrollback rolls.
+#
+# "Ends in a question mark" is a heuristic and stays one, which is why the field is
+# called ends_in_question and not "asking": a session can be waiting on you without a
+# question mark anywhere ("One last check before I advise: what connects remotely."),
+# and the registry state is the better signal when it says `waiting` or `asking`. Read
+# the two together - the state says whether it stopped, the text says what for.
+cmd_last() {
+	local target="" json=false pane sid cwd transcript text at now
+	while (($#)); do
+		case $1 in
+		--json) json=true ;;
+		-h | --help) usage; return ;;
+		-*) die "last: unknown option $1" ;;
+		*) [[ -z $target ]] || die "last: one target at a time"; target=$1 ;;
+		esac
+		shift
+	done
+	[[ -n $target ]] || target=.
+	pane=$(resolve "$target") || exit 1
+
+	IFS=$'\x1f' read -r sid cwd name state < <(
+		cc-roster 2>/dev/null | awk -F'\t' -v p="$pane" \
+			'$5 == p { printf "%s\x1f%s\x1f%s\x1f%s", $1, $6, $2, $3; exit }'
+	)
+	[[ -n ${sid:-} ]] || die "pane $pane holds no Claude session"
+
+	transcript="$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}/$sid.jsonl"
+	[[ -r $transcript ]] ||
+		transcript=$(ls -t "$HOME"/.claude/projects/*/"$sid.jsonl" 2>/dev/null | head -1)
+	[[ -r $transcript ]] || die "no transcript for $name"
+
+	# tail -n +2 drops the half-record a byte offset always lands in the middle of: jq
+	# discards a whole batch over one line it cannot parse, which reads as silence.
+	text=$(tail -c 400000 "$transcript" | tail -n +2 |
+		jq -r 'select(.type == "assistant")
+			| [ .message.content[]? | select(.type == "text") | .text ] | join("")
+			| select(. != "")' 2>/dev/null | tail -1)
+	at=$(stat -f %m "$transcript" 2>/dev/null || echo 0)
+	now=$(date +%s)
+
+	local asking=no
+	case $(printf '%s' "$text" | sed -e 's/[[:space:]]*$//' | tail -1) in
+	*'?') asking=yes ;;
+	esac
+
+	if $json; then
+		jq -n --arg name "$name" --arg state "$state" --arg text "$text" \
+			--arg asking "$asking" --argjson ago "$((now - at))" \
+			'{name: $name, state: $state, ends_in_question: ($asking == "yes"),
+			  seconds_since_transcript: $ago, text: $text}'
+		return
+	fi
+	printf '%s  %s' "$name" "$state"
+	[[ $asking == yes ]] && printf '  · ends in a question'
+	printf '\n\n%s\n' "$text"
 }
 
 cmd_grep() {
@@ -650,6 +713,7 @@ tree) shift; cmd_tree "$@" ;;
 read) shift; cmd_read "$@" ;;
 grep) shift; cmd_grep "$@" ;;
 top) shift; cmd_top "$@" ;;
+last) shift; cmd_last "$@" ;;
 send) shift; cmd_send "$@" ;;
 key) shift; cmd_key "$@" ;;
 go) shift; cmd_go "$@" ;;

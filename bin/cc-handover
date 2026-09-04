@@ -26,18 +26,6 @@ readonly INLINE_MAX=12000
 # Assistant messages shorter than this are scaffolding between tool calls, not findings.
 readonly TRIVIAL_TEXT=160
 
-# A session spawned from inside another one inherits its whole Claude environment, and
-# CLAUDE_CODE_CHILD_SESSION in particular turns transcript saving off: the new session
-# then has no transcript, so it never gets a title, cc-peers cannot name it, and it can
-# never be handed over itself. Which is the one thing this script exists to prevent.
-# Cleared rather than filtered, so a handover launched by an agent starts the same
-# session a human would have started from a plain shell.
-readonly CLEAN_ENV=(env
-	-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID
-	-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_MESSAGING_SOCKET
-	-u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_EXECPATH
-	-u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT)
-
 usage() {
 	cat <<'USAGE'
 cc-handover - hand a session's work to a fresh one
@@ -276,26 +264,20 @@ to)
 	echo "handover pasted into pane $pane_to (press enter there to send it)"
 	;;
 new)
-	[[ $pane != "-" ]] || [[ $split == window ]] ||
+	[[ $pane != "-" || $split == window ]] ||
 		die "$name has no pane to split from; use --window"
+	# cc-spawn owns starting a session, including clearing the inherited Claude
+	# environment - without which the new session saves no transcript and could never
+	# be handed over itself.
+	spawn=(cc-spawn --cwd "$cwd" "$split")
+	[[ $pane != "-" ]] && spawn=(cc-spawn --cwd "$cwd" --from "$pane" "$split")
+	$dry && spawn+=(--dry-run)
+	new=$("${spawn[@]}" -- "$brief") || exit 1
 	if $dry; then
-		printf 'would spawn (%s) in %s:\n\n' "$split" "$cwd"
-		printf '  %s' "${CLEAN_ENV[*]}"
-		printf ' claude <brief, %s chars>\n\n' "${#brief}"
+		printf '%s\n' "$new"
 		printf 'brief: %s\n' "$file"
 		exit 0
 	fi
-	case $split in
-	tab)
-		new=$(wezterm cli spawn --pane-id "$pane" --cwd "$cwd" \
-			-- "${CLEAN_ENV[@]}" claude "$brief") ;;
-	window)
-		new=$(wezterm cli spawn --new-window --cwd "$cwd" \
-			-- "${CLEAN_ENV[@]}" claude "$brief") ;;
-	*)
-		new=$(wezterm cli split-pane --pane-id "$pane" "$split" --cwd "$cwd" \
-			-- "${CLEAN_ENV[@]}" claude "$brief") ;;
-	esac
 	[[ -n $new ]] || die "could not open a pane for the handover"
 	echo "handed $name over to pane $new"
 	echo "brief: $file"
