@@ -35,13 +35,24 @@ readonly NOTES="$HOME/.claude/fleet/notes.tsv"
 # shellcheck source=bin/cc-colour
 source "$HOME/.claude/bin/cc-colour" --lib
 
-readonly BLUE=$'\033[38;2;135;215;255m'
-readonly MAUVE=$'\033[38;2;203;166;247m'
-readonly GREEN=$'\033[38;2;166;227;161m'
-readonly YELLOW=$'\033[38;2;249;226;175m'
-readonly DIM=$'\033[38;2;108;112;134m'
-readonly BOLD=$'\033[1m'
-readonly RESET=$'\033[0m'
+# Colour only for a terminal. Piped, 55% of this output was escape codes - which for a
+# human is invisible and for a Claude session reading the dashboard is about 960 tokens
+# of noise per call, paid every time it looks. Standard behaviour anywhere else; it was
+# just never true here because nothing but a human read it.
+if [[ -t 1 ]]; then
+	readonly BLUE=$'\033[38;2;135;215;255m'
+	readonly MAUVE=$'\033[38;2;203;166;247m'
+	readonly GREEN=$'\033[38;2;166;227;161m'
+	readonly YELLOW=$'\033[38;2;249;226;175m'
+	readonly DIM=$'\033[38;2;108;112;134m'
+	readonly BOLD=$'\033[1m'
+	readonly RESET=$'\033[0m'
+else
+	readonly BLUE="" MAUVE="" GREEN="" YELLOW="" DIM="" BOLD="" RESET=""
+	# cc-colour's id_colour sets these per row; blank them at the source rather than
+	# stripping escapes back out of the finished line.
+	id_colour() { IDC_ANSI=""; IDC_MUTED=""; IDC_NAME=""; }
+fi
 
 usage() {
 	cat <<'USAGE'
@@ -56,6 +67,8 @@ cc-fleet - every live Claude session, grouped by wezterm workspace
   cc-fleet --stale-ok      serve the cache at any age and refresh behind you; for a
                            caller that must not block, like the wezterm board
   cc-fleet --json          the same rows as JSON, for Claude and other readers
+  cc-fleet --brief         only what wants you, plus a count. For a reader paying by
+                           the token: 60 tokens against the dashboard's 770
 
 Age is time since *your* last prompt, not since the session last did anything: an agent
 chattering to itself for an hour does not make the work live. Closing a pane loses no
@@ -75,6 +88,7 @@ stale_ok=false
 while (($#)); do
 	case $1 in
 	--tsv) mode=tsv ;;
+	--brief) mode=brief ;;
 	--json) mode=json ;;
 	--stale) mode=stale ;;
 	--reap) mode=reap ;;
@@ -214,12 +228,43 @@ if [[ $mode == tsv ]]; then
 	exit 0
 fi
 
+# What an agent almost always means by "what is running": the ones that want something,
+# and a count of the rest. The dashboard is ~770 tokens even stripped of colour, and 31
+# of its 34 rows are idle sessions nobody asked about. This is about 60.
+if [[ $mode == brief ]]; then
+	printf '%s\n' "$rows" | awk -F"$US" -v cut="$stale_secs" '
+		$7 == "asking" || $7 == "waiting" || $7 == "busy" {
+			want[++w] = $7 "\t" $9 "\t" $6 "\t" $8 "\t" $2
+			next
+		}
+		{ rest++ }
+		($7 == "idle" || $7 == "shell") && ($9 < 0 || $9 >= cut) { old++ }
+		END {
+			if (w == 0) print "nothing wants you"
+			else {
+				printf "%d want%s you\n", w, (w == 1 ? "s" : "")
+				for (i = 1; i <= w; i++) {
+					n = split(want[i], f, "\t")
+					age = (f[2] < 0) ? "never" : \
+						(f[2] < 5400 ? int(f[2] / 60) "m" : \
+						(f[2] < 172800 ? int(f[2] / 3600) "h" : int(f[2] / 86400) "d"))
+					printf "  %-8s %5s  %-18s %s%s\n", f[1], age, f[3], f[5],
+						(f[4] == "" ? "" : "  (" f[4] ")")
+				}
+			}
+			printf "%d idle", rest + 0
+			if (old > 0) printf ", %d stale", old
+			printf "\n"
+		}'
+	exit 0
+fi
+
 if [[ $mode == json ]]; then
 	# For a reader rather than a terminal: a session another Claude is asked about should not
 	# have to be recovered out of a padded table. idle_seconds is -1 when you have never
 	# prompted it, which is different from zero and worth keeping distinguishable.
 	printf '%s\n' "$rows" | cut -d"$US" -f2-13 |
-		jq -Rs --arg us "$US" 'split("\n") | map(select(length > 0) | split($us))
+		jq -c -Rs --arg us "$US" 'split("\n") | map(select(length > 0) | split($us))
 			| map({ workspace: .[0], window: .[1], tab_id: .[2], pane: .[3], name: .[4],
 			        state: .[5], blocked_on: .[6], idle_seconds: (.[7] | tonumber?),
 			        your_turns: (.[8] | tonumber?), dir: .[9], title: .[10], id: .[11] })'

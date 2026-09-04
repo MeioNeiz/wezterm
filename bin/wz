@@ -28,7 +28,8 @@ wz - query, watch and drive wezterm panes
 
 reading
   wz tree [-a] [-c] [-w <ws>]         what is open: workspace, window, tab, pane
-  wz read <target> [-n <lines>]       text on a pane's screen; -n pulls scrollback
+  wz read <target> [-n <l>] [-t <l>]  text on a pane's screen; -n pulls scrollback,
+                                      -t/--tail keeps only the last <l> non-blank lines
   wz grep [-a] [-i] [-s] [-n <l>] <p> search every pane's text; -s focuses the first hit
   wz top [-a]                         cpu and memory per pane, busiest first
   wz last <target> [--json]           what a session last actually said, and whether
@@ -180,11 +181,16 @@ cmd_tree() {
 	} | column -t -s $'\t'
 }
 
+# A whole pane screen is about 3,600 tokens, and most callers want the last few lines of
+# it. --tail is not the same as -n: -n reaches further back into scrollback, --tail keeps
+# less of what came out. `wz last` is cheaper still (about 60 tokens) when the question is
+# what the session said rather than what is on screen.
 cmd_read() {
-	local lines=0 target=""
+	local lines=0 target="" tail_n=0
 	while (($#)); do
 		case $1 in
 		-n) shift; lines=${1:-} ;;
+		-t | --tail) shift; tail_n=${1:-} ;;
 		-h | --help) usage; return ;;
 		-*) die "read: unknown option $1" ;;
 		*) [[ -z $target ]] || die "read: one target at a time"; target=$1 ;;
@@ -193,12 +199,20 @@ cmd_read() {
 	done
 	[[ -n $target ]] || die "read: need a target"
 	case $lines in '' | *[!0-9]*) die "read: -n needs a line count" ;; esac
+	case $tail_n in '' | *[!0-9]*) die "read: --tail needs a line count" ;; esac
 	local pane
 	pane=$(resolve "$target") || exit 1
-	if ((lines > 0)); then
-		wezterm cli get-text --pane-id "$pane" --start-line "-$lines"
+	{
+		if ((lines > 0)); then
+			wezterm cli get-text --pane-id "$pane" --start-line "-$lines"
+		else
+			wezterm cli get-text --pane-id "$pane"
+		fi
+	} | if ((tail_n > 0)); then
+		# Blank lines are most of a Claude pane and none of the answer.
+		grep -v '^[[:space:]]*$' | tail -n "$tail_n"
 	else
-		wezterm cli get-text --pane-id "$pane"
+		cat
 	fi
 }
 
