@@ -130,13 +130,21 @@ BEGIN {
 		n = split(line, f, US)
 		if (n >= 3) { seen[f[1]] = f[2]; turns[f[1]] = f[3] }
 	}
-	need["asking"] = 5; need["busy"] = 4; need["shell"] = 2; need["idle"] = 1
+	# "waiting" is a registry status Claude started writing after this table was
+	# built, and it means the session has stopped and wants an answer - so it ranks
+	# with asking, not below idle. Left out, the one session on the machine that
+	# actually wants you scored 0 and sorted under thirty idle ones in the dimmest grey.
+	need["asking"] = 5; need["waiting"] = 5; need["busy"] = 4
+	need["shell"] = 2; need["idle"] = 1
 }
 {
 	name = $1; id = $2; state = $3; pane = $4; dir = $5; title = $6
-	split(state, s, " ")
-	kind = s[1]
-	detail = (s[2] != "") ? s[2] : ""
+	# Everything after the first space, not just the next word: a hook writes a tool
+	# name there, but waitingFor out of the registry is a phrase ("input needed").
+	# No apostrophes in here - this awk program is inside a single-quoted string.
+	sp = index(state, " ")
+	kind = (sp > 0) ? substr(state, 1, sp - 1) : state
+	detail = (sp > 0) ? substr(state, sp + 1) : ""
 
 	# No prompt on record means a session bootstrapped by a peer handover and never typed
 	# into. Ageing that from its start would read as fresh forever, so leave it unknown
@@ -287,7 +295,8 @@ while IFS= read -r ws; do
 	group=$(printf '%s\n' "$rows" | awk -F"$US" -v w="$ws" '$2 == w' |
 		sort -t"$US" -k1,1nr -k9,9n)
 	n=$(printf '%s\n' "$group" | wc -l | tr -d ' ')
-	wants=$(printf '%s\n' "$group" | awk -F"$US" '$7 == "asking" || $7 == "busy"' | wc -l | tr -d ' ')
+	wants=$(printf '%s\n' "$group" |
+		awk -F"$US" '$7 == "asking" || $7 == "waiting" || $7 == "busy"' | wc -l | tr -d ' ')
 	old=$(printf '%s\n' "$group" | awk -F"$US" -v cut="$stale_secs" \
 		'($7 == "idle" || $7 == "shell") && ($9 < 0 || $9 >= cut)' | wc -l | tr -d ' ')
 	total=$((total + n))
@@ -314,7 +323,7 @@ while IFS= read -r ws; do
 
 	while IFS="$US" read -r rank _ _ _ pane name kind detail idle turns _ title id _; do
 		case $kind in
-		asking)
+		asking | waiting)
 			glyph="⚠"
 			colour=$MAUVE
 			;;

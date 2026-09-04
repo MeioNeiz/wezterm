@@ -3,7 +3,8 @@
 Everything here is symlinked into place, so edit the file in this repo, not the link:
 
     wezterm.lua   <- ~/.wezterm.lua
-    bin/cc-peers  <- ~/.claude/bin/cc-peers    roster of live Claude sessions
+    bin/cc-roster <- ~/.claude/bin/cc-roster   who is alive, what state, which pane
+    bin/cc-peers  <- ~/.claude/bin/cc-peers    the same, plus a title per session
     bin/cc-fleet  <- ~/.claude/bin/cc-fleet    same, grouped by workspace, aged by my prompts
     bin/cc-board  <- ~/.claude/bin/cc-board    the board: LEADER+b
     bin/cc-colour <- ~/.claude/bin/cc-colour   which pane is which: the identity palette
@@ -35,6 +36,68 @@ clock the prompt cache runs on (`CACHE_TTL`, an hour). A transcript's mtime look
 same thing and is not - they get appended to long after the last exchange, and by that
 measure every session on the machine looks warm. One jq over every registry file is 5ms;
 a tail and a jq per session is half a second.
+
+## what it costs
+
+Measured on a machine with 59 panes and 33 live sessions, because every one of these
+runs against the whole fleet and none of them is interesting at n=1.
+
+| path | when | cost |
+|---|---|---|
+| `statusline.sh` | 0.51/s across the machine | 20-100ms |
+| `wezterm-pane-state.sh` | 4 per turn | 10ms |
+| `cc-tint` | SessionStart | 30ms |
+| the tab bar | 1/s over 59 panes | 1.2% CPU, 124MB RSS |
+| `cc-roster` | every `wz` call with a name | 90ms |
+| `cc-peers` | humans, and cc-fleet | 130ms |
+| `cc-fleet --fresh` | the board's third frame | 220ms |
+| `wz read <pane-id>` | - | 20ms |
+| `wz read <name>` | the agent path | 95ms |
+
+The human-facing surfaces were never the problem: they cache in the right places and
+the Lua side repaints only on invalidation. **The agent-facing path was**, and it was
+65x more expensive than it needed to be - `wz read <name>` cost 1462ms against 22ms for
+the same read by pane id, because resolving a name went through `cc-peers`, which works
+out a title for every session on the machine before answering.
+
+That matters more than it looks. An agent that can check the fleet in 90ms checks it
+mid-task; one that costs 1.4s a call does not bother, and then reasons from memory.
+
+Where the 1.4s went, and what replaced it:
+
+- **a jq per registry file.** 34 forks, 76ms. One jq over all of them is 6ms.
+- **an `ls -t` over the pane map per session.** 66ms. Reverse the map once instead.
+- **`$(<file)` per pane-map and state file.** A command substitution forks a subshell on
+  bash 3.2, and 200 of them was 114ms. One `awk` over every file is 10ms.
+- **a title per session**, which is a 256KB transcript tail, an awk and a jq each, for a
+  string that changes about twice in a session's life. Memoised in
+  `~/.claude/cache/titles/<sid>` as `mtime\x1fchecked_at\x1ftitle`, and reused unless
+  the transcript has actually moved. An untitled memo is never reused: holding
+  "untitled" for a minute is the difference between a new pane naming itself and a new
+  pane looking broken.
+
+So `cc-roster` is the cheap half - who is alive, what state, which pane, no titles - and
+`cc-peers` is that plus the memoised title. `wz` resolves through `cc-roster --pane`,
+which skips the hook state files too.
+
+**`waiting` is a registry status** that Claude started writing after these readers were
+built, and it means the session has stopped and wants an answer; `waitingFor` says what
+("input needed"). `cc-fleet`'s rank table did not know the word, so it scored 0 - the one
+session on the machine that actually wanted attention sorted below thirty idle ones and
+drew in the dimmest grey. It ranks with `asking` now. Anything else that switches on a
+state string has to be told about it too.
+
+## measured dead ends
+
+Do not go looking again.
+
+- **OSC 1337 `SetUserVar` does nothing on this build** (wezterm 20260803). It is the
+  obvious CLI-to-Lua bridge and it is not there: no `user-var-changed` event fires and
+  `pane:get_user_vars()` stays empty, from inside the pane and from outside it, with
+  either terminator. The byte path is fine - an `OSC 0` title write down the same tty
+  lands and shows up in `cli list` - so it is the sequence that is unhandled, not the
+  write. The bridge that does work is a file drained by the `update-status` handler,
+  which already runs once a second.
 
 ## two colour channels, and why they cannot be one
 
@@ -244,9 +307,10 @@ was make it cheap enough to reach for mid-task. The parts worth knowing:
 - **`grep` and `top` are the two that did not exist in any form.** `wezterm cli list`
   reports no pid, so per-pane CPU comes from joining `tty_name` against one `ps -ax` for the
   whole machine. A `ps -t` per pane would cost more than everything else here put together.
-- **Targets resolve through cc-peers**, so `wz read d5-lca-48` takes the same address
+- **Targets resolve through `cc-roster`**, so `wz read d5-lca-48` takes the same address
   SendMessage does. `resolve` asserts the answer is digits before returning: a pane id
   reaches `kill-pane` and once reached an `rm`, and nothing downstream should have to wonder.
+  It used to go through cc-peers and cost 1.4s a call; see "what it costs".
 - **The event log is polled, not pushed.** wezterm has no outbound event stream, and the
   states worth waking up for (busy, asking, idle) are Claude's rather than wezterm's, so
   they would not appear in one if it existed. `wz events --daemon` diffs a five-field
@@ -364,6 +428,17 @@ too, dropping the notes before the keys. Check both axes after touching a layout
   not in one `|k=v|` string. `${map#*"|$k="}` matches character by character in a UTF-8
   locale, so it costs the whole map per call - about 1ms on a 2KB one, and 69 of those per
   scan was 100ms. Keep a list of the names and `unset` them before each rebuild
+- **never a pattern substitution on a long string.** `${rows//[$'\n']/}` as an emptiness
+  test walked a 4KB string character by character under a UTF-8 locale and cost 3.3s of
+  cc-peers' 3.7. Plain `-z`. The same expansion on a *short* string is the right tool and
+  beats a fork: `${cwd//[^A-Za-z0-9]/-}` builds a transcript slug 12x faster than the
+  `sed` it replaced, with identical output
+- **`local a=$1 b="$x/$a"` does not see `a`.** bash 3.2 declares every name in one `local`
+  before assigning any of them, so the second expansion gets a local that is still unset
+  and `set -u` kills the script. Split the declaration
+- **no apostrophes inside a single-quoted awk program.** A comment saying "the hook's
+  detail" closes the string, and the error surfaces as a bash syntax error on a line of
+  awk twenty lines further down
 - `${#var}` counts characters under en_GB.UTF-8, so display width needs no external help.
   **Keep the render path fork-free**: `printf -v` and globals, never command substitution.
   Shelling out to tr/wc for width was a thousand forks a frame and visibly flickered

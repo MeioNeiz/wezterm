@@ -3,15 +3,20 @@
 # by Claude to turn "the window doing the ingest migration" into an address, and by
 # the wezterm picker (LEADER+@) to type one into a prompt.
 #
-# The registry outlives the process that wrote it, so dead pids are dropped here
-# rather than offered as addresses that will never answer.
+# The roster itself comes from cc-roster, which is the cheap half: who is alive, what
+# state, which pane. All this adds is a title per session, and a title is the whole
+# reason cc-peers used to cost 1.4s - a 256KB transcript tail, an awk and a jq each,
+# thirty-four times over, for a string that changes about twice in a session's life.
+# So titles are cached against the transcript's mtime and only recomputed when the
+# transcript has actually moved.
 
 set -u
 
-readonly REGISTRY="$HOME/.claude/sessions"
-readonly PANE_MAP="$HOME/.claude/wezterm-sessions"
-readonly PANE_STATE="$HOME/.claude/wezterm-state"
 readonly TITLE_CACHE="$HOME/.claude/cache/statusline"
+readonly TITLE_MEMO="$HOME/.claude/cache/titles"
+# An idle session's transcript never moves, so it never recomputes. A busy one moves
+# on every turn, and without a floor it would pay the full scan on every call.
+readonly TITLE_TTL=60
 
 usage() {
 	cat <<'USAGE'
@@ -28,6 +33,9 @@ alike. /rename <name> in a pane sets a real one, bare /rename derives it from th
 conversation, and either way it is unique among live sessions. Each pane's statusLine
 ends with its own @name; in wezterm, LEADER+@ types another session's name at the
 cursor and CTRL+SHIFT+SPACE lifts one off the screen.
+
+cc-roster is this without the titles, and answers in a tenth of the time. Anything
+resolving an address rather than showing one to a human wants that instead.
 USAGE
 }
 
@@ -94,55 +102,76 @@ session_title() {
 	printf '%s' "${title:-untitled}"
 }
 
-# Which wezterm pane holds a session, from the SessionStart hook's map. Reversed
-# because the map is keyed by pane, and one stale pane id can still point at a
-# session that has since moved, so the newest file wins.
-pane_of() {
-	local id=$1 file
-	for file in $(ls -t "$PANE_MAP" 2>/dev/null); do
-		[[ $(<"$PANE_MAP/$file") == "$id" ]] && { printf '%s' "$file"; return; }
-	done
-}
+# The transcript's mtime is the only thing that can change a title, so a session whose
+# transcript has not moved keeps the cached one for nothing. A busy session's mtime
+# moves every turn, which would put us straight back to a scan per call, so a memo
+# checked inside TITLE_TTL is taken without even looking at the transcript.
+#
+# Fork-free on a hit, which is the whole point: this runs once per live session, and a
+# command substitution plus a sed plus a stat was 378ms of the 470 this script cost.
+# The slug is bash's own substitution rather than a sed - identical output, 12x faster
+# on a path-length string - and the answer comes back in TITLE rather than on stdout.
+#
+# The one case that must not be held back is a session too young to have been titled:
+# holding "untitled" for a minute is the difference between a new pane naming itself
+# and a new pane looking broken. So an untitled memo is never reused.
+TITLE=""
+cached_title() {
+	local id=$1 dir=$2 now=$3
+	local file transcript mtime cached_mtime cached_at cached_title
+	# Split from the declaration above on purpose: bash 3.2 declares every name in one
+	# `local` before it assigns any of them, so "$TITLE_MEMO/$id" on that line expands
+	# an id that is local and still unset, and set -u kills the script.
+	file="$TITLE_MEMO/$id"
 
-# The registry knows busy/idle/shell; only the Notification hook knows a pane is
-# sitting on a permission prompt, which is the one state worth interrupting. That
-# hook never fires again to say the prompt was answered, so it only wins while it is
-# the newer of the two writes.
-pane_status() {
-	local pane=$1 status=$2 seen=$3 state at detail
-	[[ -n $pane && -r $PANE_STATE/$pane ]] || { printf '%s' "$status"; return; }
-	IFS=$'\t' read -r state at detail <"$PANE_STATE/$pane"
-	if [[ $state == asking ]] && ((${at:-0} * 1000 > seen)); then
-		printf 'asking%s' "${detail:+ ${detail}}"
-	else
-		printf '%s' "$status"
+	if [[ -r $file ]]; then
+		IFS=$'\x1f' read -r cached_mtime cached_at cached_title <"$file"
+		if [[ -n ${cached_title:-} && $cached_title != untitled ]]; then
+			if ((now - ${cached_at:-0} < TITLE_TTL)); then
+				TITLE=$cached_title
+				return
+			fi
+			# Past the TTL, so ask the one question that can change the answer. Two
+			# forks a session a minute, and none at all in between.
+			transcript="$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$id.jsonl"
+			mtime=$(stat -f %m "$transcript" 2>/dev/null || echo 0)
+			if [[ ${cached_mtime:-0} == "$mtime" ]]; then
+				printf '%s\x1f%s\x1f%s\n' "$mtime" "$now" "$cached_title" \
+					>"$file" 2>/dev/null
+				TITLE=$cached_title
+				return
+			fi
+		fi
 	fi
+
+	transcript="$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$id.jsonl"
+	mtime=$(stat -f %m "$transcript" 2>/dev/null || echo 0)
+	TITLE=$(session_title "$id" "$dir")
+	mkdir -p "$TITLE_MEMO" 2>/dev/null &&
+		printf '%s\x1f%s\x1f%s\n' "$mtime" "$now" "$TITLE" >"$file" 2>/dev/null
 }
 
-rows=()
-for file in "$REGISTRY"/*.json; do
-	[[ -r $file ]] || continue
-	# Unit separator rather than tab: tab is IFS whitespace, so bash would fold any
-	# empty field and shift the rest of the row left.
-	IFS=$'\x1f' read -r pid id cwd name status started seen < <(
-		jq -r '[ (.pid // ""), (.sessionId // ""), (.cwd // ""), (.name // ""),
-		         (.status // "?"), (.startedAt // 0),
-		         (.statusUpdatedAt // .updatedAt // 0) ]
-		       | map(tostring) | join("\u001f")' "$file" 2>/dev/null
-	)
-	[[ -n ${pid:-} && -n ${name:-} ]] || continue
-	kill -0 "$pid" 2>/dev/null || continue
+now=$(date +%s)
+rows=""
+# Unit separator rather than tab: tab is IFS whitespace, so bash folds an empty
+# `detail` into its neighbour and shifts the rest of the row left. cc-roster emits
+# tabs because awk splits them properly; read does not.
+while IFS=$'\x1f' read -r sid name status detail pane cwd pid seen started; do
+	[[ -n $sid ]] || continue
+	state=$status
+	[[ -n $detail ]] && state="$status $detail"
+	cached_title "$sid" "$cwd" "$now"
+	rows="$rows$name	$sid	$state	$pane	${cwd##*/}	$TITLE"$'\n'
+done < <(cc-roster 2>/dev/null | tr '\t' '\037')
 
-	pane=$(pane_of "$id")
-	rows+=("$started	$name	$id	$(pane_status "$pane" "$status" "${seen:-0}")	${pane:--}	${cwd##*/}	$(session_title "$id" "$cwd")")
-done
-
-if ((${#rows[@]} == 0)); then
+# Plain -z, never a pattern substitution: ${rows//[...]/} walks a 4KB string
+# character by character under a UTF-8 locale and cost 3.3s of this script's 3.7.
+if [[ -z $rows ]]; then
 	$tsv || echo "No live Claude sessions." >&2
 	exit 0
 fi
 
-printf '%s\n' "${rows[@]}" | sort -n | cut -f2- |
+printf '%s' "$rows" |
 	if $tsv; then
 		cat
 	else

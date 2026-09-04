@@ -2,8 +2,10 @@
 # wezterm's panes as something you can query, watch and drive. Written so a Claude
 # session can see and steer another window without a human relaying text between them.
 #
-# Targets accept a wezterm pane id, a cc-peers session name, or "." for the calling
-# pane, so the address you would hand SendMessage also works here.
+# Targets accept a wezterm pane id, a session name, or "." for the calling pane, so the
+# address you would hand SendMessage also works here. Names resolve through cc-roster,
+# not cc-peers: the two agree on every pane and the one that does not work out titles
+# answers in 42ms rather than 1.4s.
 #
 # The event log is polled rather than pushed: wezterm has no outbound event stream, and
 # the states worth knowing about (busy, asking, idle) are Claude's, not wezterm's, so
@@ -80,10 +82,14 @@ pane_tsv() {
 	'
 }
 
-# cc-peers already merges the registry with the hook state files, so nothing here
-# duplicates that; wz only needs its pane column to hang rows off.
+# cc-roster merges the registry with the hook state files and stops there. cc-peers
+# does the same and then works out a title for every session, which costs 1.4s and
+# which nothing here needs: resolving an address, labelling a row and reading a state
+# all want the name, not the topic.
+#
+# Columns: sid, name, status, detail, pane, dir, pid, seen_ms.
 session_tsv() {
-	command -v cc-peers >/dev/null && cc-peers --tsv 2>/dev/null
+	command -v cc-roster >/dev/null && cc-roster 2>/dev/null
 }
 
 PANES=""
@@ -115,7 +121,7 @@ resolve() {
 	*[!0-9]*) ;;
 	*) printf '%s' "$target"; return ;;
 	esac
-	pane=$(session_tsv | awk -F'\t' -v n="$target" '$1 == n { print $4; exit }')
+	pane=$(cc-roster --pane "$target" 2>/dev/null)
 	[[ -n $pane && $pane != "-" ]] || die "no pane named \"$target\" (try: cc-peers)"
 	# Nothing downstream should have to wonder: a pane id is digits or it is a bug.
 	case $pane in
@@ -129,7 +135,10 @@ resolve() {
 rows_in_scope() {
 	local ws=$1 conly=$2
 	awk -F'\t' -v ws="$ws" -v conly="$conly" '
-		FNR == NR { name[$4] = $1; state[$4] = $3; next }
+		# Roster row: sid, name, status, detail, pane, ... The state column carries
+		# what a blocked session is blocked on, which is the only detail worth a
+		# column here.
+		FNR == NR { name[$5] = $2; state[$5] = $3 ($4 == "" ? "" : " " $4); next }
 		ws != "" && $1 != ws { next }
 		{
 			n = ($4 in name) ? name[$4] : "-"
@@ -559,7 +568,7 @@ wait_event() {
 wait_state() {
 	local pane=$1 state=$2 timeout=$3 waited=0 cur
 	while ((waited < timeout)); do
-		cur=$(session_tsv | awk -F'\t' -v p="$pane" '$4 == p { print $3; exit }')
+		cur=$(session_tsv | awk -F'\t' -v p="$pane" '$5 == p { print $3; exit }')
 		case $cur in
 		"$state"*) echo "$cur"; return 0 ;;
 		esac

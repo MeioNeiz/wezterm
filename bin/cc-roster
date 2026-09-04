@@ -1,0 +1,131 @@
+#!/bin/bash
+# Who is alive, what state they are in, and which pane holds them. No titles.
+#
+# cc-peers used to be the only answer to that, and it costs 1.4s: a jq per registry
+# file, an `ls -t` over the pane map per session, and a transcript tail per session to
+# work out a title. Titles are the expensive part and almost nothing needs them - a
+# name resolves to a pane without one, and so do tree, top, grep and every wz target.
+# So the cheap half lives here and cc-peers adds titles on top of it.
+#
+# Columns: sid, name, status, detail, pane, cwd, pid, seen_ms, started_ms
+# `pane` is "-" when no wezterm pane holds the session. `detail` is what the session
+# says it is blocked on, and is empty unless it is blocked.
+
+set -u
+
+readonly REGISTRY="$HOME/.claude/sessions"
+readonly PANE_MAP="$HOME/.claude/wezterm-sessions"
+readonly PANE_STATE="$HOME/.claude/wezterm-state"
+
+usage() {
+	cat <<'USAGE'
+cc-roster - live Claude sessions, their state and their pane, without titles
+
+  cc-roster            sid, name, status, detail, pane, cwd, pid, seen, started
+  cc-roster --pane <name>    just the pane id holding <name>
+  cc-roster --name <pane>    just the session name in <pane>
+
+The roster cc-peers builds costs 1.4s because it works out a title for every session.
+Nothing that resolves an address needs one, so this is the same answer in ~30ms.
+USAGE
+}
+
+mode=all
+want=""
+case ${1:-} in
+--pane) mode=pane; want=${2:-}; [[ -n $want ]] || { echo "cc-roster: --pane needs a name" >&2; exit 2; } ;;
+--name) mode=name; want=${2:-}; [[ -n $want ]] || { echo "cc-roster: --name needs a pane" >&2; exit 2; } ;;
+-h | --help) usage; exit 0 ;;
+"") ;;
+*) usage >&2; exit 2 ;;
+esac
+
+# One jq over every registry file rather than one per file: 34 forks was 76ms of the
+# 1.4s, and jq streams multiple inputs as separate documents for free.
+#
+# "waiting" is a real registry status and it means the session is asking you something;
+# waitingFor says what. It arrived after the readers were written, so anything that
+# switches on status has to be told about it or the one session that actually wants you
+# ranks below thirty idle ones.
+registry=$(jq -r '
+	select(.pid and .sessionId and .name)
+	| [ (.sessionId), (.name), (.status // "?"), (.waitingFor // ""),
+	    (.cwd // ""), (.pid | tostring),
+	    ((.statusUpdatedAt // .updatedAt // 0) | tostring),
+	    ((.startedAt // 0) | tostring) ]
+	| @tsv' "$REGISTRY"/*.json 2>/dev/null)
+
+[[ -n $registry ]] || exit 0
+
+# Every pid on the machine, once. A dead pid leaves its registry file behind, and an
+# address that will never answer is worse than no address at all. The obvious version
+# of this is `kill -0` in a bash loop, which cannot be fed tab-separated fields: tab is
+# IFS whitespace, so an empty `detail` folds and shifts the rest of the row left until
+# a millisecond timestamp arrives where the pid should be. One ps and a join in awk has
+# no separator to get wrong.
+# awk -v cannot carry a multi-line value, so the two joined tables go through files,
+# the same way cc-fleet passes its own.
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
+
+ps -axo pid= | tr -d ' ' >"$work/pids"
+printf '%s\n' "$registry" >"$work/registry"
+
+# sid -> pane, from the SessionStart hook's map. The map is keyed by pane and a stale
+# pane can still name a session that has since moved, so the newest file wins; ls -t
+# gives that order and awk reads the files in the order it is handed them.
+#
+# One awk over every file rather than a bash loop of $(<file): a command substitution
+# forks a subshell on bash 3.2, and two hundred of those was 114ms of the 136 this
+# whole script used to cost.
+(cd "$PANE_MAP" 2>/dev/null && ls -t 2>/dev/null | tr '\n' '\0' |
+	xargs -0 awk 'FNR == 1 { print $0 "\t" FILENAME }' 2>/dev/null) >"$work/panes"
+
+# The Notification hook is the only thing that knows a pane is sitting on a permission
+# prompt, and it never fires again to say the prompt was answered - so it wins only
+# while it is the newer of the two writes. Same rule cc-peers has always used.
+#
+# Resolving an address needs none of this, so --pane and --name skip it entirely.
+if [[ $mode == all ]]; then
+	(cd "$PANE_STATE" 2>/dev/null && ls 2>/dev/null | tr '\n' '\0' |
+		xargs -0 awk 'FNR == 1 { print FILENAME "\t" $0 }' 2>/dev/null) >"$work/states"
+else
+	: >"$work/states"
+fi
+
+# Three tables into one row set. Kept in awk because bash 3.2 has no associative
+# arrays and the alternative is a variable per session id.
+awk -F'\t' -v OFS='\t' -v panefile="$work/panes" \
+	-v statefile="$work/states" -v pidfile="$work/pids" '
+BEGIN {
+	while ((getline line < pidfile) > 0) alive[line + 0] = 1
+	while ((getline line < panefile) > 0) {
+		if (split(line, f, "\t") < 2) continue
+		if (!(f[1] in pane)) pane[f[1]] = f[2]   # newest file first, so first wins
+	}
+	while ((getline line < statefile) > 0) {
+		if (split(line, f, "\t") < 3) continue
+		hook_state[f[1]] = f[2]; hook_at[f[1]] = f[3]; hook_detail[f[1]] = f[4]
+	}
+}
+{
+	sid = $1; name = $2; status = $3; detail = $4; cwd = $5; pid = $6
+	seen = $7; started = $8
+	if (!(pid + 0 in alive)) next
+	pn = (sid in pane) ? pane[sid] : "-"
+	if (pn != "-" && (pn in hook_state)) {
+		# Epochs against milliseconds: the registry stamps ms, the hook stamps seconds.
+		if (hook_state[pn] == "asking" && hook_at[pn] * 1000 > seen) {
+			status = "asking"
+			if (hook_detail[pn] != "") detail = hook_detail[pn]
+		}
+	}
+	print sid, name, status, detail, pn, cwd, pid, seen, started
+}' "$work/registry" | sort -t$'\t' -k9,9n |
+	case $mode in
+	pane) awk -F'\t' -v n="$want" '$2 == n { print $5; found = 1; exit }
+	      END { if (!found) exit 1 }' ;;
+	name) awk -F'\t' -v p="$want" '$5 == p { print $2; found = 1; exit }
+	      END { if (!found) exit 1 }' ;;
+	*) cat ;;
+	esac
