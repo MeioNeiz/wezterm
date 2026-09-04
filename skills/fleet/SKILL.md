@@ -88,15 +88,20 @@ went.
 cc-spawn 'read src/auth.ts and list every path that skips the guard'
 cc-spawn --tab --cwd ~/work/api 'run the failing test and say why'
 cc-spawn --shell                   # a plain pane to watch something in
+cc-spawn --ask '...'               # leave permission prompts on
 cc-spawn --dry-run '...'
 ```
+
+Spawned sessions run with `--dangerously-skip-permissions`, which is how Jacob runs every
+agent. `--ask` is the way out of that, and there is rarely a reason for it.
 
 **Always `cc-spawn`, never `wezterm cli spawn -- claude`.** A session spawned from inside
 another inherits `CLAUDE_CODE_CHILD_SESSION` and saves no transcript: no title, no name,
 nothing on its statusLine, and it can never be handed over. `cc-spawn` clears the
 environment. Nothing else warns you.
 
-A directory Claude has not seen stops on a trust prompt before the task lands.
+A directory Claude has not seen stops on a trust prompt before the task lands. Bypass
+does not cover that one, so it is the only prompt a spawned session can still sit on.
 
 ## What a session says about itself
 

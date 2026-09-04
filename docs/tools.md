@@ -78,6 +78,9 @@ Two things that are not obvious and cost a while to find:
   script exists to prevent. It announces itself as one line of warning in a pane nobody
   is watching. `cc-spawn` clears the environment, and is why every launcher goes through
   it rather than calling `wezterm cli spawn -- claude` directly.
+- **every spawned session starts with `--dangerously-skip-permissions`**, which is how
+  every agent here is run. A pane that stopped to ask does show as `asking` on the board,
+  so it is not invisible, it is just wall clock nobody is spending. `--ask` opts one out.
 - **a message typed while a turn is running is a `queue-operation` record**, not a user
   turn, so every "last prompt" reader is blind to it. It is usually the steer that
   changed what the work was. The brief carries everything queued since the last real

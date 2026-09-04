@@ -9,6 +9,10 @@
 # itself beyond one line of warning in a pane nobody is watching.
 #
 # So every launcher goes through here rather than calling `wezterm cli spawn` directly.
+#
+# It also starts every session with --dangerously-skip-permissions: that is how every
+# agent here is run, and a spawned session that stops to ask is wall clock nobody is
+# spending. --ask opts one out.
 
 set -u
 
@@ -31,6 +35,7 @@ cc-spawn - start a Claude session in a new pane, with a task
   --right | --left | --top | --bottom     split (default: right)
   --tab | --window   a new tab in the same window, or a new window
   --shell            a plain shell rather than Claude, for a pane to watch things in
+  --ask              leave permission prompts on (default: bypassed)
   --dry-run          print what it would run
 
 Prints the new pane id. The environment is cleaned first, which is the whole point:
@@ -50,6 +55,7 @@ cwd=""
 from=""
 where="--right"
 shell=false
+ask=false
 dry=false
 while (($#)); do
 	case $1 in
@@ -61,6 +67,7 @@ while (($#)); do
 	--tab) where="tab" ;;
 	--window) where="window" ;;
 	--shell) shell=true ;;
+	--ask) ask=true ;;
 	--dry-run) dry=true ;;
 	-h | --help) usage; exit 0 ;;
 	--) shift; break ;;
@@ -95,10 +102,16 @@ fi
 [[ -d $cwd ]] || die "no such directory: $cwd"
 
 prompt="$*"
+perm=" --dangerously-skip-permissions"
+$ask && perm=""
+
 if $shell; then
 	cmd=("$SHELL")
 else
-	cmd=("${CLEAN_ENV[@]}" claude "$prompt")
+	# built in pieces: an empty array expansion is unbound under bash 3.2 and set -u
+	cmd=("${CLEAN_ENV[@]}" claude)
+	$ask || cmd+=(--dangerously-skip-permissions)
+	cmd+=("$prompt")
 fi
 
 if [[ $where != window ]]; then
@@ -111,7 +124,7 @@ if $dry; then
 	if $shell; then
 		printf '  %s\n' "$SHELL"
 	else
-		printf '  %s claude <prompt, %s chars>\n' "${CLEAN_ENV[*]}" "${#prompt}"
+		printf '  %s claude%s <prompt, %s chars>\n' "${CLEAN_ENV[*]}" "$perm" "${#prompt}"
 	fi
 	exit 0
 fi
