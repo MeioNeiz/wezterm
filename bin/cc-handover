@@ -1,0 +1,303 @@
+#!/bin/bash
+# Move work from a session that is full to one that is empty.
+#
+# The manual version of this is scrolling up, copying the last message, opening a pane
+# and pasting it, which loses everything that was not on screen: what you actually
+# asked, which branch it was on, which files it had open, what it had told itself to
+# remember. All of that is already on disk in the transcript and in cc-note, so none of
+# it needs regenerating - this reads it and hands it over.
+#
+# The brief is written to a file *and* handed to the new session inline. Inline so the
+# work starts without a tool call; on disk so it can be reread, reused, or given to a
+# second session when the first one also fills up. It names the source transcript too,
+# because the whole conversation is still there and a successor that can go and look is
+# strictly better than one holding a copy of the last screen.
+
+set -u
+
+readonly FLEET="$HOME/.claude/fleet"
+readonly OUT="$FLEET/handover"
+# The tail that gets parsed. Transcripts reach 13MB and the useful part is the end;
+# 400KB is comfortably several turns even when they are long.
+readonly TAIL_BYTES=400000
+# What goes inline as the new session's opening prompt. Past this the brief still
+# names the file, and the successor reads the rest itself.
+readonly INLINE_MAX=12000
+# Assistant messages shorter than this are scaffolding between tool calls, not findings.
+readonly TRIVIAL_TEXT=160
+
+# A session spawned from inside another one inherits its whole Claude environment, and
+# CLAUDE_CODE_CHILD_SESSION in particular turns transcript saving off: the new session
+# then has no transcript, so it never gets a title, cc-peers cannot name it, and it can
+# never be handed over itself. Which is the one thing this script exists to prevent.
+# Cleared rather than filtered, so a handover launched by an agent starts the same
+# session a human would have started from a plain shell.
+readonly CLEAN_ENV=(env
+	-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID
+	-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_MESSAGING_SOCKET
+	-u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_EXECPATH
+	-u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT)
+
+usage() {
+	cat <<'USAGE'
+cc-handover - hand a session's work to a fresh one
+
+  cc-handover [T]                    print the brief for a session (default: this one)
+  cc-handover [T] --new [--right|--down|--tab|--window]
+                                     open a fresh session, seeded with it
+  cc-handover [T] --to <pane>        paste the brief into a session already open
+  cc-handover [T] --save             just write the file and print its path
+  cc-handover [T] --new --dry-run    print the command it would run, and stop
+
+  --turns N     how many substantive replies to carry (default 3)
+  --why <text>  a line saying why the work moved
+
+T is a session name, a session id, a pane id, or "." for this session.
+
+The brief carries the last prompt, the last few replies, the working directory and
+branch, the files recently touched, and anything cc-note is holding. It also names the
+source transcript, so the new session can read the rest of the conversation rather than
+work from a summary of it.
+
+  cc-handover --new                      hand this session over, fresh pane to the right
+  cc-handover d5-lca-48 --new --tab      the same for another session, on its own tab
+  cc-handover --why 'context full' --new
+USAGE
+}
+
+die() {
+	echo "cc-handover: $*" >&2
+	exit 1
+}
+
+target=""
+action=print
+split="--right"
+to=""
+turns=3
+why=""
+dry=false
+while (($#)); do
+	case $1 in
+	--new) action=new ;;
+	--dry-run) dry=true ;;
+	--save) action=save ;;
+	--to) shift; to=${1:-}; action=to; [[ -n $to ]] || die "--to needs a pane" ;;
+	--right | --left | --top | --bottom) split=$1 ;;
+	--down) split="--bottom" ;;
+	--up) split="--top" ;;
+	--tab) split="tab" ;;
+	--window) split="window" ;;
+	--turns) shift; turns=${1:-2} ;;
+	--why) shift; why=${1:-} ;;
+	-h | --help) usage; exit 0 ;;
+	-*) die "unknown option $1" ;;
+	*) [[ -z $target ]] || die "one target at a time"; target=$1 ;;
+	esac
+	shift
+done
+case $turns in '' | *[!0-9]*) die "--turns needs a number" ;; esac
+
+# --- who ---------------------------------------------------------------------------
+
+if [[ -z $target || $target == . ]]; then
+	sid=${CLAUDE_CODE_SESSION_ID:-}
+	[[ -n $sid ]] || die "no target given and CLAUDE_CODE_SESSION_ID is unset"
+else
+	case $target in
+	????????-????-????-????-????????????) sid=$target ;;
+	*[!0-9]*) sid=$(cc-roster 2>/dev/null | awk -F'\t' -v n="$target" '$2 == n { print $1; exit }') ;;
+	*) sid=$(cc-roster 2>/dev/null | awk -F'\t' -v p="$target" '$5 == p { print $1; exit }') ;;
+	esac
+	[[ -n $sid ]] || die "no live session called \"$target\" (try: cc-roster)"
+fi
+
+IFS=$'\x1f' read -r name cwd pane < <(
+	cc-roster 2>/dev/null | awk -F'\t' -v s="$sid" '$1 == s { printf "%s\x1f%s\x1f%s", $2, $6, $5; exit }'
+)
+: "${name:=$sid}" "${cwd:=$PWD}" "${pane:=-}"
+
+# The slug is bash's own substitution rather than a sed: identical output, no fork.
+transcript="$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}/$sid.jsonl"
+[[ -r $transcript ]] ||
+	transcript=$(ls -t "$HOME"/.claude/projects/*/"$sid.jsonl" 2>/dev/null | head -1)
+[[ -r $transcript ]] || die "no transcript for $name ($sid)"
+
+# --- what it was doing --------------------------------------------------------------
+#
+# One tail feeds every extraction below. `tail -n +2` drops the half-record that a byte
+# offset always lands in the middle of: jq discards a whole batch over one line it
+# cannot parse, which reads as "the session said nothing".
+tailfile=$(mktemp) || exit 1
+trap 'rm -f "$tailfile" "$tailfile.users"' EXIT
+tail -c "$TAIL_BYTES" "$transcript" | tail -n +2 >"$tailfile"
+
+title=$(awk '/"type":"custom-title"/ { c = $0 } /"type":"ai-title"/ { a = $0 }
+	END { if (c != "") print c; else if (a != "") print a }' "$tailfile" |
+	jq -r '.customTitle // .aiTitle // empty' 2>/dev/null)
+
+# The real user turn, not the "last-prompt" record beside it: that one is Claude's own
+# UI copy and arrives already truncated with an ellipsis, which is exactly the detail a
+# successor needs in full.
+#
+# Grepped out of the whole transcript rather than the tail, because a long turn pushes
+# the prompt that started it well past 400KB back - and then the only thing left in the
+# tail is the truncated copy. One grep over a 1.4MB file is 13ms.
+grep '"type":"user"' "$transcript" 2>/dev/null | tail -400 >"$tailfile.users"
+last_prompt=$(jq -r 'select((.isMeta // false) | not)
+	| .message.content
+	| if type == "string" then . elif type == "array" then
+		([ .[] | select(.type == "text") | .text ] | join("")) else empty end
+	| select(type == "string") | select(startswith("<") | not) | select(length > 0)
+	' "$tailfile.users" 2>/dev/null | tail -1)
+last_prompt_at=$(jq -r 'select((.isMeta // false) | not)
+	| select(.message.content | if type == "string" then (startswith("<") | not)
+		elif type == "array" then ([ .[] | select(.type == "text") ] | length) > 0
+		else false end)
+	| .timestamp // empty' "$tailfile.users" 2>/dev/null | tail -1)
+if [[ -z $last_prompt ]]; then
+	last_prompt=$(grep '"type":"last-prompt"' "$tailfile" | tail -1 |
+		jq -r '.lastPrompt // empty' 2>/dev/null)
+fi
+
+# Anything typed while the turn was still running lands as a queue-operation rather
+# than a user turn, so it is invisible to every "last prompt" reader - and it is
+# usually the steer that changed what the work was. Everything queued since the last
+# real prompt goes over with it.
+queued=$(grep '"type":"queue-operation"' "$transcript" 2>/dev/null | tail -100 |
+	jq -r --arg since "$last_prompt_at" '
+		select(.operation == "enqueue")
+		| select((.content // "") != "")
+		| select($since == "" or (.timestamp // "") > $since)
+		| .content' 2>/dev/null | awk '!seen[$0]++')
+
+# Anything under TRIVIAL_TEXT is a transition rather than a result - "Let me check the
+# other file", "Now the handover" - and a handover made of those says nothing. Dropping
+# them means `--turns 3` carries three messages that were worth writing down.
+replies=$(jq -r --argjson min "$TRIVIAL_TEXT" 'select(.type == "assistant")
+	| [ .message.content[]? | select(.type == "text") | .text ] | join("")
+	| select(length > $min)' "$tailfile" 2>/dev/null | tail -n "$turns")
+
+files=$(jq -r 'select(.type == "assistant") | .message.content[]?
+	| select(.type == "tool_use")
+	| select(.name == "Edit" or .name == "Write" or .name == "NotebookEdit")
+	| .input.file_path // .input.notebook_path // empty' "$tailfile" 2>/dev/null |
+	sort -u | tail -12)
+
+# --- where it was --------------------------------------------------------------------
+
+branch=""
+dirty=""
+if [[ -d $cwd ]]; then
+	branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
+	if [[ -n $branch ]]; then
+		dirty=$(git -C "$cwd" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+	fi
+fi
+
+note=$(cc-note show --for "$sid" 2>/dev/null | sed -e $'s/\033\\[[0-9;]*m//g' | tail -n +2)
+
+# --- the brief ------------------------------------------------------------------------
+
+mkdir -p "$OUT" 2>/dev/null
+stamp=$(date '+%Y%m%d-%H%M%S')
+file="$OUT/$name-$stamp.md"
+
+{
+	printf '# Handover from %s\n\n' "$name"
+	[[ -n $title ]] && printf '%s\n\n' "$title"
+	printf 'You are picking this work up fresh. '
+	if [[ -n $why ]]; then
+		printf 'The previous session handed it over: %s.\n\n' "$why"
+	else
+		printf 'The previous session handed it over.\n\n'
+	fi
+
+	printf '**Working directory** `%s`' "$cwd"
+	[[ -n $branch ]] && printf '  ·  **branch** `%s`' "$branch"
+	[[ -n $dirty && $dirty != 0 ]] && printf ' (%s uncommitted)' "$dirty"
+	printf '\n\n'
+
+	if [[ -n $note ]]; then
+		printf '## What it was tracking\n\n```\n%s\n```\n\n' "$note"
+	fi
+
+	if [[ -n $last_prompt ]]; then
+		printf '## The last thing it was asked\n\n%s\n\n' "$last_prompt"
+	fi
+
+	if [[ -n $queued ]]; then
+		printf '## And then, while it was working\n\n'
+		printf '%s\n' "$queued" | sed 's/^/> /'
+		printf '\n'
+	fi
+
+	if [[ -n $replies ]]; then
+		printf '## Where it got to\n\n%s\n\n' "$replies"
+	fi
+
+	if [[ -n $files ]]; then
+		printf '## Files it had been editing\n\n'
+		printf '%s\n' "$files" | sed 's/^/- `/; s/$/`/'
+		printf '\n'
+	fi
+
+	printf '## If you need more than this\n\n'
+	printf 'The whole conversation is still on disk. Read it rather than guessing:\n\n'
+	printf '    %s\n\n' "$transcript"
+	printf 'That session is `%s` (`claude --resume %s` reopens it).\n' "$name" "$sid"
+	printf 'This brief is saved at `%s`.\n' "$file"
+} >"$file"
+
+# --- doing something with it ----------------------------------------------------------
+
+brief=$(<"$file")
+if ((${#brief} > INLINE_MAX)); then
+	# Too long to hand over inline, so hand over the pointer. The successor reads it,
+	# which is one tool call and no truncation.
+	brief="Read $file and continue that work. It is a handover brief from a session
+that ran out of room; it names the source transcript if you need more than it carries."
+fi
+
+case $action in
+save)
+	printf '%s\n' "$file"
+	;;
+print)
+	printf '%s\n' "$(<"$file")"
+	;;
+to)
+	pane_to=$to
+	case $to in
+	*[!0-9]*) pane_to=$(cc-roster 2>/dev/null | awk -F'\t' -v n="$to" '$2 == n { print $5; exit }') ;;
+	esac
+	[[ -n $pane_to && $pane_to != "-" ]] || die "--to: no pane for \"$to\""
+	wezterm cli send-text --pane-id "$pane_to" -- "$brief"
+	echo "handover pasted into pane $pane_to (press enter there to send it)"
+	;;
+new)
+	[[ $pane != "-" ]] || [[ $split == window ]] ||
+		die "$name has no pane to split from; use --window"
+	if $dry; then
+		printf 'would spawn (%s) in %s:\n\n' "$split" "$cwd"
+		printf '  %s' "${CLEAN_ENV[*]}"
+		printf ' claude <brief, %s chars>\n\n' "${#brief}"
+		printf 'brief: %s\n' "$file"
+		exit 0
+	fi
+	case $split in
+	tab)
+		new=$(wezterm cli spawn --pane-id "$pane" --cwd "$cwd" \
+			-- "${CLEAN_ENV[@]}" claude "$brief") ;;
+	window)
+		new=$(wezterm cli spawn --new-window --cwd "$cwd" \
+			-- "${CLEAN_ENV[@]}" claude "$brief") ;;
+	*)
+		new=$(wezterm cli split-pane --pane-id "$pane" "$split" --cwd "$cwd" \
+			-- "${CLEAN_ENV[@]}" claude "$brief") ;;
+	esac
+	[[ -n $new ]] || die "could not open a pane for the handover"
+	echo "handed $name over to pane $new"
+	echo "brief: $file"
+	;;
+esac
