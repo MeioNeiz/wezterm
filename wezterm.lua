@@ -537,7 +537,81 @@ local ws_touch
 -- with the tab bar's identity palette, which cannot be hoisted above this handler.
 local focused_identity
 
-wezterm.on("update-right-status", function(window, _)
+---A file the shell can put wezterm actions in. It exists because `wezterm cli` cannot
+---do everything the Lua API can, and the gap is not academic: **the CLI cannot switch
+---workspace**. `activate-pane` on a pane in another workspace makes it active inside its
+---own window and leaves the GUI where it was, so `wz go` has always half-worked - right
+---pane, wrong screen - and there is no CLI verb that fixes it.
+---
+---OSC 1337 SetUserVar is the bridge this would normally use and it does nothing on this
+---build (see CLAUDE.md). What is left is a file and a tick, and the status bar is already
+---ticking once a second for the tab bar's sake.
+---
+---One line per action, tab separated. Claimed by rename, which is atomic, so exactly one
+---window drains a batch however many are watching.
+local ACTION_FILE = "/.claude/fleet/actions"
+
+local function perform_action_line(window, pane, verb, a, b)
+	if verb == "workspace" and a and a ~= "" then
+		window:perform_action(act.SwitchToWorkspace({ name = a }), pane)
+	elseif verb == "goto" and a and a ~= "" then
+		-- Workspace first, then the pane: switching brings that workspace's windows
+		-- forward, and activating before the switch lands puts focus somewhere the
+		-- switch then takes away.
+		if b and b ~= "" then
+			window:perform_action(act.SwitchToWorkspace({ name = b }), pane)
+		end
+		local id = tonumber(a)
+		if id then
+			pcall(function()
+				for _, w in ipairs(wezterm.mux.all_windows()) do
+					for _, t in ipairs(w:tabs()) do
+						for _, p in ipairs(t:panes()) do
+							if p:pane_id() == id then
+								t:activate()
+								p:activate()
+								return
+							end
+						end
+					end
+				end
+			end)
+		end
+	elseif verb == "toast" then
+		-- wezterm's own notification rather than osascript's: it is tied to the
+		-- terminal, so it does not arrive claiming to be from Script Editor.
+		window:toast_notification(a or "wezterm", b or "", nil, 8000)
+	end
+end
+
+local function drain_actions(window, pane)
+	local path = wezterm.home_dir .. ACTION_FILE
+	local probe = io.open(path, "r")
+	if not probe then
+		return
+	end
+	probe:close()
+	local claimed = path .. ".taken." .. tostring(window:window_id())
+	if not os.rename(path, claimed) then
+		return -- another window got this batch
+	end
+	local file = io.open(claimed, "r")
+	if not file then
+		return
+	end
+	for line in file:lines() do
+		local verb, a, b = line:match("^([^\t]*)\t?([^\t]*)\t?(.*)$")
+		if verb and verb ~= "" then
+			pcall(perform_action_line, window, pane, verb, a, b)
+		end
+	end
+	file:close()
+	os.remove(claimed)
+end
+
+wezterm.on("update-right-status", function(window, pane)
+	drain_actions(window, pane)
+
 	local parts = {}
 	local width = 0
 
@@ -559,6 +633,14 @@ wezterm.on("update-right-status", function(window, _)
 	-- about somewhere else.
 	if attention_elsewhere then
 		local away = attention_elsewhere(window)
+		-- Ahead of the rest because it is the only one asking for something away
+		-- from the keyboard, and the only channel here that no notification
+		-- permission can silently drop.
+		if (away.needs or 0) > 0 then
+			table.insert(parts, { Foreground = { Color = "#f38ba8" } })
+			table.insert(parts, { Text = string.format(" ●%d needs you", away.needs) })
+			width = width + 12
+		end
 		if away.asking > 0 then
 			table.insert(parts, { Foreground = { Color = "#cba6f7" } })
 			table.insert(parts, { Text = string.format(" ⚠%d", away.asking) })
@@ -1533,7 +1615,7 @@ table.insert(config.keys, {
 -- Throttled because update-right-status fires every second and this walks the mux, but
 -- the walk is the cheap half: the cost is one open() per off-window pane, so it is kept
 -- to the panes that are not already on screen in front of you.
-local fleet_attention = { at = 0, asking = 0, fresh = 0 }
+local fleet_attention = { at = 0, asking = 0, fresh = 0, needs = 0 }
 
 ---What each session has said about itself, out of cc-note. Only `mute` matters in this
 ---file: a muted session is one Jacob has said he does not want chased, so it must not
@@ -1567,8 +1649,8 @@ local function load_notes()
 	notes_flags = fresh
 end
 
----@return boolean true when this pane's session has been muted
-local function pane_muted(pane_id)
+---@return boolean true when this pane's session carries `flag`
+local function pane_flagged(pane_id, flag)
 	local sid = read_session_id(pane_id)
 	if not sid then
 		return false
@@ -1577,7 +1659,11 @@ local function pane_muted(pane_id)
 	if not flags then
 		return false
 	end
-	return flags:find("mute", 1, true) ~= nil
+	return flags:find(flag, 1, true) ~= nil
+end
+
+local function pane_muted(pane_id)
+	return pane_flagged(pane_id, "mute")
 end
 
 attention_elsewhere = function(window)
@@ -1588,6 +1674,7 @@ attention_elsewhere = function(window)
 	fleet_attention.at = now
 	fleet_attention.asking = 0
 	fleet_attention.fresh = 0
+	fleet_attention.needs = 0
 	load_notes()
 
 	local here = {}
@@ -1607,6 +1694,12 @@ attention_elsewhere = function(window)
 			for _, tab in ipairs(mux_window:tabs()) do
 				for _, p in ipairs(tab:panes()) do
 					local id = p:pane_id()
+					-- `needs` counts wherever the pane is, including this window:
+					-- it means someone has to do something away from the keyboard,
+					-- so having the pane on screen does not discharge it.
+					if pane_flagged(id, "needs") then
+						fleet_attention.needs = fleet_attention.needs + 1
+					end
 					if not here[id] and not pane_muted(id) then
 						local rec = read_pane_state(id)
 						if rec and rec.state == "asking" then

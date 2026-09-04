@@ -21,6 +21,9 @@ readonly CACHE="$HOME/.claude/cache"
 readonly EVENT_LOG="$CACHE/wz-events.jsonl"
 readonly EVENT_PID="$CACHE/wz-events.pid"
 readonly EVENT_KEEP=5000
+# wezterm.lua drains this on the status-bar tick. It exists for the things `wezterm cli`
+# cannot do, of which the one that matters is switching workspace.
+readonly ACTIONS="$HOME/.claude/fleet/actions"
 
 usage() {
 	cat <<'USAGE'
@@ -49,7 +52,8 @@ driving
   wz go <target>                      focus a pane, switching tab and workspace
   wz join <src> <target> [--right|--left|--top|--bottom]
   wz break <target>                   move a pane out to its own tab
-  wz notify <title> [body]            a desktop notification
+  wz notify [--say] [--quiet] <title> [body]
+                                      a sound and a toast; --say speaks it
 
 <target> is a wezterm pane id, a cc-peers session name, or "." for this pane.
 tree, grep and top cover the current workspace; -a covers every one.
@@ -423,10 +427,34 @@ cmd_key() {
 	done
 }
 
+# Queue an action for wezterm.lua. Appended, because two callers a second apart must not
+# lose one another's line; the Lua claims the whole file by rename and drains it.
+queue_action() {
+	mkdir -p "${ACTIONS%/*}" 2>/dev/null
+	printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" >>"$ACTIONS"
+}
+
+# `wezterm cli activate-pane` makes a pane active inside its own window and leaves the
+# GUI on whatever workspace it was showing, so on its own this lands you on the right
+# pane of a screen you cannot see. Measured, not assumed: activating a pane in another
+# workspace left the client's workspace unchanged.
+#
+# The CLI has no verb for the switch. So a cross-workspace jump goes through the action
+# queue, and a jump inside the current workspace stays synchronous - no tick to wait for.
 cmd_go() {
 	(($#)) || die "go: need a target"
-	local pane
+	local pane target_ws here
 	pane=$(resolve "$1") || exit 1
+	load
+	target_ws=$(printf '%s\n' "$PANES" | awk -F'\t' -v p="$pane" '$4 == p { print $1; exit }')
+	here=$(wezterm cli list-clients --format json 2>/dev/null |
+		jq -r '.[0].workspace // empty' 2>/dev/null)
+
+	if [[ -n $target_ws && -n $here && $target_ws != "$here" ]]; then
+		queue_action goto "$pane" "$target_ws"
+		echo "switching to $target_ws, pane $pane"
+		return
+	fi
 	wezterm cli activate-pane --pane-id "$pane"
 }
 
@@ -466,15 +494,43 @@ osa_quote() {
 	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+# Notification Centre is not a channel you can rely on here. WezTerm has never
+# registered with it - zero entries under its bundle id in com.apple.ncprefs - so
+# window:toast_notification returns happily and shows nothing, and ncprefs and the
+# delivery database are both TCC-protected, so a script cannot even find out. Measured,
+# after two toasts that were sent, drained and never seen.
+#
+# So the toast is still raised, because it costs nothing and starts working the day
+# permission is granted, but it is not what carries the message. Sound is: afplay needs
+# no permission, cannot be silently dropped, and is the difference between knowing and
+# not. --say speaks the body for the ones with a clock on them.
 cmd_notify() {
+	local sound=true speak=false
+	while (($#)); do
+		case ${1:-} in
+		--quiet) sound=false; shift ;;
+		--say) speak=true; shift ;;
+		-h | --help) usage; return ;;
+		--) shift; break ;;
+		-*) die "notify: unknown option $1" ;;
+		*) break ;;
+		esac
+	done
 	(($#)) || die "notify: need a title"
 	local title=$1 body=""
 	shift
 	(($#)) && body=$*
-	# wezterm exposes no notification API to the CLI, and window:toast_notification
-	# exists only inside Lua, so this goes straight to Notification Centre.
-	osascript -e "display notification \"$(osa_quote "$body")\" \
-		with title \"$(osa_quote "$title")\""
+
+	if wezterm cli list --format json >/dev/null 2>&1; then
+		queue_action toast "$title" "$body"
+	else
+		osascript -e "display notification \"$(osa_quote "$body")\" \
+			with title \"$(osa_quote "$title")\"" 2>/dev/null
+	fi
+	$sound && afplay /System/Library/Sounds/Glass.aiff >/dev/null 2>&1 &
+	$speak && say "${title}. ${body}" >/dev/null 2>&1 &
+	wait 2>/dev/null
+	return 0
 }
 
 # --- events -----------------------------------------------------------------------

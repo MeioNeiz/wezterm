@@ -16,7 +16,7 @@ Costs are output tokens, which is the budget that matters: you pay them every ca
 
 | asked | run | tokens |
 |---|---|---|
-| what wants me / what's running | `cc-fleet --brief` | **~20** |
+| what wants me / what's running | `cc-fleet --brief` | **~20-45** |
 | the whole dashboard | `cc-fleet` | ~770 |
 | every field, parseable | `cc-fleet --tsv` | ~920 |
 | ...as JSON | `cc-fleet --json` | ~1960 |
@@ -105,17 +105,29 @@ Keyed by session id, so it survives a pane move and `--resume` and stops at `/cl
 Inside a session it needs no target and no lookup.
 
 ```bash
+cc-note needs 'log in to the DigitalFive dashboard'      # quiet: see below
+cc-note needs --now 'approve the deploy'                 # quiet, and a sound now
 cc-note status 'waiting on the staging deploy'   # shows on its statusLine and cc-fleet
 cc-note progress 3 7
-cc-note todo add '...'      # todo done 1 | list | clear
 cc-note log '...'           # log --tail 20
 cc-note mute                # stop it counting towards "wants you elsewhere"
 cc-note show --for d5-lca-48
 cc-note list --json
 ```
 
-Use it when you park work, when you are blocked on something off-machine, or when a long
-job has steps worth counting.
+**`needs` is for something Jacob has to do away from the keyboard** - a login, an
+approval, a card to tap. Two levels, because a notification for every pane that wants
+something trains him to ignore all of them:
+
+- **quiet** (default): the pane's statusLine, the first line of `cc-fleet --brief`, and
+  `●N needs you` in red on the wezterm status bar of whatever window he is looking at.
+  No sound, nothing to dismiss, and it stays until cleared.
+- **`--now`**: the same plus a chime. Use it only when there is a clock on the thing.
+
+Clear it with `cc-note needs --clear` once he has done it.
+
+Otherwise use `status` when you park work or are blocked on something off-machine, and
+`progress` when a long job has steps worth counting.
 
 ## Rules
 

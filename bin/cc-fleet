@@ -227,6 +227,22 @@ fi
 	exit 0
 }
 
+# What each session said about itself, keyed by id. A variable per key rather than one
+# joined string: ${map#*"|$k="} matches character by character in a UTF-8 locale and
+# costs the whole map per lookup. Dashes are not legal in a name, so they become
+# underscores; a session id is short enough for the substitution to be free.
+#
+# Not folded into assemble_rows on purpose: that result is cached for eight seconds and
+# a note is the one field here you change and expect to see immediately.
+if [[ -r $NOTES ]]; then
+	while IFS=$'\t' read -r n_sid _ n_flags n_prog n_stat; do
+		[[ -n $n_sid ]] || continue
+		printf -v "nf_${n_sid//-/_}" '%s' "${n_flags:--}"
+		printf -v "np_${n_sid//-/_}" '%s' "${n_prog:--}"
+		printf -v "ns_${n_sid//-/_}" '%s' "${n_stat:--}"
+	done <"$NOTES"
+fi
+
 # How full each session is, keyed by id. Written by the statusLine, which is the only
 # thing Claude hands the authoritative number to - the registry does not carry it, and a
 # transcript gives the tokens in play on the last turn without the window size to divide
@@ -253,6 +269,19 @@ fi
 # and a count of the rest. The dashboard is ~770 tokens even stripped of colour, and 31
 # of its 34 rows are idle sessions nobody asked about. This is about 60.
 if [[ $mode == brief ]]; then
+	# What has asked for you by name. First, because unlike everything else here it
+	# wants something done away from the terminal.
+	needs=""
+	while IFS="$US" read -r _ _ _ _ _ nm _ _ _ _ _ _ sid _; do
+		[[ -n ${sid:-} ]] || continue
+		fkey="nf_${sid//-/_}"
+		skey="ns_${sid//-/_}"
+		case ",${!fkey:--}," in
+		*,needs,*) needs="$needs  $nm: ${!skey:--}"$'\n' ;;
+		esac
+	done <<<"$rows"
+	[[ -n $needs ]] && printf 'needs you:\n%s' "$needs"
+
 	printf '%s\n' "$rows" | awk -F"$US" -v cut="$stale_secs" '
 		$7 == "asking" || $7 == "waiting" || $7 == "busy" {
 			want[++w] = $7 "\t" $9 "\t" $6 "\t" $8 "\t" $2
@@ -306,22 +335,6 @@ if [[ $mode == json ]]; then
 			        state: .[5], blocked_on: .[6], idle_seconds: (.[7] | tonumber?),
 			        your_turns: (.[8] | tonumber?), dir: .[9], title: .[10], id: .[11] })'
 	exit 0
-fi
-
-# What each session said about itself, keyed by id. A variable per key rather than one
-# joined string: ${map#*"|$k="} matches character by character in a UTF-8 locale and
-# costs the whole map per lookup. Dashes are not legal in a name, so they become
-# underscores; a session id is short enough for the substitution to be free.
-#
-# Not folded into assemble_rows on purpose: that result is cached for eight seconds and
-# a note is the one field here you change and expect to see immediately.
-if [[ -r $NOTES ]]; then
-	while IFS=$'\t' read -r n_sid _ n_flags n_prog n_stat; do
-		[[ -n $n_sid ]] || continue
-		printf -v "nf_${n_sid//-/_}" '%s' "${n_flags:--}"
-		printf -v "np_${n_sid//-/_}" '%s' "${n_prog:--}"
-		printf -v "ns_${n_sid//-/_}" '%s' "${n_stat:--}"
-	done <"$NOTES"
 fi
 
 # "3d" beats "268214s" at a glance, and five cells is all it needs.

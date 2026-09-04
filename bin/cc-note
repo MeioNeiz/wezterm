@@ -19,7 +19,6 @@ set -u
 readonly FLEET="$HOME/.claude/fleet"
 readonly NOTES="$FLEET/notes.tsv"
 readonly LOGDIR="$FLEET/log"
-readonly TODODIR="$FLEET/todo"
 readonly LOCK="$FLEET/.lock"
 # Past this the file is swept of sessions that have ended. Sweeping costs a cc-roster,
 # so it is not worth doing on a write that is already the common case.
@@ -33,23 +32,23 @@ cc-note - what a session says about itself
   cc-note                          this session's note
   cc-note show [--for T]           one session's note, in full
   cc-note list [--json]            every session that has one
-  cc-note clear [--for T]          drop the note, the log and the todos
+  cc-note clear [--for T]          drop the note and its log
 
   cc-note status <text>            one line: what it is doing, or waiting on
   cc-note status --clear
+  cc-note needs <text>             it needs you to do something. Shows on its own line,
+                                   on cc-fleet --brief, and nowhere noisy
+  cc-note needs --now <text>       the same, and raise a notification now
+  cc-note needs --clear
   cc-note progress <done> <total>  3 of 7; --clear to drop it
-  cc-note pin | unpin              keep it at the top of the board
   cc-note mute | unmute            stop it competing for attention when it stops
-
-  cc-note todo add <text>
-  cc-note todo done <n> | undo <n> | drop <n>
-  cc-note todo list | clear
   cc-note log <text>               append a line worth keeping
   cc-note log --tail [n]
 
 --for takes a session name, a session id, or a wezterm pane id. Without it every verb
 acts on the calling session, which is free: no lookup, no roster.
 
+  cc-note needs --now 'log in to the DigitalFive dashboard'
   cc-note status 'waiting on the staging deploy'
   cc-note progress 3 7
   cc-note status --for d5-lca-48 'blocked on the DNS change'
@@ -182,48 +181,16 @@ drop_flag() {
 	printf '%s' "${out:--}"
 }
 
-# --- todos and the log ------------------------------------------------------------
+# --- the log ----------------------------------------------------------------------
 #
-# Neither belongs in notes.tsv: a todo list is many lines and a log grows without
-# bound, and notes.tsv is read in full by four surfaces on a timer. These are read
-# only when something asks for them.
+# Not in notes.tsv: that file is read in full by three surfaces on a timer and a log
+# grows without bound. Read only when something asks for it.
+#
+# There was a todo store here too, matched off cmux. Claude Code has its own todo list
+# and nothing ever wrote to this one, so it was carrying documentation weight in the
+# skill and nothing else.
 
-todo_file() { printf '%s/%s' "$TODODIR" "$1"; }
 log_file() { printf '%s/%s' "$LOGDIR" "$1"; }
-
-cmd_todo() {
-	local sid=$1 action=${2:-list} n
-	shift 2 2>/dev/null || shift $#
-	local file
-	file=$(todo_file "$sid")
-	case $action in
-	add)
-		(($#)) || die "todo add: need something to do"
-		mkdir -p "$TODODIR" 2>/dev/null
-		printf 'open\t%s\n' "$(clean "$*")" >>"$file"
-		;;
-	done | undo | drop)
-		n=${1:-}
-		case $n in '' | *[!0-9]*) die "todo $action: need a number, from todo list" ;; esac
-		[[ -r $file ]] || die "todo $action: nothing on the list"
-		local state=open
-		[[ $action == done ]] && state=done
-		if [[ $action == drop ]]; then
-			awk -F'\t' -v n="$n" 'NR != n' "$file" >"$file.$$" && mv -f "$file.$$" "$file"
-		else
-			awk -F'\t' -v OFS='\t' -v n="$n" -v s="$state" \
-				'NR == n { $1 = s } { print }' "$file" >"$file.$$" &&
-				mv -f "$file.$$" "$file"
-		fi
-		;;
-	clear) rm -f "$file" ;;
-	list)
-		[[ -r $file ]] || return 0
-		awk -F'\t' '{ printf "%2d  %s  %s\n", NR, ($1 == "done" ? "x" : " "), $2 }' "$file"
-		;;
-	*) die "todo: no such action \"$action\"" ;;
-	esac
-}
 
 cmd_log() {
 	local sid=$1
@@ -276,9 +243,6 @@ cmd_show() {
 		printf '  progress  %s %s\n' "$(bar "${F_PROGRESS%%/*}" "${F_PROGRESS##*/}")" "$F_PROGRESS"
 	fi
 	[[ $F_FLAGS != "-" ]] && printf '  flags     %s\n' "$F_FLAGS"
-	local todos
-	todos=$(cmd_todo "$sid" list)
-	[[ -n $todos ]] && printf '  todo\n%s\n' "$(printf '%s\n' "$todos" | sed 's/^/    /')"
 	local logs
 	logs=$(cmd_log "$sid" --tail 5)
 	[[ -n $logs ]] && printf '  log\n%s\n' "$(printf '%s\n' "$logs" | sed 's/^/    /')"
@@ -364,21 +328,40 @@ progress)
 		write_row "$sid" "$F_FLAGS" "$local_done/$local_total" "$F_STATUS"
 	fi
 	;;
-pin | unpin | mute | unmute)
+mute | unmute)
 	load "$sid"
 	case $verb in
-	pin) F_FLAGS=$(add_flag "$F_FLAGS" pin) ;;
-	unpin) F_FLAGS=$(drop_flag "$F_FLAGS" pin) ;;
 	mute) F_FLAGS=$(add_flag "$F_FLAGS" mute) ;;
 	unmute) F_FLAGS=$(drop_flag "$F_FLAGS" mute) ;;
 	esac
 	write_row "$sid" "$F_FLAGS" "$F_PROGRESS" "$F_STATUS"
 	;;
-todo) cmd_todo "$sid" "$@" ;;
+needs)
+	# Two levels on purpose. A pane that wants something is nearly always content to
+	# wait, and a notification for every one of those trains you to ignore them; the
+	# quiet channel puts it on the pane's own statusLine and one line of
+	# `cc-fleet --brief`, which is where you look anyway. --now is for the ones with a
+	# clock on them: a login, an approval, a card to tap.
+	load "$sid"
+	notify=false
+	[[ ${1:-} == --now ]] && { notify=true; shift; }
+	if [[ ${1:-} == --clear ]]; then
+		write_row "$sid" "$(drop_flag "$F_FLAGS" needs)" "$F_PROGRESS" "-"
+		exit 0
+	fi
+	(($#)) || die "needs: say what you need (or --clear)"
+	F_FLAGS=$(add_flag "$F_FLAGS" needs)
+	write_row "$sid" "$F_FLAGS" "$F_PROGRESS" "$(clean "$*")"
+	if $notify; then
+		name=$(cc-roster 2>/dev/null | awk -F'\t' -v s="$sid" '$1 == s { print $2; exit }')
+		wz notify "${name:-a session} needs you" "$(clean "$*")" 2>/dev/null ||
+			echo "cc-note: could not raise a notification" >&2
+	fi
+	;;
 log) cmd_log "$sid" "$@" ;;
 clear)
 	write_row "$sid" "-" "-" "-"
-	rm -f "$(todo_file "$sid")" "$(log_file "$sid")"
+	rm -f "$(log_file "$sid")"
 	;;
 *) usage >&2; exit 2 ;;
 esac
