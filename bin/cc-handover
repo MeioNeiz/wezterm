@@ -25,6 +25,12 @@ readonly TAIL_BYTES=400000
 readonly INLINE_MAX=12000
 # Assistant messages shorter than this are scaffolding between tool calls, not findings.
 readonly TRIVIAL_TEXT=160
+# A prompt can be a paste of a whole document. The instruction in it is worth carrying;
+# the payload is not, and re-ingesting it is exactly what handing over is meant to avoid.
+# Head and tail rather than head alone: an instruction sits before a paste about as often
+# as it sits after one.
+readonly CLIP_MAX=1100
+readonly CLIP_HEAD=650
 
 usage() {
 	cat <<'USAGE'
@@ -58,7 +64,20 @@ die() {
 	exit 1
 }
 
-target=""
+# Keep both ends of anything over CLIP_MAX and say what was dropped. The transcript path
+# goes in the brief, so the successor can read the whole thing if the middle mattered.
+clip() {
+	local text=$1 n=${#1} tail_len
+	if ((n <= CLIP_MAX)); then
+		printf '%s' "$text"
+		return
+	fi
+	tail_len=$((CLIP_MAX - CLIP_HEAD))
+	printf '%s\n\n[... %s characters omitted, they are in the transcript ...]\n\n%s' \
+		"${text:0:CLIP_HEAD}" "$((n - CLIP_MAX))" "${text:$((n - tail_len))}"
+}
+
+targets=()
 action=print
 split="--right"
 to=""
@@ -80,162 +99,215 @@ while (($#)); do
 	--why) shift; why=${1:-} ;;
 	-h | --help) usage; exit 0 ;;
 	-*) die "unknown option $1" ;;
-	*) [[ -z $target ]] || die "one target at a time"; target=$1 ;;
+	*) targets+=("$1") ;;
 	esac
 	shift
 done
 case $turns in '' | *[!0-9]*) die "--turns needs a number" ;; esac
 
-# --- who ---------------------------------------------------------------------------
+# --- who ----------------------------------------------------------------------------
 
-if [[ -z $target || $target == . ]]; then
-	sid=${CLAUDE_CODE_SESSION_ID:-}
-	[[ -n $sid ]] || die "no target given and CLAUDE_CODE_SESSION_ID is unset"
-else
-	case $target in
-	????????-????-????-????-????????????) sid=$target ;;
-	*[!0-9]*) sid=$(cc-roster 2>/dev/null | awk -F'\t' -v n="$target" '$2 == n { print $1; exit }') ;;
-	*) sid=$(cc-roster 2>/dev/null | awk -F'\t' -v p="$target" '$5 == p { print $1; exit }') ;;
-	esac
-	[[ -n $sid ]] || die "no live session called \"$target\" (try: cc-roster)"
-fi
-
-IFS=$'\x1f' read -r name cwd pane < <(
-	cc-roster 2>/dev/null | awk -F'\t' -v s="$sid" '$1 == s { printf "%s\x1f%s\x1f%s", $2, $6, $5; exit }'
-)
-: "${name:=$sid}" "${cwd:=$PWD}" "${pane:=-}"
-
-# The slug is bash's own substitution rather than a sed: identical output, no fork.
-transcript="$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}/$sid.jsonl"
-[[ -r $transcript ]] ||
-	transcript=$(ls -t "$HOME"/.claude/projects/*/"$sid.jsonl" 2>/dev/null | head -1)
-[[ -r $transcript ]] || die "no transcript for $name ($sid)"
-
-# --- what it was doing --------------------------------------------------------------
-#
-# One tail feeds every extraction below. `tail -n +2` drops the half-record that a byte
-# offset always lands in the middle of: jq discards a whole batch over one line it
-# cannot parse, which reads as "the session said nothing".
-tailfile=$(mktemp) || exit 1
-trap 'rm -f "$tailfile" "$tailfile.users"' EXIT
-tail -c "$TAIL_BYTES" "$transcript" | tail -n +2 >"$tailfile"
-
-title=$(awk '/"type":"custom-title"/ { c = $0 } /"type":"ai-title"/ { a = $0 }
-	END { if (c != "") print c; else if (a != "") print a }' "$tailfile" |
-	jq -r '.customTitle // .aiTitle // empty' 2>/dev/null)
-
-# The real user turn, not the "last-prompt" record beside it: that one is Claude's own
-# UI copy and arrives already truncated with an ellipsis, which is exactly the detail a
-# successor needs in full.
-#
-# Grepped out of the whole transcript rather than the tail, because a long turn pushes
-# the prompt that started it well past 400KB back - and then the only thing left in the
-# tail is the truncated copy. One grep over a 1.4MB file is 13ms.
-grep '"type":"user"' "$transcript" 2>/dev/null | tail -400 >"$tailfile.users"
-last_prompt=$(jq -r 'select((.isMeta // false) | not)
-	| .message.content
-	| if type == "string" then . elif type == "array" then
-		([ .[] | select(.type == "text") | .text ] | join("")) else empty end
-	| select(type == "string") | select(startswith("<") | not) | select(length > 0)
-	' "$tailfile.users" 2>/dev/null | tail -1)
-last_prompt_at=$(jq -r 'select((.isMeta // false) | not)
-	| select(.message.content | if type == "string" then (startswith("<") | not)
-		elif type == "array" then ([ .[] | select(.type == "text") ] | length) > 0
-		else false end)
-	| .timestamp // empty' "$tailfile.users" 2>/dev/null | tail -1)
-if [[ -z $last_prompt ]]; then
-	last_prompt=$(grep '"type":"last-prompt"' "$tailfile" | tail -1 |
-		jq -r '.lastPrompt // empty' 2>/dev/null)
-fi
-
-# Anything typed while the turn was still running lands as a queue-operation rather
-# than a user turn, so it is invisible to every "last prompt" reader - and it is
-# usually the steer that changed what the work was. Everything queued since the last
-# real prompt goes over with it.
-queued=$(grep '"type":"queue-operation"' "$transcript" 2>/dev/null | tail -100 |
-	jq -r --arg since "$last_prompt_at" '
-		select(.operation == "enqueue")
-		| select((.content // "") != "")
-		| select($since == "" or (.timestamp // "") > $since)
-		| .content' 2>/dev/null | awk '!seen[$0]++')
-
-# Anything under TRIVIAL_TEXT is a transition rather than a result - "Let me check the
-# other file", "Now the handover" - and a handover made of those says nothing. Dropping
-# them means `--turns 3` carries three messages that were worth writing down.
-replies=$(jq -r --argjson min "$TRIVIAL_TEXT" 'select(.type == "assistant")
-	| [ .message.content[]? | select(.type == "text") | .text ] | join("")
-	| select(length > $min)' "$tailfile" 2>/dev/null | tail -n "$turns")
-
-files=$(jq -r 'select(.type == "assistant") | .message.content[]?
-	| select(.type == "tool_use")
-	| select(.name == "Edit" or .name == "Write" or .name == "NotebookEdit")
-	| .input.file_path // .input.notebook_path // empty' "$tailfile" 2>/dev/null |
-	sort -u | tail -12)
-
-# --- where it was --------------------------------------------------------------------
-
-branch=""
-dirty=""
-if [[ -d $cwd ]]; then
-	branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
-	if [[ -n $branch ]]; then
-		dirty=$(git -C "$cwd" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+resolve_one() {
+	local t=$1
+	if [[ -z $t || $t == . ]]; then
+		[[ -n ${CLAUDE_CODE_SESSION_ID:-} ]] ||
+			die "no target given and CLAUDE_CODE_SESSION_ID is unset"
+		printf '%s' "$CLAUDE_CODE_SESSION_ID"
+		return
 	fi
-fi
+	case $t in
+	????????-????-????-????-????????????) printf '%s' "$t"; return ;;
+	esac
+	local sid
+	case $t in
+	*[!0-9]*) sid=$(cc-roster 2>/dev/null | awk -F'\t' -v n="$t" '$2 == n { print $1; exit }') ;;
+	*) sid=$(cc-roster 2>/dev/null | awk -F'\t' -v p="$t" '$5 == p { print $1; exit }') ;;
+	esac
+	[[ -n $sid ]] || die "no live session called \"$t\" (try: cc-roster)"
+	printf '%s' "$sid"
+}
 
-note=$(cc-note show --for "$sid" 2>/dev/null | sed -e $'s/\033\\[[0-9;]*m//g' | tail -n +2)
+# Everything one session contributes, appended to the brief. Sets LEAD_* for the first
+# target, which is the one the new pane is opened beside and takes its directory from.
+LEAD_CWD=""
+LEAD_PANE=""
+LEAD_NAME=""
+
+render_session() {
+	local sid=$1 name cwd pane transcript title last_prompt last_prompt_at queued
+	local replies files branch dirty note tailfile
+
+	IFS=$'\x1f' read -r name cwd pane < <(
+		cc-roster 2>/dev/null | awk -F'\t' -v s="$sid" \
+			'$1 == s { printf "%s\x1f%s\x1f%s", $2, $6, $5; exit }'
+	)
+	: "${name:=$sid}" "${cwd:=$PWD}" "${pane:=-}"
+	if [[ -z $LEAD_CWD ]]; then
+		LEAD_CWD=$cwd
+		LEAD_PANE=$pane
+		LEAD_NAME=$name
+	fi
+
+	# The slug is bash's own substitution rather than a sed: identical output, no fork.
+	transcript="$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}/$sid.jsonl"
+	[[ -r $transcript ]] ||
+		transcript=$(ls -t "$HOME"/.claude/projects/*/"$sid.jsonl" 2>/dev/null | head -1)
+	[[ -r $transcript ]] || die "no transcript for $name ($sid)"
+
+	tailfile=$(mktemp) || exit 1
+	tail -c "$TAIL_BYTES" "$transcript" | tail -n +2 >"$tailfile"
+
+	title=$(awk '/"type":"custom-title"/ { c = $0 } /"type":"ai-title"/ { a = $0 }
+		END { if (c != "") print c; else if (a != "") print a }' "$tailfile" |
+		jq -r '.customTitle // .aiTitle // empty' 2>/dev/null)
+
+	# The real user turn, not the "last-prompt" record beside it: that one is Claude's
+	# own UI copy and arrives already truncated with an ellipsis, which is exactly the
+	# detail a successor needs in full. Grepped out of the whole transcript rather than
+	# the tail, because a long turn pushes the prompt that started it well past 400KB
+	# back. One grep over a 1.4MB file is 13ms.
+	grep '"type":"user"' "$transcript" 2>/dev/null | tail -400 >"$tailfile.users"
+	last_prompt=$(jq -r 'select((.isMeta // false) | not)
+		| .message.content
+		| if type == "string" then . elif type == "array" then
+			([ .[] | select(.type == "text") | .text ] | join("")) else empty end
+		| select(type == "string") | select(startswith("<") | not) | select(length > 0)
+		' "$tailfile.users" 2>/dev/null | tail -1)
+	last_prompt_at=$(jq -r 'select((.isMeta // false) | not)
+		| select(.message.content | if type == "string" then (startswith("<") | not)
+			elif type == "array" then ([ .[] | select(.type == "text") ] | length) > 0
+			else false end)
+		| .timestamp // empty' "$tailfile.users" 2>/dev/null | tail -1)
+	[[ -n $last_prompt ]] || last_prompt=$(grep '"type":"last-prompt"' "$tailfile" |
+		tail -1 | jq -r '.lastPrompt // empty' 2>/dev/null)
+
+	# Anything typed while the turn was still running lands as a queue-operation rather
+	# than a user turn, so it is invisible to every "last prompt" reader - and it is
+	# usually the steer that changed what the work was. Queued system messages land the
+	# same way and are not: a <task-notification> presented under "then you said" is
+	# both noise and a lie, so anything opening with "<" is dropped, the same rule the
+	# user-turn extraction uses.
+	# Three kinds of thing land in the queue and they are not interchangeable. Across
+	# 735 transcripts here: 890 task-notifications, 761 messages from Jacob, and 511
+	# from other agents. Dropping everything that opens with "<" threw away that last
+	# quarter, which is the half of the traffic that carries actual work.
+	#
+	# Jacob's own words, kept as his. Another agent's kept as theirs and attributed -
+	# a peer handover read as a user instruction is a lie about who decided what.
+	# Task notifications dropped: an artifact-changed event under "then you said" is
+	# noise and a lie at once.
+	queued=$(grep '"type":"queue-operation"' "$transcript" 2>/dev/null | tail -100 |
+		jq -r --arg since "$last_prompt_at" \
+			--argjson max "$CLIP_MAX" --argjson head "$CLIP_HEAD" '
+			# Rendered here rather than in the shell because a message is many lines
+			# and a shell read splits on them, which would put the attribution on the
+			# first line of a peer message and orphan the rest.
+			def clip: if (length <= $max) then .
+				else .[0:$head]
+					+ "\n\n[... " + ((length - $max) | tostring)
+					+ " characters omitted, they are in the transcript ...]\n\n"
+					+ .[(length - ($max - $head)):] end;
+			def quote: split("\n") | map("> " + .) | join("\n");
+			select(.operation == "enqueue")
+			| select((.content // "") != "")
+			| select($since == "" or (.timestamp // "") > $since)
+			| .content
+			| if startswith("<cross-session-message") then
+				((capture("from-name=\"(?<who>[^\"]+)\"") // {who: "another session"}).who) as $who
+				| (split(">") | .[1:] | join(">")
+				   | sub("</cross-session-message>"; "") | sub("^\\s+"; "")
+				   | sub("\\s+$"; "")) as $body
+				| select($body != "")
+				| "_from \($who):_\n\n" + ($body | clip | quote) + "\n"
+			  elif startswith("<") then empty
+			  else (clip | quote) + "\n" end' 2>/dev/null | awk '!seen[$0]++')
+
+	# Anything under TRIVIAL_TEXT is a transition rather than a result.
+	replies=$(jq -r --argjson min "$TRIVIAL_TEXT" 'select(.type == "assistant")
+		| [ .message.content[]? | select(.type == "text") | .text ] | join("")
+		| select(length > $min)' "$tailfile" 2>/dev/null | tail -n "$turns")
+
+	files=$(jq -r 'select(.type == "assistant") | .message.content[]?
+		| select(.type == "tool_use")
+		| select(.name == "Edit" or .name == "Write" or .name == "NotebookEdit")
+		| .input.file_path // .input.notebook_path // empty' "$tailfile" 2>/dev/null |
+		sort -u | tail -12)
+
+	branch=""
+	dirty=""
+	if [[ -d $cwd ]]; then
+		branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
+		[[ -n $branch ]] && dirty=$(git -C "$cwd" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+	fi
+
+	note=$(cc-note show --for "$sid" 2>/dev/null | sed -e $'s/\033\\[[0-9;]*m//g' | tail -n +2)
+
+	{
+		printf '## From %s' "$name"
+		[[ -n $title ]] && printf ' - %s' "$title"
+		printf '\n\n'
+		printf '`%s`' "$cwd"
+		[[ -n $branch ]] && printf '  ·  branch `%s`' "$branch"
+		[[ -n $dirty && $dirty != 0 ]] && printf ' (%s uncommitted)' "$dirty"
+		printf '\n\n'
+		[[ -n $note ]] && printf '**Tracking**\n\n```\n%s\n```\n\n' "$note"
+		[[ -n $last_prompt ]] && printf '**Last asked**\n\n%s\n\n' "$(clip "$last_prompt")"
+		if [[ -n $queued ]]; then
+			printf '**Then, mid-turn**\n\n%s\n\n' "$queued"
+		fi
+		[[ -n $replies ]] && printf '**Where it got to**\n\n%s\n\n' "$replies"
+		if [[ -n $files ]]; then
+			printf '**Files it edited**\n\n'
+			printf '%s\n' "$files" | sed 's/^/- `/; s/$/`/'
+			printf '\n'
+		fi
+		printf '**Its transcript** (read this rather than guessing)\n\n    %s\n\n' "$transcript"
+		printf 'Reopen it with `claude --resume %s`.\n\n' "$sid"
+	} >>"$file"
+
+	rm -f "$tailfile" "$tailfile.users"
+}
 
 # --- the brief ------------------------------------------------------------------------
 
+((${#targets[@]})) || targets=(.)
+
 mkdir -p "$OUT" 2>/dev/null
 stamp=$(date '+%Y%m%d-%H%M%S')
-file="$OUT/$name-$stamp.md"
+first_sid=$(resolve_one "${targets[0]}") || exit 1
+first_name=$(cc-roster 2>/dev/null | awk -F'\t' -v s="$first_sid" '$1 == s { print $2; exit }')
+: "${first_name:=$first_sid}"
+file="$OUT/$first_name-$stamp.md"
+: >"$file"
 
 {
-	printf '# Handover from %s\n\n' "$name"
-	[[ -n $title ]] && printf '%s\n\n' "$title"
+	if ((${#targets[@]} > 1)); then
+		printf '# Handover from %s sessions\n\n' "${#targets[@]}"
+	else
+		printf '# Handover\n\n'
+	fi
 	printf 'You are picking this work up fresh. '
 	if [[ -n $why ]]; then
-		printf 'The previous session handed it over: %s.\n\n' "$why"
+		printf 'It was handed over: %s.\n\n' "$why"
 	else
-		printf 'The previous session handed it over.\n\n'
+		printf 'It was handed over.\n\n'
 	fi
-
-	printf '**Working directory** `%s`' "$cwd"
-	[[ -n $branch ]] && printf '  ·  **branch** `%s`' "$branch"
-	[[ -n $dirty && $dirty != 0 ]] && printf ' (%s uncommitted)' "$dirty"
-	printf '\n\n'
-
-	if [[ -n $note ]]; then
-		printf '## What it was tracking\n\n```\n%s\n```\n\n' "$note"
+	if ((${#targets[@]} > 1)); then
+		printf 'Two or more sessions were working on this and their work continues here as '
+		printf 'one. Each section below is one of them.\n\n'
 	fi
+} >>"$file"
 
-	if [[ -n $last_prompt ]]; then
-		printf '## The last thing it was asked\n\n%s\n\n' "$last_prompt"
-	fi
+for t in "${targets[@]}"; do
+	sid=$(resolve_one "$t") || exit 1
+	render_session "$sid"
+done
 
-	if [[ -n $queued ]]; then
-		printf '## And then, while it was working\n\n'
-		printf '%s\n' "$queued" | sed 's/^/> /'
-		printf '\n'
-	fi
+printf 'This brief is saved at `%s`.\n' "$file" >>"$file"
 
-	if [[ -n $replies ]]; then
-		printf '## Where it got to\n\n%s\n\n' "$replies"
-	fi
-
-	if [[ -n $files ]]; then
-		printf '## Files it had been editing\n\n'
-		printf '%s\n' "$files" | sed 's/^/- `/; s/$/`/'
-		printf '\n'
-	fi
-
-	printf '## If you need more than this\n\n'
-	printf 'The whole conversation is still on disk. Read it rather than guessing:\n\n'
-	printf '    %s\n\n' "$transcript"
-	printf 'That session is `%s` (`claude --resume %s` reopens it).\n' "$name" "$sid"
-	printf 'This brief is saved at `%s`.\n' "$file"
-} >"$file"
+cwd=$LEAD_CWD
+pane=$LEAD_PANE
+name=$LEAD_NAME
 
 # --- doing something with it ----------------------------------------------------------
 

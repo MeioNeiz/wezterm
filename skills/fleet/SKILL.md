@@ -56,16 +56,23 @@ said mid-turn, the branch, the open files, and anything the session recorded for
 cc-handover --new                  # fresh session in a pane to the right, seeded
 cc-handover --new --tab            # also --window, --down
 cc-handover d5-lca-48 --new        # a different session
+cc-handover d5-lca-08 d5-lca-65 --new   # two sessions' work continuing as one
 cc-handover --why 'context full' --new
 cc-handover                        # print the brief, spawn nothing
 cc-handover --to 7                 # paste into an open pane, unsent
 cc-handover --new --dry-run        # show the command, run nothing
 ```
 
-The brief carries the last real prompt, everything queued mid-turn, the last substantive
-replies, branch and dirty count, files edited, `cc-note` state, and **the path to the
-source transcript** - so the successor can read the original conversation instead of
-working from a summary. Say that when you hand over.
+Several targets merge into one brief, a section each. The brief carries the last real
+prompt, what was queued mid-turn, the last substantive replies, branch and dirty count,
+files edited, `cc-note` state, and **the path to each source transcript** - so the
+successor reads the original conversation instead of working from a summary. Say that
+when you hand over.
+
+Queued messages are told apart rather than lumped together: Jacob's stay his, another
+agent's are attributed to it, and task-notifications are dropped. Anything over ~1100
+characters keeps both ends and says how much was cut, so a pasted document does not get
+re-ingested whole.
 
 Nothing is lost: `claude --resume <id>` reopens the old session. Ask before closing it.
 **A session can hand itself over** - if you are near full, run it and say where the work
