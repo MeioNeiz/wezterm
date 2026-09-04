@@ -18,7 +18,9 @@ Everything here is symlinked into place, so edit the file in this repo, not the 
 wezterm.lua reads the scripts through their ~/.claude/bin paths, so the links matter.
 
 `~/.claude/statusline.sh` is not in here but sources `cc-colour`, so it moves with the
-palette.
+palette - and it now also reads `~/.claude/fleet/notes.tsv` directly, so it moves with
+cc-note's format too. It is the one file in this system that is not version controlled;
+changing either of those without changing it leaves a pane's own line stale or broken.
 
 State the scripts read, none of it theirs:
 - `~/.claude/sessions/<pid>.json`   registry, written by Claude. name, status, cwd, session id
