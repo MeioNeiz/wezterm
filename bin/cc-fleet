@@ -30,6 +30,10 @@ readonly US=$'\x1f'
 readonly CACHE="$HOME/.claude/cache/fleet-rows"
 readonly CACHE_TTL=8
 readonly NOTES="$HOME/.claude/fleet/notes.tsv"
+readonly CTX_DIR="$HOME/.claude/cache/context"
+# Past this a session is close enough to full that handing it over is a live option.
+readonly CTX_WARN=60
+readonly CTX_FULL=80
 
 # Shared with cc-board, the tab bar and the statusLine: same palette, same hash.
 # shellcheck source=bin/cc-colour
@@ -223,6 +227,23 @@ fi
 	exit 0
 }
 
+# How full each session is, keyed by id. Written by the statusLine, which is the only
+# thing Claude hands the authoritative number to - the registry does not carry it, and a
+# transcript gives the tokens in play on the last turn without the window size to divide
+# by. cc-board gets the same number by scraping it off the pane's visible statusLine,
+# which needs the pane to exist and be on screen; this does not.
+#
+# One awk over the directory rather than a read per session: a command substitution forks
+# a subshell on bash 3.2 and thirty-four of them cost more than everything else here.
+if [[ -d $CTX_DIR ]]; then
+	while IFS=$'\t' read -r c_sid c_pct c_size c_at; do
+		[[ -n ${c_sid:-} ]] || continue
+		printf -v "cx_${c_sid//-/_}" '%s' "${c_pct:-}"
+		printf -v "cw_${c_sid//-/_}" '%s' "${c_size:-0}"
+	done < <(cd "$CTX_DIR" 2>/dev/null && ls 2>/dev/null | tr '\n' '\0' |
+		xargs -0 awk 'FNR == 1 { print FILENAME "\t" $0 }' 2>/dev/null)
+fi
+
 if [[ $mode == tsv ]]; then
 	printf '%s\n' "$rows" | cut -d"$US" -f2-13 | tr "$US" '\t'
 	exit 0
@@ -256,6 +277,22 @@ if [[ $mode == brief ]]; then
 			if (old > 0) printf ", %d stale", old
 			printf "\n"
 		}'
+	# Which ones are close to full, because that is the fact that leads somewhere:
+	# cc-handover --new is the answer and nothing else here says when to reach for it.
+	full=""
+	while IFS="$US" read -r _ _ _ _ _ nm _ _ _ _ _ _ sid _; do
+		[[ -n ${sid:-} ]] || continue
+		key="cx_${sid//-/_}"
+		pct=${!key:-}
+		[[ -n $pct ]] || continue
+		((pct >= CTX_WARN)) && full="$full  $nm $pct%"$'\n'
+	done <<<"$rows"
+	if [[ -n $full ]]; then
+		# Fullest first: the list exists to say which one to hand over next.
+		printf 'near full (cc-handover --new):\n'
+		# Two leading spaces mean the name is field 3 and the percentage field 4.
+		printf '%s' "$full" | sort -t' ' -k4,4nr
+	fi
 	exit 0
 fi
 
@@ -426,6 +463,14 @@ while IFS= read -r ws; do
 			body=$YELLOW
 		fi
 		[[ $prog != "-" ]] && label="$label $prog"
+		# How full it is, but only once that is a fact you would act on. Below the
+		# warn mark it is a number competing with the state for the same cells.
+		ckey="cx_${id//-/_}"
+		cpct=${!ckey:-}
+		if [[ -n $cpct ]] && ((cpct >= CTX_WARN)); then
+			label="$label ${cpct}%"
+			((cpct >= CTX_FULL)) && colour=$MAUVE
+		fi
 		case ",$flags," in
 		*,mute,*) glyph="◌" ;;
 		esac

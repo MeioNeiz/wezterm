@@ -36,6 +36,11 @@ State these scripts write themselves, all of it theirs:
   new session would have reused the colour of the one it replaced. Hand pins win
 - `~/.claude/cache/cc-tint-painted/<pane>`  `<session-id>\t<hue>`, what cc-tint last painted
   onto that pane. There is no reading a pane's colour back, so this is the only record
+- `~/.claude/cache/context/<sid>`   `used_pct\twindow_size\tepoch`, written by the
+  statusLine on every render. Claude hands that number to the statusLine and nowhere
+  else: the registry does not carry it, and a transcript gives the tokens in play on the
+  last turn without the window size to divide by. cc-board gets the same figure by
+  scraping the pane's visible statusLine, which needs the pane to exist and be on screen
 - `~/.claude/cache/titles/<sid>`    `mtime\x1fchecked_at\x1ftitle`, cc-peers' title memo
 - `~/.claude/fleet/notes.tsv`       cc-note: `sid, at, flags, progress, status`, one line
   per annotated session. Read by the statusLine, cc-fleet and the tab bar, so every field

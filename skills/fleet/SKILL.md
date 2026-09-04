@@ -26,6 +26,10 @@ Costs are output tokens, which is the budget that matters: you pay them every ca
 | what a session is *about* | `cc-peers` | ~660 |
 | name → pane, for scripts | `cc-roster` | ~1060 |
 
+`cc-fleet --brief` also names any session past 60% of its context window, fullest first,
+because that is the fact that leads somewhere: `cc-handover --new` is what to do about
+it, and nothing else says when to reach for it.
+
 **Start with `cc-fleet --brief`.** It answers the usual question in 20 tokens; the other
 five cost 30-100x that for information nobody asked for. Reach past it only when you need
 a field it does not carry, and prefer `--tsv` to `--json` when you do.
