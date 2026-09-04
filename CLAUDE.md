@@ -524,6 +524,11 @@ too, dropping the notes before the keys. Check both axes after touching a layout
 - greys: RULE #585b70 for things that are not text (dividers, empty bar cells), FAINT #7f849c
   and DIM #9399b2 for text. Anything below overlay1 is unreadable on Mocha - surface1 on the
   base background is 1.8:1, and 1.0:1 on a marked row
+- **every script needs both symlinks**, `~/.claude/bin/<name>` and `~/.local/bin/<name>`.
+  Only the second is on PATH. cc-fleet, cc-board and cc-colour were missing theirs until
+  2026-08-26 and cc-tint until 2026-09-04, and the failure is silent: wezterm.lua and the
+  hooks call these by full path, so everything keeps working and only a bare call from a
+  shell - or from Claude - says "command not found"
 - no em-dashes in anything on screen
 
 ## do not
