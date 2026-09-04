@@ -1,0 +1,398 @@
+#!/bin/bash
+# cc-colour - the identity colour of a Claude session
+#
+# Status colours answer "what does this pane want". This answers "which pane is this",
+# which nothing else in the fleet did: forty sessions, all named d5-lca-something, all
+# drawn in whatever hue their state happened to be.
+#
+# It is a text colour, not a marker. A swatch glyph was the obvious idea and it was wrong
+# twice over: a block in a column of its own is a thing to look at rather than something
+# the eye picks up on the way past, and the saturated palette it needed in order not to be
+# mistaken for a status colour looked garish next to Catppuccin. Colouring text instead
+# fixes both. There is a lot of a title, so a subtle hue over forty characters separates
+# more reliably than a bold hue over one cell, and it can therefore be a Mocha accent and
+# look like it belongs.
+#
+# What keeps the two channels apart is now role, not tone: identity only ever colours text
+# that never carried a status colour - the statusLine's title, the board's name column -
+# and status keeps every glyph, every marker and the greys. Nothing had to be taken from
+# it, so nothing about reading state has changed.
+#
+# Nine hues for forty sessions, so a colour is a strong hint and not an identifier. It is
+# unique within a tab often enough to be worth remembering, and `cc-board` flags the tabs
+# where it is not. Pin the ones you care about.
+#
+# Assignment is the first 8 hex digits of the session id, mod the palette. No state, so
+# every reader agrees without coordinating, and a colour survives /rename, --resume and
+# a machine reboot: the id is the one name a session never changes.
+#
+#   cc-colour <id>            hex
+#   All of these take a session name (d5-lca-48) as well as an id.
+#   cc-colour --ansi <id>     SGR foreground
+#   cc-colour --name <id>     hue name
+#   cc-colour --sample <id>   the hue name, in its own colour
+#   cc-colour --pin <id> <hue> | --unpin <id> | --pins
+#   cc-colour --list          the palette
+#   cc-colour --all           every live session: name, id, hue, hex
+#
+# Sourced as a library by cc-board and statusline.sh, which cannot afford a fork per row:
+#
+#   source ~/.claude/bin/cc-colour --lib   # id_colour(); IDC_HEX/NAME/ANSI/MUTED/TINT/FG/SEL
+
+readonly ID_PINS="$HOME/.claude/session-colours"
+# Pins this wrote itself, kept apart from the hand-pinned ones so that `--pins` and the file
+# you edit stay yours. A hand pin for the same id wins. Written when a new session in a pane
+# would otherwise have reused a colour you cannot tell from the one it replaced - see
+# id_rehue - and read by everything that resolves a hue, which is this file and wezterm.lua.
+readonly ID_PINS_AUTO="$HOME/.claude/session-colours-auto"
+
+# Catppuccin Mocha's own accents, so nothing here can look out of place on this desk.
+# Nine rather than fourteen: rosewater and flamingo read as ordinary text, red reads as an
+# error, and lavender and sapphire sit too close to blue to be told apart in a title. What
+# is left is every accent that is still itself at a glance.
+#
+# Status also uses mauve, yellow, peach and green, and that is allowed now: identity never
+# lands on a glyph or a marker, so the two never appear in the same role. What is not
+# allowed is drifting from the copy in wezterm.lua (TAB_IDENTITY) - a colour that differs
+# between the board and the tab bar is worse than no colour at all.
+ID_NAMES=(pink mauve blue sapphire teal green yellow peach maroon)
+ID_HEXES=(f5c2e7 cba6f7 89b4fa 74c7ec 94e2d5 a6e3a1 f9e2af fab387 eba0ac)
+
+# The same nine hues at the brightness of the grey they replace, for the parts of a line
+# that are metadata rather than the thing you came to read. Every one is pinned to 3.6:1
+# on the base background, where the grey was 3.36, so swapping grey for colour changes the
+# hue and not the weight - which is the only way a whole line of this stays calm.
+# Lightness is per hue for that reason: a flat mix would put mauve at 2.8 and teal at 5.2.
+ID_MUTED=(ad5895 8966b3 5676ac 497d94 3f8076 468341 897344 9b6b4d af5e6b)
+
+# And the same nine as a pane's own background AND foreground, at four strengths.
+#
+# Each wezterm pane is its own terminal emulator, so OSC 11 and OSC 10 written to a pane's
+# tty move that pane's default colours and nothing else. This is the only way anything
+# inside a Claude pane gets coloured; wezterm has no per-pane config at all.
+#
+# Why both, and not just the background. What strains the eye is not a coloured ground, it
+# is the chromatic edge between ground and text at every glyph boundary - and the eye
+# localises a yellow-blue edge about three times worse than a luminance or a red-green one
+# (Wuerger, Owens & Westland, JOSA A 18(6):1231, 2001). #cdd6f4 on #1e1e2e is almost a pure
+# lightness edge, |d(a,b)| = 0.0142 in Oklab, because Catppuccin's ground is deliberately
+# hue-matched to its text. Rotating only the ground breaks that match and lands every glyph
+# edge on the eye's worst axis: 2.0x to 4.1x baseline across these nine hues.
+#
+# Rotating the text with the ground restores it. Every pair below is 0.92x to 0.97x of
+# baseline, so each pane is *more* comfortable than plain #1e1e2e, not less, while the
+# grounds are further apart than they have ever been.
+#
+# The counter-intuitive part, and the reason two earlier attempts failed: de-chroma toward
+# neutral makes it WORSE. A neutral grey at the same lightness scores 0.0426, 3.0x baseline,
+# worse than six of the nine tints it was meant to calm. #1e1e2e is not a grey.
+#
+#  - 7% of the accent mixed in, no renormalising. Raised luminance; Claude's dim text was
+#    already near the floor and went under it.
+#  - 45% mixed in, luminance renormalised. Contrast genuinely untouched (-0.8%) and it still
+#    read as strained: luminance parity says nothing about the chromatic edge.
+#  - then chroma *reduced* toward neutral to calm it, which moved it the wrong way entirely.
+#
+# Levels trade identity, not comfort: worst |d(a,b)| is 0.97x baseline at whisper and 0.92x
+# at full, while the smallest gap between two grounds goes 1.9 -> 5.4 dE. So full is both
+# the most distinguishable and the most comfortable, and is the default.
+ID_BG_WHISPER=(231c2b 201d2d 1b1f2e 19202d 192129 1b2126 211e25 241d25 241c28)
+ID_FG_WHISPER=(d9d2ed d4d4f2 cbd7f4 c6d9f2 c5daea cbdae3 d6d6df dbd4e0 dcd2e7)
+ID_BG_FAINT=(261b28 211d2d 1a1f2e 15212c 152326 1a2220 231f1e 271d1f 281b24)
+ID_FG_FAINT=(e0d0e9 d8d3f0 c9d7f4 c2dbf0 c0dde3 cadcd7 dcd6d0 e4d2d3 e5d0de)
+ID_BG_SUBTLE=(281b26 221c2c 18202e 12222b 112423 18231b 251f16 291c18 2a1b20)
+ID_FG_SUBTLE=(e6cee5 dbd2ef c8d8f4 bedcef bcdfdd c9decd e0d6c3 ead1c7 ecced7)
+ID_BG_FULL=(291a25 231c2c 17202e 0f232b 0e2521 172416 261f0f 2b1c12 2c1a1d)
+ID_FG_FULL=(eacde2 ddd1ee c7d8f4 bbddee b9e1d9 c8dfc5 e3d6b8 efd0be f1ccd1)
+
+# Which level is in force. A file rather than an argument, so the SessionStart hook and a
+# hand-run `cc-tint --level` cannot disagree about what a new pane should look like.
+ID_LEVEL_FILE="$HOME/.claude/tint-level"
+ID_SEL=(5e4f66 52476a 3e4b6b 385167 415960 475950 605955 604b49 5c4554)
+
+IDC_HEX=""
+IDC_NAME=""
+IDC_ANSI=""
+IDC_MUTED=""
+IDC_TINT=""
+IDC_FG=""
+IDC_SEL=""
+
+# Loaded once: a pin file read per row is the same fork this library exists to avoid.
+# One variable per pin rather than one map string, per the repo's rule - a `|k=v|` map is
+# scanned character by character in a UTF-8 locale, so it costs the whole map per lookup.
+ID_PINNED=""
+ID_PINS_LOADED=false
+load_pins() {
+	$ID_PINS_LOADED && return
+	ID_PINS_LOADED=true
+	local file id hue key
+	# Auto first, then hand, so a hand pin overwrites the key and wins.
+	for file in "$ID_PINS_AUTO" "$ID_PINS"; do
+		[[ -r $file ]] || continue
+		while IFS=$'\t' read -r id hue; do
+			[[ -n $id && -n $hue && $id != \#* ]] || continue
+			key="idpin_${id//-/_}"
+			printf -v "$key" '%s' "$hue"
+			ID_PINNED="$ID_PINNED $key"
+		done <"$file"
+	done
+}
+
+# The hue a new session should take in a pane that already has one, or nothing if the hash
+# is fine as it is.
+#
+# The nine tints are one hue ring at a single lightness, so how far apart two of them look
+# is a function of ring distance and nothing else: adjacent is 1.64 to 2.89 dE in Oklab,
+# two steps 3.23 to 4.37, three steps 4.83 to 6.24. One to two dE is where two colours that
+# touch stop being tellable apart, so an adjacent pair is a change you cannot see - and
+# adjacency is a third of all new sessions, because a ring of nine has neighbours either
+# side. Three steps is the smallest jump that is unmistakably a different colour, and there
+# are four hues at three or four steps to choose from.
+#
+# Which of the four comes out of the id, so the colour is still a property of the session
+# rather than of the order sessions happened to start in. Idempotent per id: a session that
+# has been rehued once is pinned and keeps that hue through --resume and a reboot, which is
+# the one thing identity has always promised.
+readonly ID_MIN_RING=3
+id_rehue() {
+	local id=$1 prev=$2 i natural prevslot=-1 dist pick key
+	[[ -n $id && -n $prev ]] || return 1
+	[[ ${id:0:8} == [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] ]] || return 1
+	load_pins
+	key="idpin_${id//-/_}"
+	[[ -n ${!key:-} ]] && return 1
+	for i in "${!ID_NAMES[@]}"; do
+		[[ ${ID_NAMES[i]} == "$prev" ]] && prevslot=$i && break
+	done
+	((prevslot >= 0)) || return 1
+	natural=$((0x${id:0:8} % ${#ID_NAMES[@]}))
+	dist=$(((natural - prevslot + ${#ID_NAMES[@]}) % ${#ID_NAMES[@]}))
+	((dist > ${#ID_NAMES[@]} / 2)) && dist=$((${#ID_NAMES[@]} - dist))
+	((dist >= ID_MIN_RING)) && return 1
+	pick=$(((0x${id:0:8} / ${#ID_NAMES[@]}) % 4))
+	printf '%s\n' "${ID_NAMES[(prevslot + ID_MIN_RING + pick) % ${#ID_NAMES[@]}]}"
+}
+
+# Record a hue this chose. Pruned only once the file has got long, because it is read on
+# every statusLine render: the prune is one grep over the registry, and a pin for a session
+# that has ended is dead weight rather than a bug.
+id_autopin() {
+	local id=$1 hue=$2 key live tmp pid phue n lock waited=0
+	[[ -n $id && -n $hue ]] || return 1
+	key="idpin_${id//-/_}"
+	printf -v "$key" '%s' "$hue"
+	ID_PINNED="$ID_PINNED $key"
+
+	# An append on its own is atomic, but the prune below is a read-modify-write, so both
+	# sides take a lock. A pin dropped by someone else's prune would leave that pane painted
+	# a colour no reader can derive from the id - which is the whole failure this file exists
+	# to prevent, so it is worth a mkdir. On timeout, take the lock away and carry on: a
+	# prune is milliseconds, so a lock held for a second is a process that has died holding
+	# it, and blocking every future session start behind it would be the worse bug.
+	lock="$ID_PINS_AUTO.lock"
+	while ! mkdir "$lock" 2>/dev/null; do
+		((++waited > 20)) && {
+			rmdir "$lock" 2>/dev/null
+			break
+		}
+		sleep 0.05
+	done
+	printf '%s\t%s\n' "$id" "$hue" >>"$ID_PINS_AUTO" 2>/dev/null
+
+	# Pruned only once it has got long, because it is read on every statusLine render: the
+	# check is one grep over the registry, and a pin for a session that has ended is dead
+	# weight rather than a bug.
+	n=$(grep -c '' "$ID_PINS_AUTO" 2>/dev/null)
+	if [[ -n $n ]] && ((n > 50)); then
+		live=$(grep -ho '"sessionId":"[0-9a-f-]*"' "$HOME"/.claude/sessions/*.json 2>/dev/null)
+		if tmp=$(mktemp); then
+			while IFS=$'\t' read -r pid phue; do
+				[[ -n $pid && -n $phue ]] || continue
+				[[ $live == *"\"$pid\""* ]] && printf '%s\t%s\n' "$pid" "$phue" >>"$tmp"
+			done <"$ID_PINS_AUTO"
+			mv "$tmp" "$ID_PINS_AUTO" 2>/dev/null || rm -f "$tmp"
+		fi
+	fi
+	rmdir "$lock" 2>/dev/null
+	return 0
+}
+
+# Sets IDC_HEX, IDC_NAME and IDC_ANSI for a session id. Pin first, then the hash; an id
+# that is not a uuid gets the first hue rather than an empty string, so a caller never has
+# to handle a missing colour.
+id_colour() {
+	local id=$1 slot=0 i pinned key
+	IDC_HEX=""
+	IDC_NAME=""
+	IDC_ANSI=""
+	IDC_MUTED=""
+	IDC_TINT=""
+	IDC_FG=""
+	IDC_SEL=""
+	[[ -n $id ]] || return 1
+
+	load_pins
+	key="idpin_${id//-/_}"
+	pinned=${!key:-}
+	if [[ -n $pinned ]]; then
+		for i in "${!ID_NAMES[@]}"; do
+			[[ ${ID_NAMES[i]} == "$pinned" ]] && slot=$i && break
+		done
+	elif [[ ${id:0:8} == [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] ]]; then
+		slot=$((0x${id:0:8} % ${#ID_NAMES[@]}))
+	fi
+
+	IDC_NAME=${ID_NAMES[slot]}
+	IDC_HEX=${ID_HEXES[slot]}
+	local m=${ID_MUTED[slot]}
+	IDC_MUTED=$'\033[38;2;'"$((0x${m:0:2}));$((0x${m:2:2}));$((0x${m:4:2}))m"
+	local level
+	level=$(cat "$ID_LEVEL_FILE" 2>/dev/null)
+	case ${level:-full} in
+	off)
+		IDC_TINT=""
+		IDC_FG=""
+		;;
+	whisper)
+		IDC_TINT="#${ID_BG_WHISPER[slot]}"
+		IDC_FG="#${ID_FG_WHISPER[slot]}"
+		;;
+	faint)
+		IDC_TINT="#${ID_BG_FAINT[slot]}"
+		IDC_FG="#${ID_FG_FAINT[slot]}"
+		;;
+	subtle)
+		IDC_TINT="#${ID_BG_SUBTLE[slot]}"
+		IDC_FG="#${ID_FG_SUBTLE[slot]}"
+		;;
+	*)
+		IDC_TINT="#${ID_BG_FULL[slot]}"
+		IDC_FG="#${ID_FG_FULL[slot]}"
+		;;
+	esac
+	IDC_SEL="#${ID_SEL[slot]}"
+	# 38;2;r;g;b built by hand: this runs once per session per load, and $(( )) on the hex
+	# pairs is cheaper than any of printf's ways of saying the same thing.
+	IDC_ANSI=$'\033[38;2;'"$((0x${IDC_HEX:0:2}));$((0x${IDC_HEX:2:2}));$((0x${IDC_HEX:4:2}))m"
+}
+
+# Sourced for the library alone: define the above and stop before the CLI.
+[[ ${1-} == --lib ]] && return 0
+
+set -u
+
+die() {
+	printf 'cc-colour: %s\n' "$1" >&2
+	exit 1
+}
+
+hue_exists() {
+	local i
+	for i in "${!ID_NAMES[@]}"; do
+		[[ ${ID_NAMES[i]} == "$1" ]] && return 0
+	done
+	return 1
+}
+
+# Every live session, from the registry cc-peers also reads. Dead pids linger in there,
+# so drop anything whose process has gone.
+live_sessions() {
+	local file pid name id
+	for file in "$HOME"/.claude/sessions/*.json; do
+		[[ -r $file ]] || continue
+		pid=${file##*/}
+		pid=${pid%.json}
+		kill -0 "$pid" 2>/dev/null || continue
+		IFS=$'\t' read -r name id < <(
+			jq -r '[(.name // ""), (.sessionId // "")] | @tsv' "$file" 2>/dev/null
+		)
+		[[ -n $id ]] && printf '%s\t%s\n' "${name:-?}" "$id"
+	done
+}
+
+# The address you know a session by, resolved to the id colours are keyed on. Registry
+# names are not guaranteed unique (two d5-lca-b3 happens), so say when it is ambiguous
+# rather than pinning whichever file the glob reached first.
+resolve_id() {
+	[[ $1 == *-*-*-*-* ]] && {
+		printf '%s' "$1"
+		return
+	}
+	local matches
+	matches=$(live_sessions | awk -F'\t' -v n="$1" '$1 == n { print $2 }')
+	case $(printf '%s' "$matches" | grep -c .) in
+	0) die "no live session named $1 (try the session id, or cc-colour --all)" ;;
+	1) printf '%s' "$matches" ;;
+	*) die "$1 is ambiguous: $(printf '%s' "$matches" | tr '\n' ' ')" ;;
+	esac
+}
+
+usage() {
+	sed -n '/^#   cc-colour <id>/,/^#$/p' "$0" | sed 's/^# \{0,2\}//'
+}
+
+case ${1-} in
+"" | -h | --help)
+	usage
+	;;
+--list)
+	for i in "${!ID_NAMES[@]}"; do
+		printf '\033[38;2;%d;%d;%dm%-9s  the quick brown fox\033[0m  #%s\n' \
+			"$((0x${ID_HEXES[i]:0:2}))" "$((0x${ID_HEXES[i]:2:2}))" "$((0x${ID_HEXES[i]:4:2}))" \
+			"${ID_NAMES[i]}" "${ID_HEXES[i]}"
+	done
+	;;
+--pins)
+	[[ -r $ID_PINS ]] || exit 0
+	grep -v '^#' "$ID_PINS" 2>/dev/null
+	;;
+--pin)
+	[[ $# -eq 3 ]] || die "usage: cc-colour --pin <name-or-id> <hue>"
+	hue_exists "$3" || die "no such hue: $3 (see --list)"
+	set -- "$1" "$(resolve_id "$2")" "$3"
+	# Rewrite rather than append, so pinning twice leaves one line.
+	tmp=$(mktemp) || die "could not write a temp file"
+	[[ -r $ID_PINS ]] && grep -v "^$2	" "$ID_PINS" >"$tmp" 2>/dev/null
+	printf '%s\t%s\n' "$2" "$3" >>"$tmp"
+	mv "$tmp" "$ID_PINS" || die "could not write $ID_PINS"
+	# Every other surface re-reads the pins on a timer; a painted pane never re-reads
+	# anything, so the ground is the one that has to be pushed.
+	"$HOME/.claude/bin/cc-tint" --all 2>/dev/null
+	printf 'pinned %s to %s\n' "$2" "$3"
+	;;
+--unpin)
+	[[ $# -eq 2 ]] || die "usage: cc-colour --unpin <name-or-id>"
+	set -- "$1" "$(resolve_id "$2")"
+	[[ -r $ID_PINS ]] || exit 0
+	tmp=$(mktemp) || die "could not write a temp file"
+	grep -v "^$2	" "$ID_PINS" >"$tmp" 2>/dev/null
+	mv "$tmp" "$ID_PINS" || die "could not write $ID_PINS"
+	"$HOME/.claude/bin/cc-tint" --all 2>/dev/null
+	printf 'unpinned %s\n' "$2"
+	;;
+--all)
+	while IFS=$'\t' read -r name id; do
+		id_colour "$id"
+		printf '%s%-14s\033[0m %-9s #%s  %s\n' \
+			"$IDC_ANSI" "$name" "$IDC_NAME" "$IDC_HEX" "$id"
+	done < <(live_sessions | sort)
+	;;
+--ansi | --name | --sample | --hex)
+	[[ $# -eq 2 ]] || die "usage: cc-colour $1 <name-or-id>"
+	id_colour "$(resolve_id "$2")" || die "not a session id: $2"
+	case $1 in
+	--ansi) printf '%s' "$IDC_ANSI" ;;
+	--name) printf '%s\n' "$IDC_NAME" ;;
+	--hex) printf '#%s\n' "$IDC_HEX" ;;
+	--sample) printf '%s%s\033[0m\n' "$IDC_ANSI" "$IDC_NAME" ;;
+	esac
+	;;
+-*)
+	die "unknown option: $1"
+	;;
+*)
+	id_colour "$1" || die "not a session id: $1"
+	printf '#%s\n' "$IDC_HEX"
+	;;
+esac

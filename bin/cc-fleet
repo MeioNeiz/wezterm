@@ -30,6 +30,10 @@ readonly US=$'\x1f'
 readonly CACHE="$HOME/.claude/cache/fleet-rows"
 readonly CACHE_TTL=8
 
+# Shared with cc-board, the tab bar and the statusLine: same palette, same hash.
+# shellcheck source=bin/cc-colour
+source "$HOME/.claude/bin/cc-colour" --lib
+
 readonly BLUE=$'\033[38;2;135;215;255m'
 readonly MAUVE=$'\033[38;2;203;166;247m'
 readonly GREEN=$'\033[38;2;166;227;161m'
@@ -308,7 +312,7 @@ while IFS= read -r ws; do
 	((old > 0)) && printf ' · %s idle >%sh' "$old" "$stale_hours"
 	printf '%s%s\n' "$gitbit" "$RESET"
 
-	while IFS="$US" read -r rank _ _ _ pane name kind detail idle turns _ title _ _; do
+	while IFS="$US" read -r rank _ _ _ pane name kind detail idle turns _ title id _; do
 		case $kind in
 		asking)
 			glyph="⚠"
@@ -337,8 +341,11 @@ while IFS= read -r ws; do
 		[[ -n $detail ]] && label="$kind $detail"
 		body=""
 		[[ $glyph == "·" ]] && body=$DIM
-		printf '  %s%s %-18s%s %s%-13s %5s %3st%s  %s%s%s %s%s%s\n' \
-			"$colour" "$glyph" "$name" "$RESET" \
+		# The glyph says what it wants, the name says which chat it is. Same split as the
+		# board and the tab bar, so the colour means one thing wherever it turns up.
+		id_colour "$id"
+		printf '  %s%s %s%-18s%s %s%-13s %5s %3st%s  %s%s%s %s%s%s\n' \
+			"$colour" "$glyph" "${IDC_ANSI:-$colour}" "$name" "$RESET" \
 			"$DIM" "${label:0:13}" "$(age "$idle")" "$turns" "$RESET" \
 			"$body" "${title:0:50}" "$RESET" "$DIM" "$pane" "$RESET"
 	done <<<"$group"

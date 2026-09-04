@@ -1,0 +1,655 @@
+#!/bin/bash
+# wezterm's panes as something you can query, watch and drive. Written so a Claude
+# session can see and steer another window without a human relaying text between them.
+#
+# Targets accept a wezterm pane id, a cc-peers session name, or "." for the calling
+# pane, so the address you would hand SendMessage also works here.
+#
+# The event log is polled rather than pushed: wezterm has no outbound event stream, and
+# the states worth knowing about (busy, asking, idle) are Claude's, not wezterm's, so
+# they would not appear in one even if it existed. `wz events --daemon` diffs a snapshot
+# every couple of seconds and appends what changed.
+
+set -u
+
+readonly GREP_LINES=500
+readonly PIPE_LINES=200
+readonly TITLE_MAX=44
+readonly CACHE="$HOME/.claude/cache"
+readonly EVENT_LOG="$CACHE/wz-events.jsonl"
+readonly EVENT_PID="$CACHE/wz-events.pid"
+readonly EVENT_KEEP=5000
+
+usage() {
+	cat <<'USAGE'
+wz - query, watch and drive wezterm panes
+
+reading
+  wz tree [-a] [-c] [-w <ws>]         what is open: workspace, window, tab, pane
+  wz read <target> [-n <lines>]       text on a pane's screen; -n pulls scrollback
+  wz grep [-a] [-i] [-s] [-n <l>] <p> search every pane's text; -s focuses the first hit
+  wz top [-a]                         cpu and memory per pane, busiest first
+
+watching
+  wz events [--after N] [--cursor-file F] [--follow] [--name E] [--limit N]
+  wz events --daemon [--interval S]   start the poller that fills the log
+  wz events --stop | --status
+  wz wait <target> --state <s> [--timeout S]
+  wz wait --event <name> [--pane N] [--timeout S]
+  wz pipe <target> [--command <cmd>] [--interval S]
+
+driving
+  wz send [--enter] <target> <text>   type text into a pane
+  wz key <target> <key>...            enter esc tab up down ctrl-c ...
+  wz go <target>                      focus a pane, switching tab and workspace
+  wz join <src> <target> [--right|--left|--top|--bottom]
+  wz break <target>                   move a pane out to its own tab
+  wz notify <title> [body]            a desktop notification
+
+<target> is a wezterm pane id, a cc-peers session name, or "." for this pane.
+tree, grep and top cover the current workspace; -a covers every one.
+-c limits tree to panes holding a Claude session.
+
+  wz tree -c -a                       every Claude session on the machine
+  wz grep -a -i 'traceback' -s        find the pane that blew up and jump to it
+  wz wait d5-lca-48 --state idle      block until that session stops working
+  wz events --follow --name state-changed
+USAGE
+}
+
+die() {
+	echo "wz: $*" >&2
+	exit 1
+}
+
+# Field order used throughout: ws, win, tab, pane, active, dir, tty, title.
+pane_tsv() {
+	wezterm cli list --format json 2>/dev/null | jq -r '
+		.[] | [
+			.workspace,
+			(.window_id | tostring),
+			(.tab_id | tostring),
+			(.pane_id | tostring),
+			(if .is_active then "*" else "" end),
+			((.cwd // "") | sub("^file://[^/]*"; "") | sub("/$"; "")
+				| split("/") | last // "" | gsub("%20"; " ")),
+			((.tty_name // "") | sub("^/dev/"; "")),
+			(if (.tab_title // "") != "" then .tab_title else (.title // "") end
+				| gsub("\\s+"; " "))
+		] | @tsv
+	'
+}
+
+# cc-peers already merges the registry with the hook state files, so nothing here
+# duplicates that; wz only needs its pane column to hang rows off.
+session_tsv() {
+	command -v cc-peers >/dev/null && cc-peers --tsv 2>/dev/null
+}
+
+PANES=""
+load() {
+	[[ -n $PANES ]] && return 0
+	PANES=$(pane_tsv)
+	[[ -n $PANES ]] || die "no wezterm mux to talk to"
+}
+
+# Empty means every workspace. Falling back to all when the caller is outside wezterm
+# beats erroring: that is how wz gets run from cron and from a plain shell.
+scope_ws() {
+	local all=$1
+	$all && return
+	[[ -n ${WEZTERM_PANE:-} ]] || return
+	printf '%s\n' "$PANES" | awk -F'\t' -v p="$WEZTERM_PANE" '$4 == p { print $1; exit }'
+}
+
+# Hoisted out of its callers on purpose: bash 3.2 misreads a case pattern's ")" as the
+# end of an enclosing $( ) or < <( ).
+resolve() {
+	local target=$1 pane
+	case $target in
+	'') die "need a target" ;;
+	.) case ${WEZTERM_PANE:-} in
+		'' | *[!0-9]*) die "\".\" needs a wezterm pane; WEZTERM_PANE is \"${WEZTERM_PANE:-}\"" ;;
+		esac
+		printf '%s' "$WEZTERM_PANE"; return ;;
+	*[!0-9]*) ;;
+	*) printf '%s' "$target"; return ;;
+	esac
+	pane=$(session_tsv | awk -F'\t' -v n="$target" '$1 == n { print $4; exit }')
+	[[ -n $pane && $pane != "-" ]] || die "no pane named \"$target\" (try: cc-peers)"
+	# Nothing downstream should have to wonder: a pane id is digits or it is a bug.
+	case $pane in
+	'' | *[!0-9]*) die "\"$target\" resolved to \"$pane\", which is not a pane id" ;;
+	esac
+	printf '%s' "$pane"
+}
+
+# ws, win, tab, pane+active, dir, session, state, tty, title, pane. Shared by every
+# reader so a pane is labelled the same way whichever command you came in through.
+rows_in_scope() {
+	local ws=$1 conly=$2
+	awk -F'\t' -v ws="$ws" -v conly="$conly" '
+		FNR == NR { name[$4] = $1; state[$4] = $3; next }
+		ws != "" && $1 != ws { next }
+		{
+			n = ($4 in name) ? name[$4] : "-"
+			if (conly == "true" && n == "-") next
+			print $1 "\t" $2 "\t" $3 "\t" $4 $5 "\t" ($6 == "" ? "-" : $6) "\t" \
+				n "\t" (($4 in state) ? state[$4] : "-") "\t" $7 "\t" $8 "\t" $4
+		}
+	' <(session_tsv) <(printf '%s\n' "$PANES")
+}
+
+cmd_tree() {
+	local all=false conly=false ws="" win tab pane dir sess state tty title pnum
+	while (($#)); do
+		case $1 in
+		-a | --all) all=true ;;
+		-c | --claude) conly=true ;;
+		-w) shift; ws=${1:-}; [[ -n $ws ]] || die "-w needs a workspace" ;;
+		-h | --help) usage; return ;;
+		*) die "tree: unexpected argument $1" ;;
+		esac
+		shift
+	done
+	load
+	[[ -n $ws ]] || ws=$(scope_ws $all)
+
+	{
+		echo $'WS\tWIN\tTAB\tPANE\tDIR\tSESSION\tSTATE\tTITLE'
+		# Truncating here rather than in awk: this awk is byte-based, so substr cuts a
+		# multibyte glyph in half, and every tab title starts with one.
+		rows_in_scope "$ws" "$conly" |
+			sort -t$'\t' -k1,1 -k2,2n -k3,3n -k10,10n |
+			while IFS=$'\t' read -r ws win tab pane dir sess state tty title pnum; do
+				((${#title} > TITLE_MAX)) && title="${title:0:$((TITLE_MAX - 1))}…"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$ws" "$win" "$tab" "$pane" "$dir" "$sess" "$state" "$title"
+			done
+	} | column -t -s $'\t'
+}
+
+cmd_read() {
+	local lines=0 target=""
+	while (($#)); do
+		case $1 in
+		-n) shift; lines=${1:-} ;;
+		-h | --help) usage; return ;;
+		-*) die "read: unknown option $1" ;;
+		*) [[ -z $target ]] || die "read: one target at a time"; target=$1 ;;
+		esac
+		shift
+	done
+	[[ -n $target ]] || die "read: need a target"
+	case $lines in '' | *[!0-9]*) die "read: -n needs a line count" ;; esac
+	local pane
+	pane=$(resolve "$target") || exit 1
+	if ((lines > 0)); then
+		wezterm cli get-text --pane-id "$pane" --start-line "-$lines"
+	else
+		wezterm cli get-text --pane-id "$pane"
+	fi
+}
+
+cmd_grep() {
+	local all=false select=false icase="" lines=$GREP_LINES pattern="" first=""
+	while (($#)); do
+		case $1 in
+		-a | --all) all=true ;;
+		-i) icase="-i" ;;
+		-s | --select) select=true ;;
+		-n) shift; lines=${1:-} ;;
+		-h | --help) usage; return ;;
+		--) shift; pattern=${1:-}; break ;;
+		-*) die "grep: unknown option $1" ;;
+		*) [[ -z $pattern ]] || die "grep: one pattern at a time"; pattern=$1 ;;
+		esac
+		shift
+	done
+	[[ -n $pattern ]] || die "grep: need a pattern"
+	case $lines in '' | *[!0-9]*) die "grep: -n needs a line count" ;; esac
+	load
+
+	# One get-text per pane at ~25ms; sequential keeps the output ordered and still
+	# comes in under two seconds across every pane on the machine.
+	local ws pane dir sess label hits
+	while IFS=$'\t' read -r ws _ _ pane dir sess _ _ _ pnum; do
+		label="$ws/$dir"
+		[[ $sess != "-" ]] && label="$label @$sess"
+		hits=$(wezterm cli get-text --pane-id "$pnum" --start-line "-$lines" 2>/dev/null |
+			grep $icase -e "$pattern")
+		[[ -n $hits ]] || continue
+		[[ -z $first ]] && first=$pnum
+		printf '%s\n' "$hits" | sed -e "s|^|$pnum	$label	|"
+	done < <(rows_in_scope "$(scope_ws $all)" false)
+
+	if $select; then
+		[[ -n $first ]] || die "grep: nothing matched, nothing to focus"
+		wezterm cli activate-pane --pane-id "$first"
+	fi
+}
+
+cmd_top() {
+	local all=false
+	while (($#)); do
+		case $1 in
+		-a | --all) all=true ;;
+		-h | --help) usage; return ;;
+		*) die "top: unexpected argument $1" ;;
+		esac
+		shift
+	done
+	load
+
+	# One ps for the whole machine joined on tty, rather than a `ps -t` per pane: that
+	# fan-out would cost more than everything else wz does put together.
+	{
+		ps -axo tty=,pid=,pcpu=,rss=,comm= | awk '$1 != "??" {
+			c = $5
+			for (i = 6; i <= NF; i++) c = c " " $i
+			print "P\t" $1 "\t" $3 "\t" $4 "\t" c
+		}'
+		rows_in_scope "$(scope_ws $all)" false | awk -F'\t' '{ print "W\t" $0 }'
+	} | awk -F'\t' '
+		$1 == "P" {
+			cpu[$2] += $3
+			rss[$2] += $4
+			# The busiest process names the pane: a login shell sits at 0.0% forever,
+			# so whatever is actually running is the useful label.
+			if ($3 + 0 >= top[$2] + 0 || !($2 in proc)) { top[$2] = $3; proc[$2] = $5 }
+			next
+		}
+		{
+			# One "W" prefix column ahead of every rows_in_scope field.
+			tty = $9
+			c = (tty in cpu) ? cpu[tty] : 0
+			m = (tty in rss) ? rss[tty] / 1024 : 0
+			p = (tty in proc) ? proc[tty] : "-"
+			printf "%.1f\t%.0f\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				c, m, $5, $2, $6, $7, $8, p
+		}
+	' | sort -t$'\t' -k1,1nr |
+		{
+			echo $'CPU%\tRSS_MB\tPANE\tWS\tDIR\tSESSION\tSTATE\tPROC'
+			cat
+		} | column -t -s $'\t'
+}
+
+# printf, not a table of literals: the bytes have to survive command substitution,
+# which eats a trailing newline but leaves \r and the escapes alone.
+key_bytes() {
+	local k c
+	k=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+	case $k in
+	enter | return | cr) printf '\r' ;;
+	esc | escape) printf '\033' ;;
+	tab) printf '\t' ;;
+	space) printf ' ' ;;
+	bs | backspace) printf '\177' ;;
+	del | delete) printf '\033[3~' ;;
+	up) printf '\033[A' ;;
+	down) printf '\033[B' ;;
+	right) printf '\033[C' ;;
+	left) printf '\033[D' ;;
+	home) printf '\033[H' ;;
+	end) printf '\033[F' ;;
+	pgup) printf '\033[5~' ;;
+	pgdn) printf '\033[6~' ;;
+	ctrl-[a-z])
+		c=$(printf '%s' "${k#ctrl-}" | tr 'a-z' 'A-Z')
+		printf "\\$(printf '%03o' $(($(printf '%d' "'$c") - 64)))"
+		;;
+	*) die "unknown key \"$1\"" ;;
+	esac
+}
+
+cmd_send() {
+	local enter=false
+	while (($#)); do
+		case ${1:-} in
+		--enter) enter=true; shift ;;
+		-h | --help) usage; return ;;
+		--) shift; break ;;
+		-*) die "send: unknown option $1" ;;
+		*) break ;;
+		esac
+	done
+	(($#)) || die "send: need a target"
+	local target=$1 pane
+	shift
+	(($#)) || die "send: need something to type"
+	pane=$(resolve "$target") || exit 1
+	wezterm cli send-text --pane-id "$pane" -- "$*"
+	if $enter; then
+		printf '\r' | wezterm cli send-text --pane-id "$pane" --no-paste
+	fi
+}
+
+cmd_key() {
+	(($#)) || die "key: need a target"
+	local target=$1 pane k bytes
+	shift
+	(($#)) || die "key: need at least one key"
+	pane=$(resolve "$target") || exit 1
+	for k in "$@"; do
+		bytes=$(key_bytes "$k") || exit 1
+		printf '%s' "$bytes" | wezterm cli send-text --pane-id "$pane" --no-paste
+	done
+}
+
+cmd_go() {
+	(($#)) || die "go: need a target"
+	local pane
+	pane=$(resolve "$1") || exit 1
+	wezterm cli activate-pane --pane-id "$pane"
+}
+
+# split-pane --move-pane-id is wezterm's join-pane: it relocates a live pane into a
+# split of the target, across tabs and windows, and `wz break` undoes it.
+cmd_join() {
+	local dir="--right" src="" target=""
+	while (($#)); do
+		case $1 in
+		--right | --left | --top | --bottom) dir=$1 ;;
+		-h | --help) usage; return ;;
+		-*) die "join: unknown option $1" ;;
+		*) if [[ -z $src ]]; then src=$1; elif [[ -z $target ]]; then target=$1
+			else die "join: too many arguments"; fi ;;
+		esac
+		shift
+	done
+	[[ -n $src && -n $target ]] || die "join: need a source and a target"
+	local s t
+	s=$(resolve "$src") || exit 1
+	t=$(resolve "$target") || exit 1
+	[[ $s != "$t" ]] || die "join: source and target are the same pane"
+	wezterm cli split-pane --pane-id "$t" --move-pane-id "$s" "$dir" >/dev/null
+	echo "moved pane $s beside $t (${dir#--})"
+}
+
+cmd_break() {
+	(($#)) || die "break: need a target"
+	local pane
+	pane=$(resolve "$1") || exit 1
+	wezterm cli move-pane-to-new-tab --pane-id "$pane" >/dev/null
+	echo "pane $pane is on its own tab"
+}
+
+# No @Q here: that is bash 4.4, and this machine is 3.2.
+osa_quote() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+cmd_notify() {
+	(($#)) || die "notify: need a title"
+	local title=$1 body=""
+	shift
+	(($#)) && body=$*
+	# wezterm exposes no notification API to the CLI, and window:toast_notification
+	# exists only inside Lua, so this goes straight to Notification Centre.
+	osascript -e "display notification \"$(osa_quote "$body")\" \
+		with title \"$(osa_quote "$title")\""
+}
+
+# --- events -----------------------------------------------------------------------
+#
+# A snapshot is pane, ws, session, state, title; diffing two of them is the whole event
+# model. wezterm has no outbound stream, and the states worth knowing about (busy,
+# asking, idle) are Claude's rather than wezterm's, so they would not be in one anyway.
+
+snapshot() {
+	PANES=$(pane_tsv)
+	[[ -n $PANES ]] || return 1
+	rows_in_scope "" false | awk -F'\t' '{ print $10 "\t" $1 "\t" $6 "\t" $7 "\t" $9 }'
+}
+
+emit_diff() {
+	awk -F'\t' '
+		FNR == NR { prev[$1] = $0; next }
+		{
+			cur[$1] = 1
+			if (!($1 in prev)) { print "pane-opened\t" $1 "\t" $2 "\t" $3 "\t" $5; next }
+			split(prev[$1], p, "\t")
+			if (p[4] != $4) print "state-changed\t" $1 "\t" $2 "\t" $3 "\t" p[4] " -> " $4
+			if (p[2] != $2) print "workspace-moved\t" $1 "\t" $2 "\t" $3 "\t" p[2] " -> " $2
+			if (p[5] != $5) print "title-changed\t" $1 "\t" $2 "\t" $3 "\t" $5
+		}
+		END {
+			for (k in prev) {
+				if (k in cur) continue
+				split(prev[k], p, "\t")
+				print "pane-closed\t" k "\t" p[2] "\t" p[3] "\t" p[5]
+			}
+		}
+	' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+last_seq() {
+	[[ -s $EVENT_LOG ]] || { echo 0; return; }
+	tail -1 "$EVENT_LOG" | jq -r '.seq // 0' 2>/dev/null || echo 0
+}
+
+events_daemon() {
+	local interval=$1 prev cur line seq now running
+	mkdir -p "$CACHE"
+	if [[ -s $EVENT_PID ]]; then
+		running=$(<"$EVENT_PID")
+		kill -0 "$running" 2>/dev/null &&
+			die "events: already running as pid $running (wz events --stop)"
+	fi
+	echo $$ >"$EVENT_PID"
+	trap 'rm -f "$EVENT_PID"' EXIT INT TERM
+
+	seq=$(last_seq)
+	prev=$(snapshot) || die "events: no wezterm mux to talk to"
+	while :; do
+		sleep "$interval"
+		cur=$(snapshot) || continue
+		while IFS= read -r line; do
+			[[ -n $line ]] || continue
+			seq=$((seq + 1))
+			now=$(date +%s)
+			# -R: the line is raw TSV, not JSON, so jq must read it as a string.
+			printf '%s\n' "$line" | jq -R -c --argjson seq "$seq" --argjson at "$now" \
+				'split("\t") | {seq: $seq, at: $at, name: .[0], pane: .[1],
+					ws: .[2], session: .[3], detail: .[4]}' >>"$EVENT_LOG"
+		done < <(emit_diff "$prev" "$cur")
+		prev=$cur
+		# Trimmed rarely and only well past the keep mark: a rewrite races a reader's
+		# tail, and the log gains only a few lines a minute even on a busy machine.
+		if (($(wc -l <"$EVENT_LOG" 2>/dev/null || echo 0) > EVENT_KEEP * 2)); then
+			tail -n "$EVENT_KEEP" "$EVENT_LOG" >"$EVENT_LOG.tmp" &&
+				mv "$EVENT_LOG.tmp" "$EVENT_LOG"
+		fi
+	done
+}
+
+events_stop() {
+	[[ -s $EVENT_PID ]] || die "events: not running"
+	local pid
+	pid=$(<"$EVENT_PID")
+	kill "$pid" 2>/dev/null || die "events: pid $pid is already gone"
+	rm -f "$EVENT_PID"
+	echo "events: stopped $pid"
+}
+
+events_status() {
+	local pid
+	if [[ -s $EVENT_PID ]]; then
+		pid=$(<"$EVENT_PID")
+		if kill -0 "$pid" 2>/dev/null; then
+			echo "events: running as pid $pid, $(last_seq) events logged"
+			return
+		fi
+	fi
+	echo "events: not running ($(last_seq) events in the log)"
+}
+
+events_read() {
+	local after=$1 cursor=$2 follow=$3 name=$4 limit=$5 out seen
+	[[ -f $EVENT_LOG ]] || die "events: no log yet (wz events --daemon &)"
+	if [[ -n $cursor && -s $cursor ]]; then
+		after=$(<"$cursor")
+	fi
+	case $after in '' | *[!0-9]*) after=0 ;; esac
+	while :; do
+		out=$(jq -c --argjson after "$after" --arg name "$name" \
+			'select(.seq > $after) | select($name == "" or .name == $name)' \
+			"$EVENT_LOG" 2>/dev/null)
+		if [[ -n $out ]]; then
+			if ((limit > 0)); then
+				printf '%s\n' "$out" | tail -n "$limit"
+			else
+				printf '%s\n' "$out"
+			fi
+			seen=$(printf '%s\n' "$out" | tail -1 | jq -r '.seq')
+			after=$seen
+			[[ -n $cursor ]] && printf '%s\n' "$after" >"$cursor"
+		fi
+		$follow || break
+		sleep 1
+	done
+}
+
+cmd_events() {
+	local after="" cursor="" follow=false name="" limit=0 interval=2 action=read
+	while (($#)); do
+		case $1 in
+		--daemon) action=daemon ;;
+		--stop) action=stop ;;
+		--status) action=status ;;
+		--follow | -f) follow=true ;;
+		--after) shift; after=${1:-} ;;
+		--cursor-file) shift; cursor=${1:-} ;;
+		--name) shift; name=${1:-} ;;
+		--limit) shift; limit=${1:-0} ;;
+		--interval) shift; interval=${1:-2} ;;
+		-h | --help) usage; return ;;
+		*) die "events: unknown option $1" ;;
+		esac
+		shift
+	done
+	case $action in
+	daemon) events_daemon "$interval" ;;
+	stop) events_stop ;;
+	status) events_status ;;
+	*) events_read "$after" "$cursor" "$follow" "$name" "$limit" ;;
+	esac
+}
+
+# --- wait -----------------------------------------------------------------------
+
+wait_event() {
+	local event=$1 pane=$2 timeout=$3 waited=0 from hit
+	[[ -f $EVENT_LOG ]] || die "wait: no event log (wz events --daemon &)"
+	from=$(last_seq)
+	while ((waited < timeout)); do
+		hit=$(jq -c --argjson after "$from" --arg n "$event" --arg p "$pane" \
+			'select(.seq > $after) | select(.name == $n)
+			 | select($p == "" or .pane == $p)' "$EVENT_LOG" 2>/dev/null | head -1)
+		[[ -n $hit ]] && { printf '%s\n' "$hit"; return 0; }
+		sleep 1
+		waited=$((waited + 1))
+	done
+	die "wait: timed out after ${timeout}s waiting for $event"
+}
+
+# Polling cc-peers rather than the event log keeps this working with no daemon, and
+# cc-peers is what knows "asking" from "idle" in the first place.
+wait_state() {
+	local pane=$1 state=$2 timeout=$3 waited=0 cur
+	while ((waited < timeout)); do
+		cur=$(session_tsv | awk -F'\t' -v p="$pane" '$4 == p { print $3; exit }')
+		case $cur in
+		"$state"*) echo "$cur"; return 0 ;;
+		esac
+		sleep 2
+		waited=$((waited + 2))
+	done
+	die "wait: timed out after ${timeout}s; pane $pane is \"${cur:-unknown}\""
+}
+
+cmd_wait() {
+	local target="" state="" event="" pane="" timeout=300
+	while (($#)); do
+		case $1 in
+		--state) shift; state=${1:-} ;;
+		--event) shift; event=${1:-} ;;
+		--pane) shift; pane=${1:-} ;;
+		--timeout) shift; timeout=${1:-300} ;;
+		-h | --help) usage; return ;;
+		-*) die "wait: unknown option $1" ;;
+		*) [[ -z $target ]] || die "wait: one target at a time"; target=$1 ;;
+		esac
+		shift
+	done
+	case $timeout in '' | *[!0-9]*) die "wait: --timeout needs seconds" ;; esac
+	[[ -n $target ]] && pane=$(resolve "$target")
+	if [[ -n $event ]]; then
+		wait_event "$event" "$pane" "$timeout"
+		return
+	fi
+	[[ -n $pane ]] || die "wait: need a target"
+	[[ -n $state ]] || die "wait: need --state or --event"
+	wait_state "$pane" "$state" "$timeout"
+}
+
+# --- pipe -----------------------------------------------------------------------
+
+pipe_loop() {
+	local pane=$1 interval=$2 lines=$3 prev cur
+	prev=$(wezterm cli get-text --pane-id "$pane" --start-line "-$lines" 2>/dev/null)
+	while :; do
+		sleep "$interval"
+		cur=$(wezterm cli get-text --pane-id "$pane" --start-line "-$lines" 2>/dev/null)
+		[[ $cur == "$prev" ]] && continue
+		diff <(printf '%s\n' "$prev") <(printf '%s\n' "$cur") | sed -n 's/^> //p'
+		prev=$cur
+	done
+}
+
+cmd_pipe() {
+	local target="" cmd="" interval=1 lines=$PIPE_LINES pane
+	while (($#)); do
+		case $1 in
+		--command | -c) shift; cmd=${1:-} ;;
+		--interval) shift; interval=${1:-1} ;;
+		-n) shift; lines=${1:-} ;;
+		-h | --help) usage; return ;;
+		-*) die "pipe: unknown option $1" ;;
+		*) [[ -z $target ]] || die "pipe: one target at a time"; target=$1 ;;
+		esac
+		shift
+	done
+	[[ -n $target ]] || die "pipe: need a target"
+	case $lines in '' | *[!0-9]*) die "pipe: -n needs a line count" ;; esac
+	pane=$(resolve "$target") || exit 1
+	# Line-diffing only reads cleanly for output that scrolls. A full-screen TUI
+	# repaints in place, so its "new" lines are whatever the redraw happened to touch.
+	if [[ -n $cmd ]]; then
+		pipe_loop "$pane" "$interval" "$lines" | sh -c "$cmd"
+	else
+		pipe_loop "$pane" "$interval" "$lines"
+	fi
+}
+
+command -v wezterm >/dev/null || die "wezterm is not on PATH"
+command -v jq >/dev/null || die "jq is not on PATH"
+
+case ${1:-} in
+tree) shift; cmd_tree "$@" ;;
+read) shift; cmd_read "$@" ;;
+grep) shift; cmd_grep "$@" ;;
+top) shift; cmd_top "$@" ;;
+send) shift; cmd_send "$@" ;;
+key) shift; cmd_key "$@" ;;
+go) shift; cmd_go "$@" ;;
+join) shift; cmd_join "$@" ;;
+break) shift; cmd_break "$@" ;;
+notify) shift; cmd_notify "$@" ;;
+events) shift; cmd_events "$@" ;;
+wait) shift; cmd_wait "$@" ;;
+pipe) shift; cmd_pipe "$@" ;;
+-h | --help | help | '') usage ;;
+*) usage >&2; exit 2 ;;
+esac

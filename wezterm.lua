@@ -2,6 +2,22 @@ local wezterm = require("wezterm")
 local act = wezterm.action
 local config = wezterm.config_builder()
 
+-- config_builder() is strict: assigning a field it does not know raises, and a raise while
+-- loading this file means wezterm throws away the entire config and falls back to defaults.
+-- One typo in a cosmetic setting therefore costs every keybinding, the tab bar and the whole
+-- colour scheme. Field names also come and go between versions.
+--
+-- So anything optional goes through here, where an unknown field is skipped with a warning.
+-- Note that no `wezterm` CLI subcommand validates these - show-keys and ls-fonts both load
+-- the file and report nothing - so the GUI is the only thing that will ever tell you.
+local function try_set(key, value)
+	if not pcall(function()
+		config[key] = value
+	end) then
+		wezterm.log_warn("wezterm.lua: skipping unknown config field " .. key)
+	end
+end
+
 local is_windows = wezterm.target_triple:find("windows") ~= nil
 local is_macos = wezterm.target_triple:find("darwin") ~= nil
 
@@ -28,8 +44,15 @@ config.tab_bar_at_bottom = false
 config.hide_tab_bar_if_only_one_tab = false
 -- Deliberately loose: this is the only width format-tab-title is told about, and
 -- it is the config value, not the room actually left in the bar. The real sharing
--- happens in tab_share, so this only has to be wide enough not to bind first.
-config.tab_max_width = 160
+-- happens in label_width, so this only has to be wide enough not to bind first - and
+-- at 160 it was binding first, in every window wide enough to matter.
+config.tab_max_width = 320
+-- Two cells a tab, and nothing here is ever clicked.
+--
+-- Through try_set because this field has been spelled two different ways: assigning the
+-- wrong one is not a warning, it is `error converting Lua table to Config` and the whole
+-- file is discarded. Nothing in this config is worth that, least of all two cells.
+try_set("show_close_tab_button_in_tabs", false)
 -- Doubles as how often the tab bar re-reads pane state, see update-right-status.
 config.status_update_interval = 1000
 
@@ -37,6 +60,11 @@ config.status_update_interval = 1000
 -- Invisible if it ever reaches the tab bar, so format-tab-title can tell the two
 -- apart and let live pane topics win over a pin that has since gone stale.
 local AUTO_TITLE_MARK = "\u{2063}"
+
+-- A tab can carry a hand-typed name *and* the live pane row. Text before the first
+-- backslash is the name, the backslash onward is the row's to fill: "dtmf \". A title
+-- with no backslash still means typed by hand, shown exactly as typed.
+local TAB_GROUP_SEP = "\\"
 
 -- (Optional) On Windows, default to PowerShell 7 — uncomment if you want it.
 -- This same file works on macOS, Linux, and Windows.
@@ -56,6 +84,9 @@ local AUTO_TITLE_MARK = "\u{2063}"
 local resurrect = wezterm.plugin.require("https://github.com/MLFlexer/resurrect.wezterm")
 
 local session_map_dir = wezterm.home_dir .. "/.claude/wezterm-sessions"
+-- What cc-tint last painted onto each pane, `<session id>\t<hue name>`. Only read here to
+-- be wiped with the rest of the pane-keyed state.
+local painted_dir = wezterm.home_dir .. "/.claude/cache/cc-tint-painted"
 -- What each Claude pane is doing, written by hooks/wezterm-pane-state.sh; read by
 -- format-tab-title, since a pane title only ever says working or not working.
 local pane_state_dir = wezterm.home_dir .. "/.claude/wezterm-state"
@@ -251,14 +282,18 @@ local function saved_workspace_names()
 end
 
 wezterm.on("gui-startup", function()
-	-- pane ids restart from 0 with a new mux, so the old map and the old pane states
-	-- would both mis-attribute; the ids we need are already baked into the saved states
+	-- pane ids restart from 0 with a new mux, so the old map, the old pane states and the
+	-- record of what colour each pane was painted would all mis-attribute; the ids we need
+	-- are already baked into the saved states. A stale paint record is the subtle one: it
+	-- would have a new session in pane 3 avoid the colour that the *previous* mux's pane 3
+	-- was wearing.
 	wezterm.background_child_process({
 		"/bin/sh", "-c",
 		string.format(
-			"rm -rf %q %q && mkdir -p %q %q",
+			"rm -rf %q %q %q && mkdir -p %q %q",
 			session_map_dir,
 			pane_state_dir,
+			painted_dir,
 			session_map_dir,
 			pane_state_dir
 		),
@@ -481,7 +516,7 @@ config.key_tables = {
 -- trailing blank alternates between space and NBSP: identical cell, different
 -- bytes, every tab re-evaluated once per status_update_interval.
 -- ============================================================
-local tab_geometry = {} -- tab id -> cells the tab bar has to share; see tab_share
+local tab_geometry = {} -- tab id -> the bar's size; see label_width
 local status_tick = 0
 
 -- Assigned in the Claude fleet section at the foot of this file, which needs
@@ -496,6 +531,11 @@ local ws_git_refresh
 -- LEADER+w its alt-tab order. The status bar is the only thing that fires often enough to
 -- notice you arriving by any route - the picker, LEADER+n/p, or clicking a window.
 local ws_touch
+
+-- Likewise, and for the workspace name: it takes the colour of the pane you are actually
+-- in, so the bar answers "which chat am I typing into" as well as "where am I". Defined
+-- with the tab bar's identity palette, which cannot be hoisted above this handler.
+local focused_identity
 
 wezterm.on("update-right-status", function(window, _)
 	local parts = {}
@@ -549,7 +589,16 @@ wezterm.on("update-right-status", function(window, _)
 	local workspace = window:active_workspace()
 	status_tick = status_tick + 1
 	local blank = (status_tick % 2 == 0) and " " or "\u{00a0}"
-	table.insert(parts, { Foreground = { Color = "#89b4fa" } })
+	local ws_colour = "#89b4fa"
+	if focused_identity then
+		local ok_pane, tint = pcall(function()
+			return focused_identity(window:active_pane():pane_id())
+		end)
+		if ok_pane and tint then
+			ws_colour = tint
+		end
+	end
+	table.insert(parts, { Foreground = { Color = ws_colour } })
 	table.insert(parts, { Text = "  " .. workspace .. " " .. blank })
 	width = width + #workspace + 4
 
@@ -577,16 +626,23 @@ end)
 -- Precedence: a title typed by hand (LEADER+,) wins, then live pane topics, then
 -- a pin left by the save layer, then whatever the active pane calls itself.
 -- ============================================================
-local MAX_LABEL = 24 -- past this a topic is padding, and the other tabs want the room
-local SOLO_BUDGET = 52 -- a lone pane shares with nobody, so let its topic run on
+-- A whole topic, not half of one, and the only ceiling left. At 52, with label_width's
+-- predecessor also limiting, a window with one tab and four hundred spare columns still
+-- wrote "Audit and sync HubSp…": two caps on the same number, and the wrong one bound.
+local SOLO_BUDGET = 96
 local MIN_LABEL = 10 -- a label with room for a subject, not just a verb
 local TERSE_LABEL = 5 -- squeezed, but still names something
-local TAB_FLOOR = 10 -- index, a squeezed label, trailing space: the least a tab can say
+local GROUP_LABEL = 14 -- a tab's own name, the part before TAB_GROUP_SEP
 -- Reserves for chrome this code cannot measure. Generous on purpose: unused bar is
 -- just empty, whereas overshooting means wezterm clips the tabs itself, which is
 -- the failure this whole calculation exists to avoid. Raise if tabs still clip.
-local TAB_CHROME = 8 -- the fancy tab bar's own padding and close button, per tab
-local BAR_SLACK = 8 -- new tab button, and rounding
+-- Per-tab overhead this code cannot measure. It was 8 on the reasoning that unused bar
+-- is harmless, which is true in a two-tab window and false in a ten-tab one: there it
+-- was claiming 80 of 111 columns and starving every tab of a name. 5 with the close
+-- button turned off. Raise it if tabs start clipping, which is the failure it exists
+-- to avoid.
+local TAB_CHROME = 5
+local BAR_SLACK = 6 -- new tab button, and rounding
 
 -- Titles that name a program rather than a task.
 local UNINFORMATIVE = {
@@ -792,6 +848,137 @@ local TAB_COLOURS = {
 -- When only one of a tab's panes can be named, name the one that wants you most.
 local NEED = { asking = 5, fresh = 4, waiting = 3, working = 2, stale = 1 }
 
+-- Identity, which is a different question from status: not "what does this pane want"
+-- but "which pane is this". Twenty sessions in one workspace are all named d5-lca-
+-- something and all drawn in whatever hue their state happens to be, so the tab bar
+-- could say a tab had four chats in it without saying which four.
+--
+-- Mocha's own accents, and they overlap TAB_COLOURS on purpose. What separates the two
+-- channels is role rather than hue: identity never lands on a glyph or a marker, so in
+-- this bar it colours only the terse dot - the one that is standing in for a whole pane
+-- because nothing else fits. Status keeps every named label, the markers that mean
+-- something (? blocked, ✓ just finished), the shape ◆ for focus, and the greys.
+--
+-- Keep in step with ~/.claude/bin/cc-colour, which is the same ladder and the same
+-- hash: the board, the statusLine and this bar have to agree or the colour is noise.
+local TAB_IDENTITY = {
+	"#f5c2e7", "#cba6f7", "#89b4fa", "#74c7ec", "#94e2d5",
+	"#a6e3a1", "#f9e2af", "#fab387", "#eba0ac",
+}
+
+local identity_pins = {}
+local identity_pins_at = 0
+local identity_pins_generation = 0
+local IDENTITY_PIN_NAMES = {
+	pink = 1, mauve = 2, blue = 3, sapphire = 4, teal = 5,
+	green = 6, yellow = 7, peach = 8, maroon = 9,
+}
+
+---Pinned colours: the ones cc-tint chose for itself first, then the hand-pinned ones over
+---the top, which is the precedence cc-colour's load_pins uses. Re-read on a timer rather
+---than per paint, because this runs for every pane in every tab, once a second.
+---
+---Three seconds rather than ten. cc-tint writes an auto pin at the moment a session starts,
+---so the timer is how long the label can disagree with the ground the pane is already
+---wearing, and a disagreement between those two at exactly the moment you start a session
+---is the thing this whole scheme is for. Two small file reads every three seconds.
+local IDENTITY_PIN_FILES = { "/.claude/session-colours-auto", "/.claude/session-colours" }
+
+local function load_identity_pins()
+	local now = os.time()
+	if now - identity_pins_at < 3 then
+		return
+	end
+	identity_pins_at = now
+	local fresh = {}
+	for _, name in ipairs(IDENTITY_PIN_FILES) do
+		local file = io.open(wezterm.home_dir .. name, "r")
+		if file then
+			for line in file:lines() do
+				local id, hue = line:match("^(%S+)\t(%S+)$")
+				if id and IDENTITY_PIN_NAMES[hue] then
+					fresh[id] = IDENTITY_PIN_NAMES[hue]
+				end
+			end
+			file:close()
+		end
+	end
+	-- pane_identity caches the resolved colour, so a pin that changed has to invalidate it
+	-- or the bar keeps the old hue for the rest of that cache's life.
+	local changed = false
+	for id, slot in pairs(fresh) do
+		if identity_pins[id] ~= slot then
+			changed = true
+			break
+		end
+	end
+	if not changed then
+		for id in pairs(identity_pins) do
+			if fresh[id] == nil then
+				changed = true
+				break
+			end
+		end
+	end
+	identity_pins = fresh
+	if changed then
+		identity_pins_generation = identity_pins_generation + 1
+	end
+end
+
+---The first 8 hex digits of the session id, mod the palette. Stateless on purpose, so
+---this agrees with cc-colour without either of them coordinating, and a colour survives
+---/rename and --resume: the id is the one name a session never changes.
+local function identity_of(session_id)
+	if session_id == nil then
+		return nil
+	end
+	load_identity_pins()
+	local slot = identity_pins[session_id]
+	if slot == nil then
+		local head = session_id:sub(1, 8)
+		slot = 1
+		if head:match("^%x%x%x%x%x%x%x%x$") then
+			slot = tonumber(head, 16) % #TAB_IDENTITY + 1
+		end
+	end
+	return TAB_IDENTITY[slot]
+end
+
+-- pane id -> colour. read_session_id is a file open, and the bar repaints every pane
+-- every second; the mapping only changes when a session starts in the pane.
+local identity_cache = {}
+local identity_cache_at = 0
+local identity_cache_generation = 0
+
+local function pane_identity(pane_id)
+	local now = os.time()
+	load_identity_pins()
+	if now - identity_cache_at > 10 or identity_cache_generation ~= identity_pins_generation then
+		identity_cache = {}
+		identity_cache_at = now
+		identity_cache_generation = identity_pins_generation
+	end
+	local hit = identity_cache[pane_id]
+	if hit ~= nil then
+		return hit ~= false and hit or nil
+	end
+	local colour = identity_of(read_session_id(pane_id))
+	identity_cache[pane_id] = colour or false
+	return colour
+end
+
+focused_identity = pane_identity
+
+-- Status is a dot. Only asking and fresh get a shape of their own, because those are the
+-- two you act on; everything else is the same ● in a different colour, which is what makes
+-- a tab of four panes read as one row rather than as four unrelated marks. Giving each
+-- state its own glyph was tried and it looked like punctuation.
+--
+-- The dot is also the whole of status in this bar now: the label text next to it belongs to
+-- identity. One shape and two colours per pane, and no background tints, which is as few
+-- things as this can be while still answering both questions.
+
 ---@return string colour, string marker, integer marker width in cells
 local function status_style(status, detail, active, budget)
 	if status == "asking" then
@@ -812,47 +999,73 @@ local function status_style(status, detail, active, budget)
 	return TAB_COLOURS[status] or TAB_COLOURS.waiting, "", 0
 end
 
----Cells this tab may spend, given every other tab in the window wants its share.
----Every tab keeps TAB_FLOOR first, so five tabs stay readable rather than two
----reading well and three falling off the end; only the room left over is shared,
----weighted by pane count, since a 4-way split has four topics to name and a lone
----pane has one. The weight is capped so one busy tab cannot take the lot.
-local function tab_share(tab, tabs)
+-- Prefix is " 1: ", or " 10: " past nine tabs. Budgeted at the wider one, so a tenth tab
+-- opening cannot make every label in the window one cell too long.
+local PREFIX_CELLS = 5
+
+---One label width for every pane in the window.
+---
+---This used to be a per-tab share, divided by that tab's pane count. Both halves were
+---defensible - a busy tab has more topics to name, a tab you are looking at is worth more
+---room - and together they made the same topic 13 cells wide in one tab and 18 in the next
+---for reasons that were completely invisible from the bar. Every pane getting the same
+---width turns out to be worth more than every tab getting a fair share, so the window is
+---divided at once and the answer never depends on which tab a pane sits in.
+---
+---Nothing is held back either: what is left after chrome, prefixes and dividers is split
+---between the panes on the bar, capped only at a whole topic each.
+---@return integer cells per label, 0 when not even a terse row fits
+local function label_width(tab, tabs)
 	local geom = tab_geometry[tab.tab_id]
 	if geom == nil then
-		-- Not measured yet: the first paint after a config reload runs before any
-		-- status tick, and tab_geometry resets with the rest of the file. Claim room
-		-- rather than guess narrow, so that frame shows labels and lets tab_max_width
-		-- clip if it must, instead of flashing a bar full of dots.
-		return math.huge
+		-- Not measured yet: the first paint after a config reload runs before any status
+		-- tick. Claim room rather than guess narrow, so that frame shows labels and lets
+		-- tab_max_width clip if it must, instead of flashing a bar full of dots.
+		return SOLO_BUDGET
 	end
-	local cols, reserve = geom.cols, geom.reserve
-	local count = math.max(1, (tabs and #tabs > 0) and #tabs or geom.tabs or 1)
-	local usable = math.max(count, cols - reserve - BAR_SLACK - count * TAB_CHROME)
-	local base = math.min(TAB_FLOOR, math.floor(usable / count))
-	local spare = usable - base * count
-	if tabs == nil or #tabs == 0 then -- no sibling list: share evenly
-		return base + math.floor(spare / count)
-	end
-	local total, mine = 0, 1
-	for _, other in ipairs(tabs) do
-		local weight = math.max(1, math.min(4, #(other.panes or {})))
-		total = total + weight
-		if other.tab_id == tab.tab_id then
-			mine = weight
+	local ntabs, npanes = 0, 0
+	if tabs ~= nil and #tabs > 0 then
+		for _, other in ipairs(tabs) do
+			ntabs = ntabs + 1
+			npanes = npanes + math.max(1, #(other.panes or {}))
 		end
+	else
+		ntabs = math.max(1, geom.tabs or 1)
+		npanes = math.max(ntabs, #(tab.panes or {}) * ntabs)
 	end
-	return base + math.floor(spare * mine / math.max(1, total))
+	-- one divider between panes inside a tab, so npanes - ntabs of them across the bar
+	local chrome = ntabs * (TAB_CHROME + PREFIX_CELLS) + (npanes - ntabs) + BAR_SLACK
+	local text = geom.cols - geom.reserve - chrome
+	if text < npanes then
+		return 0
+	end
+	local mine = math.max(1, #(tab.panes or {}))
+	return math.max(
+		1,
+		math.min(
+			SOLO_BUDGET,
+			math.floor(text / npanes),
+			-- never so wide that wezterm's own tab_max_width clips the tab back
+			math.floor((config.tab_max_width - PREFIX_CELLS - mine) / mine)
+		)
+	)
 end
 
 wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 	local prefix = " " .. (tab.tab_index + 1) .. ": "
 	local pinned = tab.tab_title or ""
+	local sep = pinned:find(TAB_GROUP_SEP, 1, true)
+	local group = sep and (pinned:sub(1, sep - 1):gsub("^%s+", ""):gsub("%s+$", "")) or ""
 
 	local ok, formatted = pcall(function()
-		local auto_pin = pinned:find(AUTO_TITLE_MARK, 1, true) ~= nil or has_claude_glyph(pinned)
+		local auto_pin = sep ~= nil
+			or pinned:find(AUTO_TITLE_MARK, 1, true) ~= nil
+			or has_claude_glyph(pinned)
+		-- A name typed without the separator is still a name, not an instruction to
+		-- drop every pane label, so it becomes the group. A tab with no Claude panes
+		-- builds no labels and falls through to the title exactly as typed.
 		if pinned ~= "" and not auto_pin then
-			return nil -- typed by hand: show it exactly as typed
+			group = pinned:gsub("^%s+", ""):gsub("%s+$", "")
 		end
 
 		-- A pane's is_active only means active *within its tab*, so all five tabs have
@@ -865,11 +1078,13 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 			local label, working, quiet = pane_label(pane)
 			if label then
 				local status, detail = pane_status(pane, working)
+				local fg = pane_identity(pane.pane_id)
 				table.insert(labels, {
 					text = label,
 					active = on_screen and pane.is_active,
 					status = status,
 					detail = detail,
+					identity = fg,
 				})
 			elseif quiet then
 				silent = silent + 1 -- a pane that exists but has not said what it is
@@ -883,25 +1098,33 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 		if zoomed then
 			local label, working = pane_label(tab.active_pane)
 			local status, detail = pane_status(tab.active_pane, working)
+			local zfg = pane_identity(tab.active_pane.pane_id)
 			labels = {
 				{
 					text = label or tab.active_pane.title or "",
 					active = on_screen,
 					status = status,
 					detail = detail,
+					identity = zfg,
 				},
 			}
 		end
 
 		local count = #labels
 		local marks = (silent > 0 and not zoomed) and #(" +" .. silent) or 0
-		-- what the panes could use, what wezterm allows, what the bar can spare
-		local cap = (count == 1) and SOLO_BUDGET or (MAX_LABEL * count + count - 1)
-		local avail = math.min(cap, max_width or cap, tab_share(tab, tabs))
-			- #prefix - 1 - (zoomed and 2 or 0) - marks
-		avail = math.max(count, avail)
-		-- panes share what is left, minus a divider between each
-		local per = math.floor((avail - (count - 1)) / count)
+		local per = label_width(tab, tabs)
+		-- Dropped when label_width has already said there is no room at all, so a name
+		-- can never resurrect a zero budget into a one-cell label.
+		local name = (group ~= "" and per > 0) and shorten(group, GROUP_LABEL) or ""
+		local name_cost = name ~= "" and (#name + 2) or 0
+		-- the +N, the name and the zoom arrow come out of the labels, not out of the bar
+		if marks > 0 or zoomed or name_cost > 0 then
+			per = math.max(1, per - math.ceil((marks + name_cost + (zoomed and 2 or 0)) / count))
+		end
+		-- What is left for a topic once a terse row has spent one cell per pane on its dot.
+		-- Must come off the row's own budget: taking it off the bar instead is how a tab
+		-- ends up wider than the share it was given and wezterm clips the lot.
+		local spare = per * count - count
 
 		local items = {
 			{ Attribute = { Intensity = "Normal" } },
@@ -909,18 +1132,31 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 			{ Text = zoomed and (prefix .. "⤢ ") or prefix },
 		}
 
-		if count > 1 and per < TERSE_LABEL then
-			-- Too tight to name every pane, so drop to one coloured glyph each: the
-			-- status is the part you cannot reconstruct by looking at the tab, and a
-			-- row of dots still says how many chats are in there and who wants you.
-			-- Whatever is left over goes to the focused pane's topic.
-			local spare = avail - count - 1
+		if name ~= "" then
+			-- Bold in the index's own grey, so the name reads as chrome beside the tab
+			-- number rather than as one more pane. No new hue: identity still means
+			-- only "which session is this".
+			table.insert(items, { Attribute = { Intensity = "Bold" } })
+			table.insert(items, { Text = name })
+			table.insert(items, { Attribute = { Intensity = "Normal" } })
+			table.insert(items, { Foreground = { Color = TAB_COLOURS.divider } })
+			table.insert(items, { Text = " │" })
+		end
+
+		if per == 0 or (count > 1 and per < TERSE_LABEL) then
+			-- Too tight to name every pane, so drop to one glyph each. These used to be
+			-- status dots, which said how many chats were in the tab and who wanted you
+			-- but never which chats - and in a nine-tab window of four-way splits this
+			-- row of dots is the entire tab bar, so "which" is what it has to carry.
+			-- The dot takes the pane's identity colour; the two statuses that actually
+			-- want you keep their own hue and their own shape (? blocked, ✓ just
+			-- finished), focus stays the shape ◆ rather than a colour, and a stale pane
+			-- stays grey because which chat it is has stopped mattering.
 			for _, label in ipairs(labels) do
 				local colour, marker = status_style(label.status, label.detail, label.active, 0)
 				table.insert(items, { Attribute = { Intensity = label.active and "Bold" or "Normal" } })
 				table.insert(items, { Foreground = { Color = colour } })
-				local glyph = marker ~= "" and marker or (label.active and "◆" or "●")
-				table.insert(items, { Text = glyph })
+				table.insert(items, { Text = marker ~= "" and marker or (label.active and "◆" or "●") })
 			end
 			if spare >= TERSE_LABEL then
 				-- one topic fits, so name whichever pane wants you rather than the one
@@ -931,9 +1167,8 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 						pick = label
 					end
 				end
-				local colour = status_style(pick.status, pick.detail, pick.active, 0)
 				table.insert(items, { Attribute = { Intensity = pick.active and "Bold" or "Normal" } })
-				table.insert(items, { Foreground = { Color = colour } })
+				table.insert(items, { Foreground = { Color = pick.identity or TAB_COLOURS.waiting } })
 				table.insert(items, { Text = " " .. shorten(strip_filler(pick.text), spare) })
 			end
 		else
@@ -948,10 +1183,19 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 				local text = (count > 1 or per < MIN_LABEL) and strip_filler(label.text) or label.text
 				local colour, marker, marker_width =
 					status_style(label.status, label.detail, label.active, per)
+				if marker == "" then
+					marker, marker_width = label.active and "◆" or "●", 1
+				end
+				-- The same dot as the terse row, then the name in the pane's own colour:
+				-- the dot is what it wants, the name is which one it is. Two colours and
+				-- one shape per pane, so a split tab still reads as a row.
 				table.insert(items, { Attribute = { Intensity = label.active and "Bold" or "Normal" } })
 				table.insert(items, { Foreground = { Color = colour } })
-				local shown = shorten(text, math.max(1, per - marker_width))
-				table.insert(items, { Text = marker .. shown })
+				-- a space after the dot: without it the status shape runs straight into
+				-- Claude's own topic and the two read as one word
+				table.insert(items, { Text = marker .. " " })
+				table.insert(items, { Foreground = { Color = label.identity or TAB_COLOURS.waiting } })
+				table.insert(items, { Text = shorten(text, math.max(1, per - marker_width - 1)) })
 			end
 		end
 
@@ -969,14 +1213,14 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 	if ok and formatted then
 		return formatted
 	end
-	local title = pinned:gsub(AUTO_TITLE_MARK, "")
+	local title = sep and group or (pinned:gsub(AUTO_TITLE_MARK, ""))
 	if title == "" then
 		title = tab.active_pane.title or ""
 	end
 	if title == "" then
 		title = pane_dir(tab.active_pane) or "…"
 	end
-	local room = math.min(SOLO_BUDGET, math.max(TERSE_LABEL, tab_share(tab, tabs) - #prefix - 1))
+	local room = math.max(TERSE_LABEL, label_width(tab, tabs))
 	return prefix .. shorten(title, room) .. " "
 end)
 
@@ -1072,7 +1316,7 @@ table.insert(config.keys, {
 -- ============================================================
 -- Claude: the fleet
 -- A tab bar indexes the window you are already looking at. Past a dozen conversations
--- across a dozen workspaces that is the wrong index, and no amount of tab_share fixes
+-- across a dozen workspaces that is the wrong index, and no amount of label_width fixes
 -- it: the session you want is usually not in this window at all. Two gaps follow, and
 -- this section closes both.
 --
@@ -1145,7 +1389,7 @@ local function fleet_choices()
 		for field in (line .. "\t"):gmatch("([^\t]*)\t") do
 			table.insert(f, field)
 		end
-		-- ws, pane, name, kind, asks, idle, pct, title, last
+		-- ws, pane, name, kind, asks, idle, pct, title, last, identity colour
 		local pane = tonumber(f[2])
 		if pane and f[3] ~= "" then
 			local asks = f[5] == "yes"
@@ -1159,6 +1403,7 @@ local function fleet_choices()
 				pct = f[7],
 				title = f[8],
 				last = f[9],
+				identity = (f[10] or ""):match("^#%x%x%x%x%x%x$"),
 				-- Waiting outranks working: one wants an answer, the other wants nothing.
 				weight = asks and 5 or (FLEET_WEIGHT[f[4]] or 0),
 			})
@@ -1193,7 +1438,9 @@ local function fleet_choices()
 			{ Text = marker .. " " },
 			{ Foreground = { Color = TAB_COLOURS.index } },
 			{ Text = fleet_pad(r.ws, 13) },
-			{ Foreground = { Color = colour } },
+			-- the name in the pane's own colour, the glyph above still in its state's:
+			-- scanning this list for "the teal one" is the whole point of having colours
+			{ Foreground = { Color = r.identity or colour } },
 			{ Text = fleet_pad(r.name, 19) },
 			{ Foreground = { Color = TAB_COLOURS.index } },
 			{ Text = fleet_pad(fleet_age(r.idle), 6) },

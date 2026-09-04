@@ -52,21 +52,51 @@
 set -u
 
 readonly FLEET="$HOME/.claude/bin/cc-fleet"
+# Sourced, not run: the palette and the hash have to agree with the tab bar and the
+# statusLine, and a fork per row is what the render path may not do.
+# shellcheck source=bin/cc-colour
+source "$HOME/.claude/bin/cc-colour" --lib
 readonly ROSTER_CACHE="$HOME/.claude/cache/fleet-rows"
 readonly PANE_MAP="$HOME/.claude/wezterm-sessions"
 readonly PANE_STATE="$HOME/.claude/wezterm-state"
 readonly US=$'\x1f'
 readonly STALE_SECS=$((8 * 3600))
+# Matches FRESH_SECONDS in wezterm.lua: the tab bar's ✓ and the board's have to age out
+# together, or the same session reads as just-finished in one and merely stopped in the other.
+readonly FRESH_SECS=90
 readonly REFRESH_SECS=6
 # How long a prompt cache lives. An hour for these sessions; override it if that changes.
 readonly CACHE_TTL=${CC_CACHE_TTL:-3600}
 NOW=0
+# The local offset, read alongside NOW rather than per row: every clock on the board is
+# integer arithmetic on the two, because a date(1) fork per row is what the render path may
+# not do. A timestamp from the far side of a DST change reads an hour out, which moves a day
+# name never and a clock face only on the two days a year after one.
+TZOFF=0
+DAYNAME=(Sun Mon Tue Wed Thu Fri Sat)
+MONNAME=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
+
+stamp_now() {
+	local s
+	s=$( { date '+%s %z'; } 2>/dev/null)
+	NOW=${s%% *}
+	[[ $NOW =~ ^[0-9]+$ ]] || NOW=0
+	s=${s##* }
+	if [[ $s =~ ^[+-][0-9][0-9][0-9][0-9]$ ]]; then
+		TZOFF=$((10#${s:1:2} * 3600 + 10#${s:3:2} * 60))
+		[[ ${s:0:1} == - ]] && TZOFF=$((-TZOFF))
+	fi
+}
 
 readonly BLUE=$'\033[38;2;135;215;250m'
 readonly MAUVE=$'\033[38;2;203;166;247m'
 readonly GREEN=$'\033[38;2;166;227;161m'
 readonly YELLOW=$'\033[38;2;249;226;175m'
 readonly ORANGE=$'\033[38;2;250;179;135m'
+# The tab bar's waiting colour, which is not Mocha peach: a stopped session and a
+# just-finished one are a hue apart there, and copying the glyphs without the hues would
+# leave ✓ and ● both yellow.
+readonly AMBER=$'\033[38;2;255;215;175m'
 readonly RED=$'\033[38;2;243;139;168m'
 readonly TEXT=$'\033[38;2;205;214;244m'
 # Three greys, not two, and all of them lighter than they were: the footer and the cold
@@ -99,7 +129,7 @@ cc-board - every Claude session in a workspace, on one screen
   cc-board --rows          start in rows rather than in the grid
   cc-board --once          print one frame and exit
   cc-board --watch         redraw on a loop, no keyboard
-  cc-board --tsv           workspace, pane, name, state, asks, idle, pct, title, last-line -
+  cc-board --tsv           ws, pane, name, state, asks, idle, pct, title, last-line, colour -
                            the enriched roster, for the wezterm pickers and for scripts
 
   h j k l  move            enter  jump to it          m  mark / unmark
@@ -474,7 +504,8 @@ scan_panes() {
 	E_ID=()
 	E_SINCE=()
 	E_HAVE=()
-	NOW=$(date +%s)
+	E_HKIND=()
+	stamp_now
 	scan_registry
 
 	while IFS="$US" read -r kind a b c d e f g; do
@@ -512,6 +543,10 @@ scan_panes() {
 			E_POS[n]=$((d * 100000 + e))
 			E_DIR[n]=$g
 			E_ID[n]=$SID
+			id_colour "$SID"
+			printf -v "sw_$a" '%s' "$IDC_ANSI"
+			printf -v "swm_$a" '%s' "$IDC_MUTED"
+			printf -v "swn_$a" '%s' "$IDC_NAME"
 			E_SINCE[n]=$PSINCE
 			E_TITLE[n]=$TOPIC
 			E_NAME[n]=""
@@ -520,6 +555,10 @@ scan_panes() {
 			working) E_KIND[n]=busy ;;
 			*) E_KIND[n]=idle ;;
 			esac
+			# Only what a hook actually wrote counts as a live reading. No state file leaves
+			# the idle above as a guess, and the roster is welcome to correct it.
+			E_HKIND[n]=""
+			[[ -n $PSTATE ]] && E_HKIND[n]=${E_KIND[n]}
 			E_DETAIL[n]=""
 			E_IDLE[n]=""
 			E_TURNS[n]=""
@@ -603,6 +642,7 @@ merge_roster() {
 			E_DIR[i]=""
 			E_ID[i]=""
 			E_SINCE[i]=0
+			E_HKIND[i]=""
 			E_TITLE[i]=""
 			E_LAST[i]=""
 			E_PCT[i]=""
@@ -610,7 +650,15 @@ merge_roster() {
 		fi
 		E_NAME[i]=$name
 		[[ -n $id ]] && E_ID[i]=$id
-		E_KIND[i]=$kind
+		# The roster's state is the registry's, cached; the hook files are written the instant
+		# a turn ends. Taking the roster's word for it unconditionally is what left a session
+		# showing as working for as long as the cache took to catch up - which with --stale-ok
+		# is not bounded by anything. So it names the state only where no hook wrote after the
+		# roster was assembled, and the stale-hook case still corrects itself, because a hook
+		# that stopped firing has an epoch that keeps falling further behind.
+		if [[ -z ${E_HKIND[i]:-} ]] || ((${E_SINCE[i]:-0} <= ROSTER_AT)); then
+			E_KIND[i]=$kind
+		fi
 		E_DETAIL[i]=$detail
 		E_IDLE[i]=$idle
 		E_TURNS[i]=$turns
@@ -634,7 +682,7 @@ merge_roster() {
 	done
 	UNCONFIRMED=$nextmiss
 	if ((k < ${#E_PANE[@]})); then
-		local P=() N=() K=() D=() I=() U=() T=() L=() C=() A=() W=() B=() BL=() O=() R=() H=() ID=() SN=()
+		local P=() N=() K=() D=() I=() U=() T=() L=() C=() A=() W=() B=() BL=() O=() R=() H=() ID=() SN=() HK=()
 		IDXMAP="|"
 		for ((n = 0; n < k; n++)); do
 			i=${keep[n]}
@@ -642,7 +690,7 @@ merge_roster() {
 			I[n]=${E_IDLE[i]}; U[n]=${E_TURNS[i]}; T[n]=${E_TITLE[i]}; L[n]=${E_LAST[i]}
 			C[n]=${E_PCT[i]}; A[n]=${E_ASKS[i]}; W[n]=${E_WS[i]}; B[n]=${E_TAB[i]}
 			BL[n]=${E_TABLABEL[i]}; O[n]=${E_POS[i]}; R[n]=${E_DIR[i]}; H[n]=${E_HAVE[i]}
-			ID[n]=${E_ID[i]}; SN[n]=${E_SINCE[i]}
+			ID[n]=${E_ID[i]}; SN[n]=${E_SINCE[i]}; HK[n]=${E_HKIND[i]:-}
 			IDXMAP="${IDXMAP}${P[n]}=${n}|"
 		done
 		E_PANE=(${P[@]+"${P[@]}"}); E_NAME=(${N[@]+"${N[@]}"}); E_KIND=(${K[@]+"${K[@]}"})
@@ -651,6 +699,7 @@ merge_roster() {
 		E_ASKS=(${A[@]+"${A[@]}"}); E_WS=(${W[@]+"${W[@]}"}); E_TAB=(${B[@]+"${B[@]}"})
 		E_TABLABEL=(${BL[@]+"${BL[@]}"}); E_POS=(${O[@]+"${O[@]}"}); E_DIR=(${R[@]+"${R[@]}"})
 		E_HAVE=(${H[@]+"${H[@]}"}); E_ID=(${ID[@]+"${ID[@]}"}); E_SINCE=(${SN[@]+"${SN[@]}"})
+		E_HKIND=(${HK[@]+"${HK[@]}"})
 	fi
 	ROSTER_MERGED=true
 	recompute_flags
@@ -671,7 +720,7 @@ recompute_flags() {
 		fi
 		is_cold "$i" && COLD=$((COLD + 1))
 	done
-	NOW=$(date +%s)
+	stamp_now
 	LOADED_AT=$NOW
 }
 
@@ -682,6 +731,19 @@ is_cold() {
 	[[ -z ${E_IDLE[i]} ]] && return 1
 	((${E_IDLE[i]} >= 0 && ${E_IDLE[i]} < STALE_SECS)) && return 1
 	return 0
+}
+
+# Stopped within the last FRESH_SECS, which is the tab bar's ✓. done_at is the same clock the
+# board already prints in the done column, so the two can never disagree; it is borrowed and
+# put back because emit_row reads DONE_AT for its own column further down the same row.
+is_fresh() {
+	local i=$1 keep=$DONE_AT rc=1
+	[[ ${E_ASKS[i]} == yes ]] && return 1
+	[[ ${E_KIND[i]} == busy ]] && return 1
+	done_at "$i"
+	((DONE_AT > 0 && NOW - DONE_AT < FRESH_SECS)) && rc=0
+	DONE_AT=$keep
+	return $rc
 }
 
 # One git call for the workspace, not one per session: they nearly all share a working tree,
@@ -700,6 +762,15 @@ refresh_git() {
 # Fetching the roster without waiting for it. Only ever needed on a cold cache, where
 # assembling it costs a second: with a cache on disk cc-fleet --stale-ok returns what it has
 # immediately and rebuilds behind us, so the synchronous path is the normal one.
+# When the roster in hand was assembled, which is the cache file's own mtime: cc-fleet serves
+# it at up to eight seconds old, and with --stale-ok at any age at all while it rebuilds
+# behind you. Without this the board had no way to tell a reading from a memory.
+ROSTER_AT=0
+stamp_roster() {
+	ROSTER_AT=$( { stat -f %m "$ROSTER_CACHE"; } 2>/dev/null) || ROSTER_AT=0
+	[[ $ROSTER_AT =~ ^[0-9]+$ ]] || ROSTER_AT=0
+}
+
 ROSTER_PENDING=false
 start_roster() {
 	rm -f "$work/roster" "$work/roster.part" 2>/dev/null
@@ -714,6 +785,7 @@ poll_roster() {
 	$ROSTER_PENDING || return 1
 	[[ -e "$work/roster" ]] || return 1
 	ROSTER_PENDING=false
+	stamp_roster
 	merge_roster "$(<"$work/roster")"
 	refresh_git
 	return 0
@@ -722,6 +794,10 @@ poll_roster() {
 fetch_roster() {
 	$ROSTER_PENDING && return
 	if [[ -r $ROSTER_CACHE ]]; then
+		# Stamped before the call, not after: --stale-ok hands back what is on disk and may
+		# rewrite it behind us, and dating these rows by that rewrite would make a memory
+		# look like a reading.
+		stamp_roster
 		merge_roster "$("$FLEET" --tsv --stale-ok 2>/dev/null | tr '\t' "$US")"
 		refresh_git
 	else
@@ -799,6 +875,64 @@ set_age() {
 	elif ((s < 5400)); then printf -v AGE '%dm' $((s / 60))
 	elif ((s < 172800)); then printf -v AGE '%dh' $((s / 3600))
 	else printf -v AGE '%dd' $((s / 86400)); fi
+}
+
+# Days since 1970-01-01 to a calendar day and month (Hinnant's civil_from_days). Integer
+# only, because a clock older than a week wants a date on it and date(1) is a fork.
+CD=0
+CM=0
+civil_from_days() {
+	local z=$(($1 + 719468)) era doe yoe doy mp
+	era=$(((z >= 0 ? z : z - 146096) / 146097))
+	doe=$((z - era * 146097))
+	yoe=$(((doe - doe / 1460 + doe / 36524 - doe / 146096) / 365))
+	doy=$((doe - (365 * yoe + yoe / 4 - yoe / 100)))
+	mp=$(((5 * doy + 2) / 153))
+	CD=$((doy - (153 * mp + 2) / 5 + 1))
+	CM=$((mp < 10 ? mp + 3 : mp - 9))
+}
+
+# When a session last stopped, on the clock rather than in the relative age beside it: the
+# same "done 16:40" Claude prints at the foot of its own pane, which is the form you can hold
+# against a memory of the afternoon in a way "20h" never is. A previous day takes its name in
+# front; past a week a day name stops being unambiguous, so it becomes a date.
+DONE=""
+set_done() {
+	local at=$1 full=${2:-} secs day today hh mm
+	DONE=""
+	[[ $at =~ ^[0-9]+$ ]] && ((at > 0)) || return
+	secs=$((at + TZOFF))
+	day=$((secs / 86400))
+	today=$(((NOW + TZOFF) / 86400))
+	printf -v hh '%02d' $((secs % 86400 / 3600))
+	printf -v mm '%02d' $((secs % 3600 / 60))
+	if ((day >= today)); then
+		DONE="${hh}:${mm}"
+	elif ((today - day < 7)); then
+		DONE="${DAYNAME[(day + 4) % 7]} ${hh}:${mm}"
+	else
+		civil_from_days "$day"
+		DONE="${CD} ${MONNAME[CM - 1]}"
+		[[ -n $full ]] && DONE="${DONE} ${hh}:${mm}"
+	fi
+}
+
+# Which epoch that clock reads. The hook file first: it is stamped the moment a turn ends and
+# matches what the pane itself prints, to the minute. The registry's statusUpdatedAt only as a
+# fallback, for a session no hook ever wrote for. Nothing at all while a session is working -
+# it has not finished, and a start time under a "done" heading would be a lie.
+DONE_AT=0
+done_at() {
+	local i=$1 k
+	DONE_AT=0
+	[[ ${E_KIND[i]} == busy ]] && return
+	if ((${E_SINCE[i]:-0} > 0)); then
+		DONE_AT=${E_SINCE[i]}
+		return
+	fi
+	[[ -n ${E_ID[i]} ]] || return
+	k="ck_${E_ID[i]//-/_}"
+	[[ ${!k:-} =~ ^[0-9]+$ ]] && DONE_AT=${!k}
 }
 
 # Context as the resource bar it is: how much of the window is spent, amber past half, red
@@ -1045,25 +1179,95 @@ build_visible() {
 
 # ---------------------------------------------------------------- state glyph and colour
 
+# The identity colour, resolved once at load and stored per pane. It goes on the name,
+# which is the row's identity field and was grey; the state glyph and the topic keep the
+# status colours, so the two questions never share a mark.
+IDCOL=""
+IDMUTED=""
+set_idcol() {
+	local i=$1 key
+	IDCOL=$FAINT
+	IDMUTED=$FAINT
+	[[ ${E_PANE[i]} == [0-9]* ]] || return
+	key="sw_${E_PANE[i]}"
+	[[ -n ${!key:-} ]] && IDCOL=${!key}
+	key="swm_${E_PANE[i]}"
+	[[ -n ${!key:-} ]] && IDMUTED=${!key}
+}
+
+# How many panes in a group share their hue with another pane in the same group. Ten hues
+# over forty sessions makes this common, and inside one tab it is the one case where the
+# colour stops identifying anything - so name it, since it is also the case a pin fixes.
+CLASH=0
+group_clash() {
+	local start=$1 end=$2 a b ka kb ha hb
+	CLASH=0
+	for ((a = start; a < end; a++)); do
+		ka="swn_${E_PANE[${IDX[a]}]}"
+		ha=${!ka:-}
+		[[ -n $ha ]] || continue
+		for ((b = start; b < end; b++)); do
+			((b == a)) && continue
+			kb="swn_${E_PANE[${IDX[b]}]}"
+			hb=${!kb:-}
+			[[ $ha == "$hb" ]] && {
+				CLASH=$((CLASH + 1))
+				break
+			}
+		done
+	done
+}
+
+# One heading, clipped. A tab you have named yourself with LEADER+, can be longer than a
+# narrow board, and a heading that wraps costs the frame a line and leaves every row under it
+# one out of place - which is the same failure as a frame that does not fit its pane.
+GHEAD=""
+group_heading() {
+	local g=$1 start=$2 end=$3 name tail max
+	group_clash "$start" "$end"
+	tail=" · $((end - start))"
+	((CLASH > 0)) && tail="${tail} · ${CLASH} alike"
+	name=${GROUP_NAME[g]}
+	max=$((COLS - 2 - ${#tail}))
+	((max < 4)) && max=4
+	((${#name} > max)) && name="${name:0:max - 1}…"
+	GHEAD="${FAINT}  ${name}${RULE}${tail}${RESET}"
+}
+
+# The tab bar's alphabet, exactly: status is a dot, and only the two states that want
+# something of you get a shape - ? blocked on a prompt, ✓ finished in the last minute and a
+# half. Five different glyphs was tried in the bar and read as punctuation; a row of panes
+# only scans as a row when the shape is constant and the colour varies, and the board's strip
+# is that same row. › stays because the bar has no shell panes to have an opinion about.
 GLYPH=""
 COLOUR=""
+STATE=""
 style_of() {
 	local i=$1
 	if [[ ${E_ASKS[i]} == yes ]]; then
-		GLYPH="⚠"
+		STATE=asking
+		GLYPH="?"
 		COLOUR=$MAUVE
 	elif [[ ${E_KIND[i]} == busy ]]; then
-		GLYPH="◐"
+		STATE=working
+		GLYPH="●"
 		COLOUR=$GREEN
 	elif [[ ${E_KIND[i]} == shell ]]; then
+		STATE=shell
 		GLYPH="›"
 		COLOUR=$DIM
+	elif is_fresh "$i"; then
+		STATE=fresh
+		GLYPH="✓"
+		COLOUR=$YELLOW
 	elif is_cold "$i"; then
-		GLYPH="·"
+		STATE=cold
+		GLYPH="●"
 		COLOUR=$FAINT
 	else
-		GLYPH="✳"
-		COLOUR=$YELLOW
+		STATE=waiting
+		GLYPH="●"
+		COLOUR=$AMBER
 	fi
 }
 
@@ -1172,32 +1376,44 @@ PCT_W=0
 CACHE_W=0
 LAST_W=0
 LABEL_W=20
+# "Tue 16:40", the widest form the clock takes in a row. Ten cells with its gap, which the
+# topic can spare down to about seventy-six columns and not below - LEADER+b opens the board
+# as an unzoomed half-split, so those middle widths are the common case and not an edge one.
+# Narrower than that, the block under the cursor is the only place it fits.
+DONE_W=0
+# cursor, mark, state glyph, space
+readonly PREFIX_W=4
 row_widths() {
+	local dw
 	CACHE_W=1
 	((COLS < 40)) && CACHE_W=0
+	DONE_W=0
+	((COLS >= 76)) && DONE_W=9
+	dw=0
+	((DONE_W > 0)) && dw=$((DONE_W + 1))
 	if ((COLS >= 120)); then
 		NAME_W=16 AGE_W=5 BAR_W=10 PCT_W=4
 		LABEL_W=40
-		LAST_W=$((COLS - 4 - NAME_W - 1 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1 - PCT_W - LABEL_W - 2))
+		LAST_W=$((COLS - PREFIX_W - NAME_W - 1 - 1 - CACHE_W - AGE_W - dw - 1 - BAR_W - 1 - PCT_W - LABEL_W - 2))
 		((LAST_W < 24)) && {
 			LABEL_W=$((LABEL_W + LAST_W - 24))
 			LAST_W=24
 		}
 	elif ((COLS >= 96)); then
 		NAME_W=16 AGE_W=5 BAR_W=10 PCT_W=4 LAST_W=0
-		LABEL_W=$((COLS - 4 - NAME_W - 1 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1 - PCT_W - 1))
+		LABEL_W=$((COLS - PREFIX_W - NAME_W - 1 - 1 - CACHE_W - AGE_W - dw - 1 - BAR_W - 1 - PCT_W - 1))
 	elif ((COLS >= 64)); then
 		NAME_W=0 AGE_W=5 BAR_W=8 PCT_W=4 LAST_W=0
-		LABEL_W=$((COLS - 4 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1 - PCT_W - 1))
+		LABEL_W=$((COLS - PREFIX_W - 1 - CACHE_W - AGE_W - dw - 1 - BAR_W - 1 - PCT_W - 1))
 	elif ((COLS >= 44)); then
 		NAME_W=0 AGE_W=5 BAR_W=6 PCT_W=0 LAST_W=0
-		LABEL_W=$((COLS - 4 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1))
+		LABEL_W=$((COLS - PREFIX_W - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1))
 	elif ((COLS >= 32)); then
 		NAME_W=0 AGE_W=4 BAR_W=4 PCT_W=0 LAST_W=0
-		LABEL_W=$((COLS - 4 - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1))
+		LABEL_W=$((COLS - PREFIX_W - 1 - CACHE_W - AGE_W - 1 - BAR_W - 1))
 	else
 		NAME_W=0 AGE_W=3 BAR_W=0 PCT_W=0 LAST_W=0
-		LABEL_W=$((COLS - 4 - 1 - CACHE_W - AGE_W - 1))
+		LABEL_W=$((COLS - PREFIX_W - 1 - CACHE_W - AGE_W - 1))
 	fi
 	((LABEL_W < 6)) && LABEL_W=6
 }
@@ -1220,6 +1436,16 @@ row_label() {
 BODY=()
 push() { BODY[${#BODY[@]}]=$1; }
 
+# A grid line on its own says nothing about how far down the fleet it is - a cell is two lines
+# and a heading belongs to the cells under it. LINE_POS records, per line, the position of the
+# first session in the unit it is part of, which is what makes a scroll window snap to whole
+# cells and what lets "N more above" count sessions rather than lines.
+LINE_POS=()
+gpush() {
+	LINE_POS[${#BODY[@]}]=$1
+	BODY[${#BODY[@]}]=$2
+}
+
 emit_row() {
 	local pos=$1 i=$2 line cursor mark bg meta labelcol
 	style_of "$i"
@@ -1238,16 +1464,19 @@ emit_row() {
 	meta=$AGE
 	row_label "$i"
 	labelcol=$TEXT
-	[[ $GLYPH == "·" ]] && labelcol=$FAINT
-	[[ $GLYPH == "·" && -n $bg ]] && labelcol=$DIM
+	[[ $STATE == cold ]] && labelcol=$FAINT
+	[[ $STATE == cold && -n $bg ]] && labelcol=$DIM
 	[[ ${E_ASKS[i]} == yes ]] && labelcol=$MAUVE
 
-	line="${bg}${BLUE}${cursor}${DIM}${mark}${COLOUR}${GLYPH} ${labelcol}"
+	set_idcol "$i"
+	line="${bg}"
+	if [[ $cursor == " " ]]; then line+="${BLUE}${cursor}"; else line+="${IDCOL}${cursor}"; fi
+	line+="${DIM}${mark}${COLOUR}${GLYPH} ${labelcol}"
 	pad_to "$ROWLABEL" "$LABEL_W"
 	line+="$PAD"
 	if ((NAME_W > 0)); then
 		pad_to "${E_NAME[i]}" "$NAME_W"
-		line+=" ${FAINT}${PAD}"
+		line+=" ${IDCOL}${PAD}"
 	fi
 	line+=" "
 	# One cell for whether the prompt cache is still alive. Marked when it is, rather than
@@ -1261,6 +1490,15 @@ emit_row() {
 	line+="${DIM}"
 	pad_left "$meta" "$AGE_W"
 	line+="$PADL"
+	# Right of the age and reading the same weight, because the two answer one question
+	# between them: how long since you last spoke to it, and the hour it stopped. Blank while
+	# a session is working, so a lit cell here means finished and nothing else does.
+	if ((DONE_W > 0)); then
+		done_at "$i"
+		set_done "$DONE_AT"
+		pad_left "$DONE" "$DONE_W"
+		line+=" ${PADL}"
+	fi
 	if ((BAR_W > 0)); then
 		set_ctxbar "${E_PCT[i]}" "$BAR_W"
 		line+=" ${CTXBAR}${bg}"
@@ -1282,7 +1520,7 @@ emit_row() {
 # as the rows below it having gone strange. Content first and the address last: the topic
 # and the closing line are what you came to read, the name is what you use afterwards.
 emit_expansion() {
-	local i=$1 w=$((COLS - 6)) meta="" seg line n col
+	local i=$1 w=$((COLS - 6)) meta="" seg line n col huekey
 	((w < 12)) && w=$((COLS - 4))
 	((w < 10)) && return
 
@@ -1337,6 +1575,20 @@ emit_expansion() {
 		fi
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
 	fi
+	# Ahead of everything else here because on a narrow board this is the only place the
+	# clock appears at all, and full: a session a fortnight old gets its date, not a day name
+	# that could mean either of two Tuesdays.
+	done_at "$i"
+	if ((DONE_AT > 0)); then
+		set_done "$DONE_AT" full
+		seg=" · done ${DONE}"
+		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
+	fi
+	huekey="swn_${E_PANE[i]}"
+	if [[ -n ${!huekey:-} ]]; then
+		seg=" · ${!huekey}"
+		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
+	fi
 	cache_left_of "${E_ID[i]}"
 	if ((CACHE_LEFT >= 60)); then
 		seg=" · cache $((CACHE_LEFT / 60))m left"
@@ -1363,7 +1615,8 @@ emit_expansion() {
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
 	fi
 	pad_to "$meta" "$w"
-	push "${SELECTED}    ${FAINT}${PAD}  ${RESET}"
+	set_idcol "$i"
+	push "${SELECTED}    ${IDMUTED}${PAD}  ${RESET}"
 }
 
 FRAME=""
@@ -1384,7 +1637,8 @@ fill_body() {
 		end=${GROUP_START[g + 1]}
 		((end > start)) || continue
 		((g > 0)) && $blanks && push ""
-		push "${FAINT}  ${GROUP_NAME[g]}${RULE} · $((end - start))${RESET}"
+		group_heading "$g" "$start" "$end"
+		push "$GHEAD"
 		for ((pos = start; pos < end; pos++)); do
 			i=${IDX[pos]}
 			((pos == selected)) && SEL_FIRST=${#BODY[@]}
@@ -1463,6 +1717,10 @@ build_grid() {
 	build_header
 	FRAME=$HEADER
 	ROW_START=()
+	BODY=()
+	LINE_POS=()
+	SEL_FIRST=-1
+	SEL_LAST=-1
 
 	if ((${#IDX[@]} == 0)); then
 		FRAME+="${EOL}"$'\n'"${DIM}  nothing here${RESET}${EOL}"$'\n'
@@ -1475,13 +1733,19 @@ build_grid() {
 	# was half empty on one row and clipped on the next; together they fill line one and
 	# hand the whole width of line two to what Claude actually said.
 	local g pos start end i col l1 l2 cursor bg mark meta bar_w name_w topic_w msg_w
+	local done_w rowfirst cap total first last above below
 	bar_w=10
 	name_w=16
 	((cell_w < 44)) && {
 		bar_w=6
 		name_w=12
 	}
+	# The clock costs eleven cells out of the topic, which a narrow cell has not got: below
+	# sixty the topic is already the thing being squeezed and it is worth more here.
+	done_w=0
+	((cell_w >= 60)) && done_w=9
 	topic_w=$((cell_w - 5 - name_w - 6 - bar_w - 5))
+	((done_w > 0)) && topic_w=$((topic_w - done_w - 2))
 	((topic_w < 8)) && topic_w=8
 	# The message line is "  ▸ " plus the text, and that prefix is four cells: budgeting the
 	# text at cell_w - 6 made every message line two columns narrower than its name line, so
@@ -1492,12 +1756,14 @@ build_grid() {
 		start=${GROUP_START[g]}
 		end=${GROUP_START[g + 1]}
 		((end > start)) || continue
-		FRAME+="${FAINT}  ${GROUP_NAME[g]}${RULE} · $((end - start))${RESET}${EOL}"$'\n'
+		group_heading "$g" "$start" "$end"
+		gpush "$start" "$GHEAD"
 
 		pos=$start
 		while ((pos < end)); do
 			l1=""
 			l2=""
+			rowfirst=$pos
 			ROW_START[${#ROW_START[@]}]=$pos
 			for ((col = 0; col < per_row && pos < end; col++, pos++)); do
 				i=${IDX[pos]}
@@ -1522,11 +1788,21 @@ build_grid() {
 					l2+="${RULE} │ ${RESET}"
 				fi
 
-				l1+="${bg}${BLUE}${cursor}${DIM}${mark}${COLOUR}${GLYPH} "
+				set_idcol "$i"
+				l1+="$bg"
+				if [[ $cursor == " " ]]; then l1+="${BLUE}${cursor}"; else l1+="${IDCOL}${cursor}"; fi
+				l1+="${DIM}${mark}${COLOUR}${GLYPH} ${IDCOL}"
 				pad_to "${E_NAME[i]:-pane ${E_PANE[i]}}" "$name_w"
 				l1+="${PAD}${DIM}"
-				pad_to "$meta" 6
-				l1+="${PAD}${CTXBAR}${bg}${DIM} "
+				pad_left "$meta" 5
+				l1+="${PADL} "
+				if ((done_w > 0)); then
+					done_at "$i"
+					set_done "$DONE_AT"
+					pad_left "$DONE" "$done_w"
+					l1+="${PADL}  "
+				fi
+				l1+="${CTXBAR}${bg}${DIM} "
 				pad_to "${E_PCT[i]:+${E_PCT[i]}%}" 4
 				l1+="${PAD} ${COLOUR}"
 				pad_to "${E_TITLE[i]}" "$topic_w"
@@ -1547,10 +1823,56 @@ build_grid() {
 				l2+="${PAD}${RESET}"
 
 			done
-			FRAME+="${l1}${EOL}"$'\n'"${l2}${EOL}"$'\n'
+			((selected >= rowfirst && selected < pos)) && SEL_FIRST=${#BODY[@]}
+			gpush "$rowfirst" "$l1"
+			gpush "$rowfirst" "$l2"
+			((selected >= rowfirst && selected < pos)) && SEL_LAST=$((${#BODY[@]} - 1))
 		done
 	done
 	ROW_START[${#ROW_START[@]}]=${#IDX[@]}
+
+	# The grid used to write every cell it had and let the pane deal with it. A fleet of
+	# thirty is seventy lines, so in any pane shorter than that the top scrolled off the
+	# alternate screen - and once it had, ESC[H no longer addressed the first line of the
+	# frame, so the in-place repaint painted over the wrong rows and left last minute's text
+	# standing. Both of the things that looked like "it did not load" were this.
+	cap=$((ROWS - HEADER_LINES - FOOTER_LINES))
+	((cap < 3)) && cap=3
+	total=${#BODY[@]}
+	first=$SCROLL
+	above=0
+	below=0
+	if ((total <= cap)); then
+		first=0
+	else
+		((SEL_FIRST >= 0 && SEL_FIRST < first)) && first=$SEL_FIRST
+		((SEL_LAST >= 0 && SEL_LAST >= first + cap)) && first=$((SEL_LAST - cap + 1))
+		((first + cap > total)) && first=$((total - cap))
+		((first < 0)) && first=0
+		while ((first > 0)) && ((LINE_POS[first] == LINE_POS[first - 1])); do
+			first=$((first - 1))
+		done
+	fi
+	((first > 0)) && above=1
+	SCROLL=$first
+	last=$((first + cap - above))
+	((last > total)) && last=$total
+	if ((last < total)); then
+		below=1
+		last=$((last - 1))
+		while ((last > first)) && ((LINE_POS[last] == LINE_POS[last - 1])); do
+			last=$((last - 1))
+		done
+	fi
+	((last < first)) && last=$first
+
+	((above > 0)) &&
+		FRAME+="${FAINT}  ↑ ${LINE_POS[first]} more above${RESET}${EOL}"$'\n'
+	for ((pos = first; pos < last; pos++)); do
+		FRAME+="${BODY[pos]}${EOL}"$'\n'
+	done
+	((below > 0)) &&
+		FRAME+="${FAINT}  ↓ $((${#IDX[@]} - LINE_POS[last])) more below${RESET}${EOL}"$'\n'
 	frame_footer "$footer"
 }
 
@@ -1583,11 +1905,17 @@ HELPNOTES=(
 
 showhelp=false
 build_help() {
-	local kw=10 line k d entry
+	local kw=10 line k d entry cap left
 	build_header
 	FRAME=$HEADER
 	((COLS < 46)) && kw=8
+	# The keys before the notes, and both inside the pane. A help screen that overruns puts
+	# its own top off the alternate screen and takes the repaint with it, which is a poor way
+	# to answer "what does this do".
+	cap=$((ROWS - HEADER_LINES - FOOTER_LINES))
+	left=$cap
 	for entry in "${HELPKEYS[@]}"; do
+		((left > 0)) || break
 		k=${entry%%|*}
 		d=${entry#*|}
 		pad_to "$k" "$kw"
@@ -1595,11 +1923,17 @@ build_help() {
 		pad_to "$d" $((COLS - kw - 4))
 		line+="${DIM}${PAD}${RESET}"
 		FRAME+="${line}${EOL}"$'\n'
+		left=$((left - 1))
 	done
-	FRAME+="${EOL}"$'\n'
+	((left > ${#HELPNOTES[@]})) && {
+		FRAME+="${EOL}"$'\n'
+		left=$((left - 1))
+	}
 	for entry in "${HELPNOTES[@]}"; do
+		((left > 0)) || break
 		pad_to "$entry" $((COLS - 4))
 		FRAME+="${FAINT}  ${PAD}${RESET}${EOL}"$'\n'
+		left=$((left - 1))
 	done
 	frame_footer "any key to go back"
 }
@@ -1646,6 +1980,7 @@ readonly KEYS_NARROW="j k move · ⏎ jump · / find · ? keys · q quit"
 load_all() {
 	scan_panes
 	run_tails
+	stamp_roster
 	merge_roster "$("$FLEET" --tsv --stale-ok 2>/dev/null | tr '\t' "$US")"
 	refresh_git
 }
@@ -1660,9 +1995,12 @@ if [[ $mode == tsv ]]; then
 		# A row still inside its grace period has no roster entry yet, so no name and no
 		# age. The pickers key on the name, so it is not a row for them.
 		[[ -n ${E_NAME[i]} ]] || continue
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		# Field 10 is the identity hex, so the wezterm pickers colour their name column
+		# the same way the board does rather than working the palette out again in Lua.
+		id_colour "${E_ID[i]}"
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 			"${E_WS[i]}" "${E_PANE[i]}" "${E_NAME[i]}" "${E_KIND[i]}" "${E_ASKS[i]}" \
-			"${E_IDLE[i]}" "${E_PCT[i]}" "${E_TITLE[i]}" "${E_LAST[i]}"
+			"${E_IDLE[i]}" "${E_PCT[i]}" "${E_TITLE[i]}" "${E_LAST[i]}" "#${IDC_HEX}"
 	done
 	exit 0
 fi
