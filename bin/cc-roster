@@ -1,131 +1,212 @@
 #!/bin/bash
-# Who is alive, what state they are in, and which pane holds them. No titles.
-#
-# cc-peers used to be the only answer to that, and it costs 1.4s: a jq per registry
-# file, an `ls -t` over the pane map per session, and a transcript tail per session to
-# work out a title. Titles are the expensive part and almost nothing needs them - a
-# name resolves to a pane without one, and so do tree, top, grep and every wz target.
-# So the cheap half lives here and cc-peers adds titles on top of it.
+# Who is alive, what state, which pane. No titles: cc-peers adds those on top.
 #
 # Columns: sid, name, status, detail, pane, cwd, pid, seen_ms, started_ms
-# `pane` is "-" when no wezterm pane holds the session. `detail` is what the session
-# says it is blocked on, and is empty unless it is blocked.
+# pane is "-" when no wezterm pane holds the session; detail is empty unless blocked.
 
 set -u
 
 readonly REGISTRY="$HOME/.claude/sessions"
+# Between former names inside one field: tab is taken and a name can hold a space.
+readonly US=$'\x1f'
 readonly PANE_MAP="$HOME/.claude/wezterm-sessions"
 readonly PANE_STATE="$HOME/.claude/wezterm-state"
+readonly DIGEST="$HOME/.claude/cache/fleet-digest"
 
 usage() {
 	cat <<'USAGE'
 cc-roster - live Claude sessions, their state and their pane, without titles
 
   cc-roster            sid, name, status, detail, pane, cwd, pid, seen, started
-  cc-roster --pane <name>    just the pane id holding <name>
+  cc-roster --pane <target>  just the pane id holding <target>
+  cc-roster --sid <target>   just the session id of <target>
+  cc-roster --row <target>   the whole row for <target>
   cc-roster --name <pane>    just the session name in <pane>
+  cc-roster --digest         write the registry half, keyed by pane, for ~/.wezterm.lua
 
-The roster cc-peers builds costs 1.4s because it works out a title for every session.
-Nothing that resolves an address needs one, so this is the same answer in ~30ms.
+A <target> is a session name, a name that session used to have, a pane id or a session
+id. Names match the way Claude matches them - case-insensitively, with runs of spaces
+folded to hyphens - so `bash-command-execution` reaches a session called "bash command
+execution", and an address that has since been renamed still lands.
+
+--digest writes ~/.claude/cache/fleet-digest and prints nothing:
+
+  #<epoch>
+  <pane>  <sid>  <status>  <waitingFor>  <seen_ms>
+
+The hook states are left out: wezterm.lua reads those per pane already.
 USAGE
 }
 
 mode=all
 want=""
+aliases=""
 case ${1:-} in
---pane) mode=pane; want=${2:-}; [[ -n $want ]] || { echo "cc-roster: --pane needs a name" >&2; exit 2; } ;;
---name) mode=name; want=${2:-}; [[ -n $want ]] || { echo "cc-roster: --name needs a pane" >&2; exit 2; } ;;
+--pane | --sid | --row | --name)
+	mode=${1#--}
+	want=${2:-}
+	[[ -n $want ]] || { echo "cc-roster: $1 needs a target" >&2; exit 2; }
+	;;
+--digest) mode=digest ;;
 -h | --help) usage; exit 0 ;;
 "") ;;
 *) usage >&2; exit 2 ;;
 esac
 
-# One jq over every registry file rather than one per file: 34 forks was 76ms of the
-# 1.4s, and jq streams multiple inputs as separate documents for free.
-#
-# "waiting" is a real registry status and it means the session is asking you something;
-# waitingFor says what. It arrived after the readers were written, so anything that
-# switches on status has to be told about it or the one session that actually wants you
-# ranks below thirty idle ones.
+# Former names ride as a tenth column only where they are resolved: cc-peers reads nine.
+case $mode in
+pane | sid | row) aliases=1 ;;
+esac
+
+# Mirrors Claude's resolver, which SendMessage uses too: names are keyed trimmed,
+# lowercased, whitespace folded to hyphens, and a former name (only those from the
+# conversation the session is still in; the jq cuts to those) resolves when nothing
+# current does. A current name beats a former one; a former name two live sessions
+# share resolves to neither, because picking one silently briefs the wrong pane.
+match_name() {
+	awk -F'\t' -v want="$1" -v out="$2" -v us="$US" '
+	function norm(s) {
+		gsub(/^ +| +$/, "", s); s = tolower(s); gsub(/ +/, "-", s); return s
+	}
+	function pick() {
+		if (out > 0) return $out
+		return $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8 "\t" $9
+	}
+	BEGIN { w = norm(want) }
+	{
+		if (hit == "" && norm($2) == w) hit = pick()
+		if ($10 == "") next
+		n = split($10, a, us)
+		for (i = 1; i <= n; i++)
+			if (norm(a[i]) == w) { alias = pick(); who = $2; nalias++; break }
+	}
+	END {
+		if (hit != "") { print hit; exit 0 }
+		if (nalias == 1) {
+			printf "cc-roster: \"%s\" is now \"%s\"\n", want, who > "/dev/stderr"
+			print alias
+			exit 0
+		}
+		if (nalias > 1)
+			printf "cc-roster: \"%s\" is a former name of %d live sessions; say which\n", \
+				want, nalias > "/dev/stderr"
+		exit 1
+	}'
+}
+
+# Pane and session ids cannot drift, so they match as themselves. out 0 is the row.
+resolve() {
+	local want=$1 out=$2
+	local col=""
+	case $want in
+	*[!0-9]*) ;;
+	*) col=5 ;;
+	esac
+	case $want in
+	????????-????-????-????-????????????) col=1 ;;
+	esac
+	[[ -n $col ]] || { match_name "$want" "$out"; return; }
+	awk -F'\t' -v v="$want" -v c="$col" -v out="$out" -v OFS='\t' '
+		$c == v {
+			if (out > 0) print $out
+			else print $1, $2, $3, $4, $5, $6, $7, $8, $9
+			found = 1; exit
+		}
+		END { if (!found) exit 1 }'
+}
+
+# waitingFor is what a "waiting" session is asking. The name is emitted as its key, so
+# nothing downstream shows an address with a space in it.
 registry=$(jq -r '
-	select(.pid and .sessionId and .name)
-	| [ (.sessionId), (.name), (.status // "?"), (.waitingFor // ""),
+	def key: (. // "") | ascii_downcase
+		| sub("^\\s+"; "") | sub("\\s+$"; "") | gsub("\\s+"; "-");
+	. as $r
+	| select(.pid and .sessionId and .name)
+	| [ (.sessionId), (.name | key), (.status // "?"), (.waitingFor // ""),
 	    (.cwd // ""), (.pid | tostring),
 	    ((.statusUpdatedAt // .updatedAt // 0) | tostring),
-	    ((.startedAt // 0) | tostring) ]
+	    ((.startedAt // 0) | tostring),
+	    ([ (.formerNames // [])[]
+	       | select(.sessionId == $r.sessionId) | .name | key ] | join("\u001f")) ]
 	| @tsv' "$REGISTRY"/*.json 2>/dev/null)
 
 [[ -n $registry ]] || exit 0
 
-# Every pid on the machine, once. A dead pid leaves its registry file behind, and an
-# address that will never answer is worse than no address at all. The obvious version
-# of this is `kill -0` in a bash loop, which cannot be fed tab-separated fields: tab is
-# IFS whitespace, so an empty `detail` folds and shifts the rest of the row left until
-# a millisecond timestamp arrives where the pid should be. One ps and a join in awk has
-# no separator to get wrong.
-# awk -v cannot carry a multi-line value, so the two joined tables go through files,
-# the same way cc-fleet passes its own.
+# A dead pid leaves its registry file behind. One ps joined in awk rather than kill -0
+# in a bash loop, which cannot read tab-separated rows with an empty field.
 work=$(mktemp -d) || exit 1
 trap 'rm -rf "$work"' EXIT
 
 ps -axo pid= | tr -d ' ' >"$work/pids"
 printf '%s\n' "$registry" >"$work/registry"
 
-# sid -> pane, from the SessionStart hook's map. The map is keyed by pane and a stale
-# pane can still name a session that has since moved, so the newest file wins; ls -t
-# gives that order and awk reads the files in the order it is handed them.
-#
-# One awk over every file rather than a bash loop of $(<file): a command substitution
-# forks a subshell on bash 3.2, and two hundred of those was 114ms of the 136 this
-# whole script used to cost.
+# sid -> pane. A stale pane can still name a session that has moved, so newest file wins.
 (cd "$PANE_MAP" 2>/dev/null && ls -t 2>/dev/null | tr '\n' '\0' |
 	xargs -0 awk 'FNR == 1 { print $0 "\t" FILENAME }' 2>/dev/null) >"$work/panes"
 
-# The Notification hook is the only thing that knows a pane is sitting on a permission
-# prompt, and it never fires again to say the prompt was answered - so it wins only
-# while it is the newer of the two writes. Same rule cc-peers has always used.
-#
-# Resolving an address needs none of this, so --pane and --name skip it entirely.
-if [[ $mode == all ]]; then
+case $mode in
+all | row)
 	(cd "$PANE_STATE" 2>/dev/null && ls 2>/dev/null | tr '\n' '\0' |
 		xargs -0 awk 'FNR == 1 { print FILENAME "\t" $0 }' 2>/dev/null) >"$work/states"
-else
-	: >"$work/states"
-fi
+	;;
+*) : >"$work/states" ;;
+esac
 
-# Three tables into one row set. Kept in awk because bash 3.2 has no associative
-# arrays and the alternative is a variable per session id.
+# A hook record wins while it is newer than the registry: nothing fires when a prompt
+# is answered. An idle registry never overrules errored or parked, since idle is what
+# both look like from outside. Hook stamps seconds, registry ms: +1 so a same-second
+# hook wins the tie. parked reports as busy: the turn is over, its background work is not.
 awk -F'\t' -v OFS='\t' -v panefile="$work/panes" \
-	-v statefile="$work/states" -v pidfile="$work/pids" '
+	-v statefile="$work/states" -v pidfile="$work/pids" -v aliases="$aliases" '
 BEGIN {
+	srand(); now = srand()
 	while ((getline line < pidfile) > 0) alive[line + 0] = 1
 	while ((getline line < panefile) > 0) {
 		if (split(line, f, "\t") < 2) continue
-		if (!(f[1] in pane)) pane[f[1]] = f[2]   # newest file first, so first wins
+		if (!(f[1] in pane)) pane[f[1]] = f[2]
 	}
 	while ((getline line < statefile) > 0) {
-		if (split(line, f, "\t") < 3) continue
+		n = split(line, f, "\t")
+		if (n < 3) continue
 		hook_state[f[1]] = f[2]; hook_at[f[1]] = f[3]; hook_detail[f[1]] = f[4]
+		# parked has no writer when the background work ends, so it expires (CLAUDE.md)
+		if (f[2] == "parked" && now - f[3] > (f[4] == "monitor" ? 3600 : 14400))
+			hook_state[f[1]] = "done"
+		# No sid on records older than the stamp: trusted rather than dropped.
+		hook_sid[f[1]] = (n >= 5) ? f[5] : ""
 	}
 }
 {
 	sid = $1; name = $2; status = $3; detail = $4; cwd = $5; pid = $6
-	seen = $7; started = $8
+	seen = $7; started = $8; former = $9
 	if (!(pid + 0 in alive)) next
 	pn = (sid in pane) ? pane[sid] : "-"
-	if (pn != "-" && (pn in hook_state)) {
-		# Epochs against milliseconds: the registry stamps ms, the hook stamps seconds.
-		if (hook_state[pn] == "asking" && hook_at[pn] * 1000 > seen) {
-			status = "asking"
+	if (pn != "-" && (pn in hook_state) && (hook_sid[pn] == "" || hook_sid[pn] == sid)) {
+		hs = hook_state[pn]
+		newer = (hook_at[pn] + 1) * 1000 > seen
+		if ((hs == "asking" && newer) || (hs == "errored" && (newer || status == "idle"))) {
+			status = hs
 			if (hook_detail[pn] != "") detail = hook_detail[pn]
+		} else if (hs == "parked" && (newer || status == "idle")) {
+			status = "busy"
 		}
 	}
-	print sid, name, status, detail, pn, cwd, pid, seen, started
+	if (aliases) print sid, name, status, detail, pn, cwd, pid, seen, started, former
+	else print sid, name, status, detail, pn, cwd, pid, seen, started
 }' "$work/registry" | sort -t$'\t' -k9,9n |
 	case $mode in
-	pane) awk -F'\t' -v n="$want" '$2 == n { print $5; found = 1; exit }
-	      END { if (!found) exit 1 }' ;;
+	pane) resolve "$want" 5 ;;
+	sid) resolve "$want" 1 ;;
+	row) resolve "$want" 0 ;;
 	name) awk -F'\t' -v p="$want" '$5 == p { print $2; found = 1; exit }
 	      END { if (!found) exit 1 }' ;;
+	digest)
+		# Written whole then renamed, so the one-second Lua reader never sees half a file.
+		mkdir -p "${DIGEST%/*}" 2>/dev/null
+		{
+			printf '#%s\n' "$(date +%s)"
+			awk -F'\t' -v OFS='\t' '$5 != "-" { print $5, $1, $3, $4, $8 }'
+		} >"$DIGEST.$$" && mv -f "$DIGEST.$$" "$DIGEST" || rm -f "$DIGEST.$$"
+		;;
 	*) cat ;;
 	esac

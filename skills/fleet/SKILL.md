@@ -25,25 +25,51 @@ Costs are output tokens, which is the budget that matters: you pay them every ca
 | a whole pane's screen | `wz read <name>` | ~3600 |
 | what a session is *about* | `cc-peers` | ~660 |
 | name → pane, for scripts | `cc-roster` | ~1060 |
+| enough to **continue** its work | `cc-handover <name>` | ~260-900 |
+| ...two sessions at once | `cc-handover a b` | ~1150 |
+| ...the rest of this tab | `cc-handover .tab` | the same |
+| only the sessions on this tab | add `--tab` to any cc-fleet | scoped, so less |
 
 `cc-fleet --brief` also names any session past 60% of its context window, fullest first,
 because that is the fact that leads somewhere: `cc-handover --new` is what to do about
 it, and nothing else says when to reach for it.
 
+**"Catch me up on what they were doing" is `cc-handover`, not a pane read.** It is the
+bottom half of that table and it is the branch of this skill people arrive at by asking
+for stdout. Measured on two real sessions: the merged brief was 4,583 characters against
+8,923 for both full screens, so it is *cheaper* than the naive answer and it carries the
+last prompt, the queued messages, the branch, the files touched and the transcript path,
+where a screen has already scrolled past all five. Size tracks the session, not the tool.
+Reach for `wz read` when the question is genuinely what is *on* that screen.
+
+**No read here wakes a session.** Every one of them goes via Claude's own files or
+wezterm's screen buffer, so it costs the session nothing and cannot interrupt a turn.
+Exactly three things touch a pane: `cc-handover --to <pane>` (pastes, unsent), `--new`
+and `cc-spawn` (open a new pane, leave the source alone), and SendMessage. So never ask a
+session what it is doing when reading it is free and silent.
+
 **Start with `cc-fleet --brief`.** It answers the usual question in 20 tokens; the other
 five cost 30-100x that for information nobody asked for. Reach past it only when you need
 a field it does not carry, and prefer `--tsv` to `--json` when you do.
 
-`--tsv` columns: `workspace, window, tab_id, pane, name, state, blocked_on, idle_seconds,
-your_turns, dir, title, id`.
+`--tsv` columns, **no header row**: `workspace, window, tab_id, pane, name, state,
+blocked_on, idle_seconds, your_turns, dir, title, id`.
+
+**`--tab` scopes any of them to the sessions sharing this pane's tab**: `cc-fleet --tab`,
+`--tab --brief`, `--tab --tsv`. "The other panes here" is how the question actually gets
+asked, and without it the answer costs the whole machine plus an awk on `tab_id`. It is a
+modifier, not a mode, and it narrows the counts and footers too.
 
 Three things about that data:
 
 - **`idle_seconds` is time since *Jacob* last prompted it**, not since it did anything.
   `-1` means never - usually a handover nobody read. An agent talking to itself for an
   hour does not make the work live.
-- **`state` is `busy`, `idle`, `shell`, `asking` or `waiting`.** The last two both mean
-  stopped and wanting an answer; `blocked_on` says what.
+- **`state` is `busy`, `idle`, `shell`, `errored`, `asking` or `waiting`.** The last two
+  both mean stopped and wanting an answer; `blocked_on` says what, and on a `waiting` it
+  is the session's own word for it: `permission prompt` and `input needed` want Jacob now,
+  `dialog open` and `sandbox request` are a different kind of stuck, `worker request` is
+  not about him at all.
 - **`idle` does not mean finished.** The Stop hook fires whether a session finished or
   stopped to ask. `wz last <name>` is the check: it reads the transcript rather than the
   screen, so it still works after the pane has scrolled, and it costs ~60 tokens against
@@ -61,6 +87,8 @@ cc-handover --new                  # fresh session in a pane to the right, seede
 cc-handover --new --tab            # also --window, --down
 cc-handover d5-lca-48 --new        # a different session
 cc-handover d5-lca-08 d5-lca-65 --new   # two sessions' work continuing as one
+cc-handover .tab                   # every other live session on this tab
+cc-handover .tab --new --window    # the whole tab's work continuing in one session
 cc-handover --why 'context full' --new
 cc-handover                        # print the brief, spawn nothing
 cc-handover --to 7                 # paste into an open pane, unsent
@@ -78,6 +106,17 @@ agent's are attributed to it, and task-notifications are dropped. Anything over 
 characters keeps both ends and says how much was cut, so a pasted document does not get
 re-ingested whole.
 
+`.tab` is the same target grammar as `.`, and it means every *other* live session on this
+pane's tab, in wezterm's own left-to-right order, skipping panes holding no session. It
+exists because "hand me the rest of this tab" otherwise takes three calls and a join.
+
+**`--dry-run` is now genuinely dry.** It was not, with `--tab` or `--window`: those two
+reach cc-spawn as bare words, cc-spawn's parser breaks on the first bare word and takes
+the rest of the line as the prompt, so `--dry-run` was swallowed and a real session
+opened and started work. The default `--right` path was always fine, which is why it went
+unnoticed. Fixed at the caller, but the shape of it is worth remembering: **a bare word in
+a cc-spawn argument list ends the options.**
+
 Nothing is lost: `claude --resume <id>` reopens the old session. Ask before closing it.
 **A session can hand itself over** - if you are near full, run it and say where the work
 went.
@@ -89,8 +128,17 @@ cc-spawn 'read src/auth.ts and list every path that skips the guard'
 cc-spawn --tab --cwd ~/work/api 'run the failing test and say why'
 cc-spawn --shell                   # a plain pane to watch something in
 cc-spawn --ask '...'               # leave permission prompts on
+cc-spawn --worktree=auth-guard '...'    # its own checkout, its own branch
 cc-spawn --dry-run '...'
 ```
+
+**`--worktree` when two sessions would otherwise edit the same repo at once.** Claude
+Code makes it at `<repo>/.claude/worktrees/<name>` on `worktree-<name>`, locks it for the
+life of the session, and copies gitignored files listed in `.worktreeinclude`. Opt-in:
+several sessions in one checkout is the normal way of working here, and it only stops
+being fine when they write at the same time - at which point nothing in the tree says
+which of the dirty files belongs to whom. Needs a git repo; cc-spawn checks before it
+opens the pane rather than letting claude fail in a pane nobody is watching.
 
 Spawned sessions run with `--dangerously-skip-permissions`, which is how Jacob runs every
 agent. `--ask` is the way out of that, and there is rarely a reason for it.
@@ -137,7 +185,11 @@ Otherwise use `status` when you park work or are blocked on something off-machin
 ## Rules
 
 - **Never kill a pane whose state is `busy`, `asking` or `waiting`.** One is mid-turn,
-  the others hold a prompt open.
+  the others hold a prompt open. `busy` now also covers a session whose turn is over but
+  whose own background work is not, so this is stricter than it looks.
+- **`errored` means the turn died on an API error**, usually a rate limit, and Claude
+  Code does not retry it. The session is fine; it needs a nudge to carry on. `cc-fleet
+  --brief` names the error kind in brackets.
 - **Confirm before anything mutating** - killing, moving, retitling, handing into a pane
   that already has something in it. Name the sessions and say what will happen, then
   wait. Reading is free; rearranging someone's desk is not.
@@ -154,6 +206,13 @@ Otherwise use `status` when you park work or are blocked on something off-machin
   session writes again.
 - Duplicate session names happen. SendMessage reaches whichever is listed first - flag it
   rather than guessing.
+- **A name can move.** Claude renames a session on a collision, on `/rename`, and on a
+  resume; background sessions get named after their task. Every tool here takes the old
+  name too and says `cc-roster: "x" is now "y"` on stderr when you use one, so pass that
+  on rather than swallowing it. A name Claude built from a task has spaces in it, and
+  every tool here shows and takes the folded form instead - `bash-command-execution` -
+  which SendMessage accepts too. What never moves is the session id, which is what
+  `cc-note` is keyed by.
 - Every script needs links in **both** `~/.claude/bin` and `~/.local/bin`; only the
   second is on PATH, and the failure is silent because hooks call by full path.
 - Nine identity hues over forty sessions, so colours repeat. `cc-board` flags a tab where

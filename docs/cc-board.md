@@ -62,9 +62,13 @@ too, dropping the notes before the keys. Check both axes after touching a layout
 
 ## the tab bar
 
-Label width is **one number per window**, not a share per tab. `label_width` takes what is
-left after chrome, prefixes and dividers and divides it by the panes on the bar, capped at a
-whole topic each. Every label in a window is therefore the same width.
+Label width comes from **whichever ceiling the live tab bar actually imposes**, and the two
+bars impose different ones, so `label_width` branches on `FANCY`. Under the fancy bar the
+ceiling is per tab and the panes share it between themselves; under the retro bar there is
+no per-tab ceiling and every pane on the bar shares one width. Either way the panes
+water-fill within their budget - a topic short enough to fit hands its surplus to one that
+does not - and the cap stays a single number, so no two clipped labels ever clip at
+different widths for reasons invisible from the bar.
 
 The predecessor shared the bar per tab, weighted by pane count, and then divided by pane
 count again. Every part of that was defensible - a 4-way split has four topics to name, the
@@ -86,6 +90,47 @@ Three things had also been quietly throwing space away:
 
 Together: 47 -> 96 cells in the wide windows, and zero spread within every window.
 
+Then three more, found from the other end - a nine-tab window clipping nine of ten topics
+with the right third of the bar visibly empty, and a three-way split showing two of its
+three panes:
+
+- **the bar is not measured in terminal cells.** The fancy tab bar draws in
+  `window_frame.font` at `window_frame.font_size`, Roboto Bold 12 by default on macOS,
+  against a JetBrains Mono 14 terminal. Every width was counted in one unit and spent in
+  the other, so the bar was about a fifth wider than the arithmetic believed. `FRAME_CELLS`
+  converts, out of the two point sizes and the two advance widths, shaded by
+  `FRAME_MARGIN` because a proportional font has no exact answer. The frame font is now
+  pinned rather than left to the default, so a wezterm upgrade cannot move the constant's
+  premise. Point it at a monospace font and both factors become 1.0.
+- **a flat share cannot give space back.** `Call patching process` was handed the same 33
+  cells as a 59 character topic and the twelve it could not use went nowhere. Water-filling
+  spends them on the topics that are long instead.
+- **the binding constraint was never in this file.** `fancy_tab_bar.rs` sets
+  `elem.max_width` on every tab to `pixel_width / num_tabs - 1.5 cells`, counting the
+  new-tab button in the divisor. It is not conditional on the bar being full, so a tab can
+  never use more than its equal share however little its neighbours want, and *no* way of
+  dividing the whole bar between panes could have reached it. That is why the two symptoms
+  had two different causes: single-pane tabs were short because of the unit and the flat
+  share, and the split tab was losing a pane to a ceiling nothing here knew about. It is
+  also why raising `tab_max_width` to 320 changed nothing - in fancy mode wezterm sets that
+  aside entirely (`tab_width_max = usize::MAX.min(tab_max_width)`).
+
+On a 429 column nine-tab window, per label: **31 -> 41** cells for a single-pane tab, and a
+three-way split went from two panes visible to three at 13 each.
+
+**The frame font size is the width lever**, because that ceiling is in pixels: every point
+off `FRAME_FONT_SIZE` is characters back, 10.0 buying 51 and 16 against 12.0's 41 and 13.
+It stays at 12.0 because 10 reads too small on this display, and an unreadable tab bar is
+not a wider one.
+
+The retro bar was tried as the other way out and is a trade, not a win: no per-tab ceiling
+at all while the whole bar fits, which suits a split-heavy window, but it draws in the
+terminal font, so the bar holds 429 cells rather than about 508, every pane shares those,
+and the text is bigger and harder to read for it. `use_fancy_tab_bar = false` switches both
+the bar and `label_width`'s model, and the retro path is kept working for exactly that.
+
 What is still not solved: ten tabs in a 111 column window cannot show topics at all - the
 `N: ` prefixes alone are 50 of those columns. It renders as a row of status dots, which is
-the honest answer, and identity is carried by the pane tint instead.
+the honest answer, and identity is carried by the pane tint instead. Nor can anything here
+buy a split tab more than its ninth of a nine-tab bar; that one is wezterm's rule, and the
+levers on it are the frame font size, the retro bar, or fewer tabs.

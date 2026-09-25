@@ -1,34 +1,21 @@
 #!/bin/bash
-# Move work from a session that is full to one that is empty.
-#
-# The manual version of this is scrolling up, copying the last message, opening a pane
-# and pasting it, which loses everything that was not on screen: what you actually
-# asked, which branch it was on, which files it had open, what it had told itself to
-# remember. All of that is already on disk in the transcript and in cc-note, so none of
-# it needs regenerating - this reads it and hands it over.
-#
-# The brief is written to a file *and* handed to the new session inline. Inline so the
-# work starts without a tool call; on disk so it can be reread, reused, or given to a
-# second session when the first one also fills up. It names the source transcript too,
-# because the whole conversation is still there and a successor that can go and look is
-# strictly better than one holding a copy of the last screen.
+# Move work from a session that is full to one that is empty, out of what is already on
+# disk: the transcript and cc-note. The brief goes inline, so work starts without a tool
+# call, and to a file, so it can be reread or handed on again. It names the transcript,
+# because a successor that can go and look beats one holding a summary.
 
 set -u
 
 readonly FLEET="$HOME/.claude/fleet"
 readonly OUT="$FLEET/handover"
-# The tail that gets parsed. Transcripts reach 13MB and the useful part is the end;
-# 400KB is comfortably several turns even when they are long.
+# Transcripts reach 13MB; the useful part is the end.
 readonly TAIL_BYTES=400000
-# What goes inline as the new session's opening prompt. Past this the brief still
-# names the file, and the successor reads the rest itself.
+# Past this inline, the new session is handed the file path instead.
 readonly INLINE_MAX=12000
-# Assistant messages shorter than this are scaffolding between tool calls, not findings.
+# Shorter assistant messages are scaffolding between tool calls, not findings.
 readonly TRIVIAL_TEXT=160
-# A prompt can be a paste of a whole document. The instruction in it is worth carrying;
-# the payload is not, and re-ingesting it is exactly what handing over is meant to avoid.
-# Head and tail rather than head alone: an instruction sits before a paste about as often
-# as it sits after one.
+# A prompt can be a pasted document. Head and tail, because the instruction sits before
+# a paste about as often as after it.
 readonly CLIP_MAX=1100
 readonly CLIP_HEAD=650
 
@@ -46,7 +33,8 @@ cc-handover - hand a session's work to a fresh one
   --turns N     how many substantive replies to carry (default 3)
   --why <text>  a line saying why the work moved
 
-T is a session name, a session id, a pane id, or "." for this session.
+T is a session name, a session id, a pane id, "." for this session, or ".tab" for every
+other live session on this pane's tab.
 
 The brief carries the last prompt, the last few replies, the working directory and
 branch, the files recently touched, and anything cc-note is holding. It also names the
@@ -56,6 +44,8 @@ work from a summary of it.
   cc-handover --new                      hand this session over, fresh pane to the right
   cc-handover d5-lca-48 --new --tab      the same for another session, on its own tab
   cc-handover --why 'context full' --new
+  cc-handover .tab                       catch up on the rest of this tab, print only
+  cc-handover .tab --new --window        the whole tab's work continuing in one session
 USAGE
 }
 
@@ -64,8 +54,6 @@ die() {
 	exit 1
 }
 
-# Keep both ends of anything over CLIP_MAX and say what was dropped. The transcript path
-# goes in the brief, so the successor can read the whole thing if the middle mattered.
 clip() {
 	local text=$1 n=${#1} tail_len
 	if ((n <= CLIP_MAX)); then
@@ -95,7 +83,7 @@ while (($#)); do
 	--up) split="--top" ;;
 	--tab) split="tab" ;;
 	--window) split="window" ;;
-	--turns) shift; turns=${1:-2} ;;
+	--turns) shift; turns=${1:-3} ;;
 	--why) shift; why=${1:-} ;;
 	-h | --help) usage; exit 0 ;;
 	-*) die "unknown option $1" ;;
@@ -107,39 +95,61 @@ case $turns in '' | *[!0-9]*) die "--turns needs a number" ;; esac
 
 # --- who ----------------------------------------------------------------------------
 
-resolve_one() {
-	local t=$1
+# One cc-roster call per target, which settles the address and gives the row at once.
+# A session id or "." that is no longer live still hands over, from its transcript.
+row_for() {
+	local t=$1 row
 	if [[ -z $t || $t == . ]]; then
 		[[ -n ${CLAUDE_CODE_SESSION_ID:-} ]] ||
 			die "no target given and CLAUDE_CODE_SESSION_ID is unset"
-		printf '%s' "$CLAUDE_CODE_SESSION_ID"
-		return
+		t=$CLAUDE_CODE_SESSION_ID
 	fi
-	case $t in
-	????????-????-????-????-????????????) printf '%s' "$t"; return ;;
-	esac
-	local sid
-	case $t in
-	*[!0-9]*) sid=$(cc-roster 2>/dev/null | awk -F'\t' -v n="$t" '$2 == n { print $1; exit }') ;;
-	*) sid=$(cc-roster 2>/dev/null | awk -F'\t' -v p="$t" '$5 == p { print $1; exit }') ;;
-	esac
-	[[ -n $sid ]] || die "no live session called \"$t\" (try: cc-roster)"
-	printf '%s' "$sid"
+	row=$(cc-roster --row "$t")
+	if [[ -z $row ]]; then
+		case $t in
+		????????-????-????-????-????????????)
+			printf -v row '%s\t%s\t\t\t-\t%s' "$t" "$t" "$PWD"
+			;;
+		*) die "no live session called \"$t\" (try: cc-roster)" ;;
+		esac
+	fi
+	printf '%s' "$row"
 }
 
-# Everything one session contributes, appended to the brief. Sets LEAD_* for the first
-# target, which is the one the new pane is opened beside and takes its directory from.
+# ".tab": every other live session on this pane's tab, in wezterm's order for the tab.
+tab_siblings() {
+	local tab panes out
+	[[ -n ${WEZTERM_PANE:-} ]] || die ".tab needs WEZTERM_PANE; run it from a wezterm pane"
+	panes=$(wezterm cli list --format json 2>/dev/null |
+		jq -r --argjson me "${WEZTERM_PANE}" '
+			(map(select(.pane_id == $me)) | first | .tab_id) as $t
+			| .[] | select(.tab_id == $t and .pane_id != $me) | .pane_id')
+	[[ -n $panes ]] || die ".tab: pane $WEZTERM_PANE is the only pane on its tab"
+	# awk -v cannot carry a newline.
+	panes=${panes//$'\n'/,}
+	out=$(cc-roster 2>/dev/null | awk -F'\t' -v list="$panes" '
+		BEGIN { n = split(list, want, ",") }
+		{ nm[$5] = $2 }
+		END {
+			for (i = 1; i <= n; i++)
+				if (want[i] != "" && want[i] in nm) print nm[want[i]]
+		}')
+	[[ -n $out ]] || die ".tab: no other live sessions on this tab"
+	printf '%s\n' "$out"
+}
+
+# One session's section of the brief, from its roster row. LEAD_* is the first target:
+# the new pane opens beside it and takes its directory.
 LEAD_CWD=""
 LEAD_PANE=""
 LEAD_NAME=""
 
 render_session() {
-	local sid=$1 name cwd pane transcript title last_prompt last_prompt_at queued
+	local sid name cwd pane transcript title last_prompt last_prompt_at queued
 	local replies files branch dirty note tailfile
 
-	IFS=$'\x1f' read -r name cwd pane < <(
-		cc-roster 2>/dev/null | awk -F'\t' -v s="$sid" \
-			'$1 == s { printf "%s\x1f%s\x1f%s", $2, $6, $5; exit }'
+	IFS=$'\x1f' read -r sid name cwd pane < <(
+		printf '%s\n' "$1" | awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s", $1, $2, $6, $5 }'
 	)
 	: "${name:=$sid}" "${cwd:=$PWD}" "${pane:=-}"
 	if [[ -z $LEAD_CWD ]]; then
@@ -148,7 +158,6 @@ render_session() {
 		LEAD_NAME=$name
 	fi
 
-	# The slug is bash's own substitution rather than a sed: identical output, no fork.
 	transcript="$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}/$sid.jsonl"
 	[[ -r $transcript ]] ||
 		transcript=$(ls -t "$HOME"/.claude/projects/*/"$sid.jsonl" 2>/dev/null | head -1)
@@ -161,11 +170,8 @@ render_session() {
 		END { if (c != "") print c; else if (a != "") print a }' "$tailfile" |
 		jq -r '.customTitle // .aiTitle // empty' 2>/dev/null)
 
-	# The real user turn, not the "last-prompt" record beside it: that one is Claude's
-	# own UI copy and arrives already truncated with an ellipsis, which is exactly the
-	# detail a successor needs in full. Grepped out of the whole transcript rather than
-	# the tail, because a long turn pushes the prompt that started it well past 400KB
-	# back. One grep over a 1.4MB file is 13ms.
+	# The real user turn, not the "last-prompt" record, which arrives truncated. From the
+	# whole transcript: a long turn pushes its prompt well past the tail.
 	grep '"type":"user"' "$transcript" 2>/dev/null | tail -400 >"$tailfile.users"
 	last_prompt=$(jq -r 'select((.isMeta // false) | not)
 		| .message.content
@@ -181,27 +187,14 @@ render_session() {
 	[[ -n $last_prompt ]] || last_prompt=$(grep '"type":"last-prompt"' "$tailfile" |
 		tail -1 | jq -r '.lastPrompt // empty' 2>/dev/null)
 
-	# Anything typed while the turn was still running lands as a queue-operation rather
-	# than a user turn, so it is invisible to every "last prompt" reader - and it is
-	# usually the steer that changed what the work was. Queued system messages land the
-	# same way and are not: a <task-notification> presented under "then you said" is
-	# both noise and a lie, so anything opening with "<" is dropped, the same rule the
-	# user-turn extraction uses.
-	# Three kinds of thing land in the queue and they are not interchangeable. Across
-	# 735 transcripts here: 890 task-notifications, 761 messages from Jacob, and 511
-	# from other agents. Dropping everything that opens with "<" threw away that last
-	# quarter, which is the half of the traffic that carries actual work.
-	#
-	# Jacob's own words, kept as his. Another agent's kept as theirs and attributed -
-	# a peer handover read as a user instruction is a lie about who decided what.
-	# Task notifications dropped: an artifact-changed event under "then you said" is
-	# noise and a lie at once.
+	# Typed mid-turn lands as a queue-operation, not a user turn, and is usually the steer
+	# that changed the work. Your words are kept as yours; another agent's are attributed,
+	# since a peer handover read as your instruction misstates who decided; anything else
+	# opening with "<" (task notifications) is dropped.
 	queued=$(grep '"type":"queue-operation"' "$transcript" 2>/dev/null | tail -100 |
 		jq -r --arg since "$last_prompt_at" \
 			--argjson max "$CLIP_MAX" --argjson head "$CLIP_HEAD" '
-			# Rendered here rather than in the shell because a message is many lines
-			# and a shell read splits on them, which would put the attribution on the
-			# first line of a peer message and orphan the rest.
+			# Rendered in jq: a shell read would split a many-line message.
 			def clip: if (length <= $max) then .
 				else .[0:$head]
 					+ "\n\n[... " + ((length - $max) | tostring)
@@ -222,7 +215,6 @@ render_session() {
 			  elif startswith("<") then empty
 			  else (clip | quote) + "\n" end' 2>/dev/null | awk '!seen[$0]++')
 
-	# Anything under TRIVIAL_TEXT is a transition rather than a result.
 	replies=$(jq -r --argjson min "$TRIVIAL_TEXT" 'select(.type == "assistant")
 		| [ .message.content[]? | select(.type == "text") | .text ] | join("")
 		| select(length > $min)' "$tailfile" 2>/dev/null | tail -n "$turns")
@@ -231,7 +223,8 @@ render_session() {
 		| select(.type == "tool_use")
 		| select(.name == "Edit" or .name == "Write" or .name == "NotebookEdit")
 		| .input.file_path // .input.notebook_path // empty' "$tailfile" 2>/dev/null |
-		sort -u | tail -12)
+		awk '{ at[$0] = NR } END { for (f in at) print at[f] "\t" f }' |
+		sort -n | tail -12 | cut -f2-)
 
 	branch=""
 	dirty=""
@@ -240,7 +233,7 @@ render_session() {
 		[[ -n $branch ]] && dirty=$(git -C "$cwd" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
 	fi
 
-	note=$(cc-note show --for "$sid" 2>/dev/null | sed -e $'s/\033\\[[0-9;]*m//g' | tail -n +2)
+	note=$(cc-note show --for "$sid" --bare 2>/dev/null)
 
 	{
 		printf '## From %s' "$name"
@@ -272,12 +265,34 @@ render_session() {
 
 ((${#targets[@]})) || targets=(.)
 
+# Expanded first, so the section count is real. Command substitution, not process
+# substitution: die in the latter would leave an empty target list.
+if [[ " ${targets[*]} " == *" .tab "* ]]; then
+	sibs=$(tab_siblings) || exit 1
+	expanded=()
+	for t in "${targets[@]}"; do
+		if [[ $t == .tab ]]; then
+			while IFS= read -r nm; do
+				[[ -n $nm ]] && expanded+=("$nm")
+			done <<<"$sibs"
+		else
+			expanded+=("$t")
+		fi
+	done
+	targets=("${expanded[@]}")
+fi
+
+rows=()
+for t in "${targets[@]}"; do
+	row=$(row_for "$t") || exit 1
+	rows+=("$row")
+done
+
 mkdir -p "$OUT" 2>/dev/null
 stamp=$(date '+%Y%m%d-%H%M%S')
-first_sid=$(resolve_one "${targets[0]}") || exit 1
-first_name=$(cc-roster 2>/dev/null | awk -F'\t' -v s="$first_sid" '$1 == s { print $2; exit }')
-: "${first_name:=$first_sid}"
+first_name=$(printf '%s\n' "${rows[0]}" | cut -f2)
 file="$OUT/$first_name-$stamp.md"
+[[ -e $file ]] && file="$OUT/$first_name-$stamp-$$.md"
 : >"$file"
 
 {
@@ -298,9 +313,8 @@ file="$OUT/$first_name-$stamp.md"
 	fi
 } >>"$file"
 
-for t in "${targets[@]}"; do
-	sid=$(resolve_one "$t") || exit 1
-	render_session "$sid"
+for row in "${rows[@]}"; do
+	render_session "$row"
 done
 
 printf 'This brief is saved at `%s`.\n' "$file" >>"$file"
@@ -313,8 +327,6 @@ name=$LEAD_NAME
 
 brief=$(<"$file")
 if ((${#brief} > INLINE_MAX)); then
-	# Too long to hand over inline, so hand over the pointer. The successor reads it,
-	# which is one tool call and no truncation.
 	brief="Read $file and continue that work. It is a handover brief from a session
 that ran out of room; it names the source transcript if you need more than it carries."
 fi
@@ -329,7 +341,7 @@ print)
 to)
 	pane_to=$to
 	case $to in
-	*[!0-9]*) pane_to=$(cc-roster 2>/dev/null | awk -F'\t' -v n="$to" '$2 == n { print $5; exit }') ;;
+	*[!0-9]*) pane_to=$(cc-roster --pane "$to") ;;
 	esac
 	[[ -n $pane_to && $pane_to != "-" ]] || die "--to: no pane for \"$to\""
 	wezterm cli send-text --pane-id "$pane_to" -- "$brief"
@@ -338,11 +350,12 @@ to)
 new)
 	[[ $pane != "-" || $split == window ]] ||
 		die "$name has no pane to split from; use --window"
-	# cc-spawn owns starting a session, including clearing the inherited Claude
-	# environment - without which the new session saves no transcript and could never
-	# be handed over itself.
-	spawn=(cc-spawn --cwd "$cwd" "$split")
-	[[ $pane != "-" ]] && spawn=(cc-spawn --cwd "$cwd" --from "$pane" "$split")
+	# cc-spawn clears the inherited Claude environment. It must get --tab, not tab: its
+	# parser takes the first bare word as the start of the prompt.
+	spawn_where=$split
+	case $split in tab | window) spawn_where="--$split" ;; esac
+	spawn=(cc-spawn --cwd "$cwd" "$spawn_where")
+	[[ $pane != "-" ]] && spawn=(cc-spawn --cwd "$cwd" --from "$pane" "$spawn_where")
 	$dry && spawn+=(--dry-run)
 	new=$("${spawn[@]}" -- "$brief") || exit 1
 	if $dry; then

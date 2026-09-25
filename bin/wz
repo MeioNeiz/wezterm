@@ -1,29 +1,22 @@
 #!/bin/bash
-# wezterm's panes as something you can query, watch and drive. Written so a Claude
-# session can see and steer another window without a human relaying text between them.
-#
-# Targets accept a wezterm pane id, a session name, or "." for the calling pane, so the
-# address you would hand SendMessage also works here. Names resolve through cc-roster,
-# not cc-peers: the two agree on every pane and the one that does not work out titles
-# answers in 42ms rather than 1.4s.
-#
-# The event log is polled rather than pushed: wezterm has no outbound event stream, and
-# the states worth knowing about (busy, asking, idle) are Claude's, not wezterm's, so
-# they would not appear in one even if it existed. `wz events --daemon` diffs a snapshot
-# every couple of seconds and appends what changed.
+# wezterm's panes as something a Claude session can query, watch and drive. Targets
+# resolve through cc-roster, so the address SendMessage takes works here too.
 
 set -u
 
 readonly GREP_LINES=500
+readonly GREP_JOBS=16
 readonly PIPE_LINES=200
 readonly TITLE_MAX=44
 readonly CACHE="$HOME/.claude/cache"
 readonly EVENT_LOG="$CACHE/wz-events.jsonl"
 readonly EVENT_PID="$CACHE/wz-events.pid"
 readonly EVENT_KEEP=5000
-# wezterm.lua drains this on the status-bar tick. It exists for the things `wezterm cli`
-# cannot do, of which the one that matters is switching workspace.
+# Drained by wezterm.lua on the status tick, for what `wezterm cli` cannot do: switching
+# workspace, a toast.
 readonly ACTIONS="$HOME/.claude/fleet/actions"
+# By full path: cron and the GUI need not have ~/.local/bin on PATH.
+readonly ROSTER="$HOME/.claude/bin/cc-roster"
 
 usage() {
 	cat <<'USAGE'
@@ -55,7 +48,8 @@ driving
   wz notify [--say] [--quiet] <title> [body]
                                       a sound and a toast; --say speaks it
 
-<target> is a wezterm pane id, a cc-peers session name, or "." for this pane.
+<target> is a wezterm pane id, a session name, a session id, or "." for this pane.
+A name it used to have works too, and cc-roster says so on stderr when one is used.
 tree, grep and top cover the current workspace; -a covers every one.
 -c limits tree to panes holding a Claude session.
 
@@ -89,14 +83,9 @@ pane_tsv() {
 	'
 }
 
-# cc-roster merges the registry with the hook state files and stops there. cc-peers
-# does the same and then works out a title for every session, which costs 1.4s and
-# which nothing here needs: resolving an address, labelling a row and reading a state
-# all want the name, not the topic.
-#
-# Columns: sid, name, status, detail, pane, dir, pid, seen_ms.
+# Columns: sid, name, status, detail, pane, dir, pid, seen_ms, started_ms.
 session_tsv() {
-	command -v cc-roster >/dev/null && cc-roster 2>/dev/null
+	"$ROSTER" 2>/dev/null
 }
 
 PANES=""
@@ -106,8 +95,7 @@ load() {
 	[[ -n $PANES ]] || die "no wezterm mux to talk to"
 }
 
-# Empty means every workspace. Falling back to all when the caller is outside wezterm
-# beats erroring: that is how wz gets run from cron and from a plain shell.
+# Empty means every workspace, which is also the answer outside wezterm.
 scope_ws() {
 	local all=$1
 	$all && return
@@ -115,8 +103,7 @@ scope_ws() {
 	printf '%s\n' "$PANES" | awk -F'\t' -v p="$WEZTERM_PANE" '$4 == p { print $1; exit }'
 }
 
-# Hoisted out of its callers on purpose: bash 3.2 misreads a case pattern's ")" as the
-# end of an enclosing $( ) or < <( ).
+# A function, not inline: bash 3.2 misreads a case ")" inside $( ).
 resolve() {
 	local target=$1 pane
 	case $target in
@@ -128,9 +115,9 @@ resolve() {
 	*[!0-9]*) ;;
 	*) printf '%s' "$target"; return ;;
 	esac
-	pane=$(cc-roster --pane "$target" 2>/dev/null)
+	pane=$("$ROSTER" --pane "$target")
 	[[ -n $pane && $pane != "-" ]] || die "no pane named \"$target\" (try: cc-peers)"
-	# Nothing downstream should have to wonder: a pane id is digits or it is a bug.
+	# A pane id reaches kill-pane: digits or nothing.
 	case $pane in
 	'' | *[!0-9]*) die "\"$target\" resolved to \"$pane\", which is not a pane id" ;;
 	esac
@@ -142,10 +129,9 @@ resolve() {
 rows_in_scope() {
 	local ws=$1 conly=$2
 	awk -F'\t' -v ws="$ws" -v conly="$conly" '
-		# Roster row: sid, name, status, detail, pane, ... The state column carries
-		# what a blocked session is blocked on, which is the only detail worth a
-		# column here.
-		FNR == NR { name[$5] = $2; state[$5] = $3 ($4 == "" ? "" : " " $4); next }
+		# By name, not FNR == NR: with no live sessions the roster is empty and every
+		# pane row would be read as one.
+		FILENAME == ARGV[1] { name[$5] = $2; state[$5] = $3 ($4 == "" ? "" : " " $4); next }
 		ws != "" && $1 != ws { next }
 		{
 			n = ($4 in name) ? name[$4] : "-"
@@ -173,8 +159,7 @@ cmd_tree() {
 
 	{
 		echo $'WS\tWIN\tTAB\tPANE\tDIR\tSESSION\tSTATE\tTITLE'
-		# Truncating here rather than in awk: this awk is byte-based, so substr cuts a
-		# multibyte glyph in half, and every tab title starts with one.
+		# Truncated in bash: awk is byte-based and would halve a glyph.
 		rows_in_scope "$ws" "$conly" |
 			sort -t$'\t' -k1,1 -k2,2n -k3,3n -k10,10n |
 			while IFS=$'\t' read -r ws win tab pane dir sess state tty title pnum; do
@@ -185,10 +170,7 @@ cmd_tree() {
 	} | column -t -s $'\t'
 }
 
-# A whole pane screen is about 3,600 tokens, and most callers want the last few lines of
-# it. --tail is not the same as -n: -n reaches further back into scrollback, --tail keeps
-# less of what came out. `wz last` is cheaper still (about 60 tokens) when the question is
-# what the session said rather than what is on screen.
+# -n reaches further back into scrollback; --tail keeps less of what came out.
 cmd_read() {
 	local lines=0 target="" tail_n=0
 	while (($#)); do
@@ -220,18 +202,11 @@ cmd_read() {
 	fi
 }
 
-# The state files cannot tell a session that finished from one that stopped to ask a
-# question: the Stop hook fires either way. The usual answer is to read the pane, which
-# works and is what cc-board does, but the transcript says it better - the screen is
-# whatever fits, and it is gone once the pane is closed or the scrollback rolls.
-#
-# "Ends in a question mark" is a heuristic and stays one, which is why the field is
-# called ends_in_question and not "asking": a session can be waiting on you without a
-# question mark anywhere ("One last check before I advise: what connects remotely."),
-# and the registry state is the better signal when it says `waiting` or `asking`. Read
-# the two together - the state says whether it stopped, the text says what for.
+# The transcript rather than the screen: the screen is whatever fits and is gone once
+# the pane closes. ends_in_question is a heuristic; the registry state is the better
+# signal when it says waiting or asking.
 cmd_last() {
-	local target="" json=false pane sid cwd transcript text at now
+	local target="" json=false sid cwd transcript text at now
 	while (($#)); do
 		case $1 in
 		--json) json=true ;;
@@ -242,21 +217,22 @@ cmd_last() {
 		shift
 	done
 	[[ -n $target ]] || target=.
-	pane=$(resolve "$target") || exit 1
+	if [[ $target == . ]]; then
+		target=$(resolve .) || exit 1
+	fi
 
 	IFS=$'\x1f' read -r sid cwd name state < <(
-		cc-roster 2>/dev/null | awk -F'\t' -v p="$pane" \
-			'$5 == p { printf "%s\x1f%s\x1f%s\x1f%s", $1, $6, $2, $3; exit }'
+		"$ROSTER" --row "$target" |
+			awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s", $1, $6, $2, $3 }'
 	)
-	[[ -n ${sid:-} ]] || die "pane $pane holds no Claude session"
+	[[ -n ${sid:-} ]] || die "no Claude session at \"$target\""
 
 	transcript="$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}/$sid.jsonl"
 	[[ -r $transcript ]] ||
 		transcript=$(ls -t "$HOME"/.claude/projects/*/"$sid.jsonl" 2>/dev/null | head -1)
 	[[ -r $transcript ]] || die "no transcript for $name"
 
-	# tail -n +2 drops the half-record a byte offset always lands in the middle of: jq
-	# discards a whole batch over one line it cannot parse, which reads as silence.
+	# tail -n +2 drops the half-record a byte offset lands in: jq would discard the batch.
 	text=$(tail -c 400000 "$transcript" | tail -n +2 |
 		jq -r 'select(.type == "assistant")
 			| [ .message.content[]? | select(.type == "text") | .text ] | join("")
@@ -300,18 +276,35 @@ cmd_grep() {
 	case $lines in '' | *[!0-9]*) die "grep: -n needs a line count" ;; esac
 	load
 
-	# One get-text per pane at ~25ms; sequential keeps the output ordered and still
-	# comes in under two seconds across every pane on the machine.
-	local ws pane dir sess label hits
+	# get-text in parallel, batches of GREP_JOBS, then one grep over the lot in pane order.
+	local ws pane dir sess label i=0 tmp
+	local files=()
+	tmp=$(mktemp -d) || die "grep: no temp dir"
 	while IFS=$'\t' read -r ws _ _ pane dir sess _ _ _ pnum; do
 		label="$ws/$dir"
 		[[ $sess != "-" ]] && label="$label @$sess"
-		hits=$(wezterm cli get-text --pane-id "$pnum" --start-line "-$lines" 2>/dev/null |
-			grep $icase -e "$pattern")
-		[[ -n $hits ]] || continue
-		[[ -z $first ]] && first=$pnum
-		printf '%s\n' "$hits" | sed -e "s|^|$pnum	$label	|"
+		printf '%s\t%s\n' "$pnum" "$label" >>"$tmp/index"
+		files[i]="$tmp/$i"
+		wezterm cli get-text --pane-id "$pnum" --start-line "-$lines" >"$tmp/$i" 2>/dev/null &
+		i=$((i + 1))
+		((i % GREP_JOBS == 0)) && wait
 	done < <(rows_in_scope "$(scope_ws $all)" false)
+	wait
+	if ((i > 0)); then
+		grep -H $icase -e "$pattern" "${files[@]}" |
+			awk -F'\t' -v dir="$tmp/" -v firstfile="$tmp/first" '
+				FILENAME == ARGV[1] { pn[FNR - 1] = $1; lb[FNR - 1] = $2; next }
+				{
+					rest = substr($0, length(dir) + 1)
+					c = index(rest, ":")
+					k = substr(rest, 1, c - 1) + 0
+					if (first == "") first = pn[k]
+					print pn[k] "\t" lb[k] "\t" substr(rest, c + 1)
+				}
+				END { print first > firstfile }' "$tmp/index" -
+		read -r first <"$tmp/first" 2>/dev/null
+	fi
+	rm -rf "$tmp"
 
 	if $select; then
 		[[ -n $first ]] || die "grep: nothing matched, nothing to focus"
@@ -331,8 +324,7 @@ cmd_top() {
 	done
 	load
 
-	# One ps for the whole machine joined on tty, rather than a `ps -t` per pane: that
-	# fan-out would cost more than everything else wz does put together.
+	# One ps for the machine joined on tty, not a ps -t per pane.
 	{
 		ps -axo tty=,pid=,pcpu=,rss=,comm= | awk '$1 != "??" {
 			c = $5
@@ -344,8 +336,7 @@ cmd_top() {
 		$1 == "P" {
 			cpu[$2] += $3
 			rss[$2] += $4
-			# The busiest process names the pane: a login shell sits at 0.0% forever,
-			# so whatever is actually running is the useful label.
+			# The busiest process names the pane: a login shell sits at 0.0%.
 			if ($3 + 0 >= top[$2] + 0 || !($2 in proc)) { top[$2] = $3; proc[$2] = $5 }
 			next
 		}
@@ -365,8 +356,7 @@ cmd_top() {
 		} | column -t -s $'\t'
 }
 
-# printf, not a table of literals: the bytes have to survive command substitution,
-# which eats a trailing newline but leaves \r and the escapes alone.
+# printf, not literals: the bytes must survive command substitution.
 key_bytes() {
 	local k c
 	k=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
@@ -427,20 +417,14 @@ cmd_key() {
 	done
 }
 
-# Queue an action for wezterm.lua. Appended, because two callers a second apart must not
-# lose one another's line; the Lua claims the whole file by rename and drains it.
+# Appended so two callers a second apart keep both lines; the Lua claims it by rename.
 queue_action() {
 	mkdir -p "${ACTIONS%/*}" 2>/dev/null
 	printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" >>"$ACTIONS"
 }
 
-# `wezterm cli activate-pane` makes a pane active inside its own window and leaves the
-# GUI on whatever workspace it was showing, so on its own this lands you on the right
-# pane of a screen you cannot see. Measured, not assumed: activating a pane in another
-# workspace left the client's workspace unchanged.
-#
-# The CLI has no verb for the switch. So a cross-workspace jump goes through the action
-# queue, and a jump inside the current workspace stays synchronous - no tick to wait for.
+# activate-pane leaves the GUI on its current workspace and the CLI has no verb to
+# switch, so a cross-workspace jump goes through the action queue.
 cmd_go() {
 	(($#)) || die "go: need a target"
 	local pane target_ws here
@@ -458,8 +442,7 @@ cmd_go() {
 	wezterm cli activate-pane --pane-id "$pane"
 }
 
-# split-pane --move-pane-id is wezterm's join-pane: it relocates a live pane into a
-# split of the target, across tabs and windows, and `wz break` undoes it.
+# split-pane --move-pane-id is join-pane: across tabs and windows; `wz break` undoes it.
 cmd_join() {
 	local dir="--right" src="" target=""
 	while (($#)); do
@@ -494,16 +477,8 @@ osa_quote() {
 	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
-# Notification Centre is not a channel you can rely on here. WezTerm has never
-# registered with it - zero entries under its bundle id in com.apple.ncprefs - so
-# window:toast_notification returns happily and shows nothing, and ncprefs and the
-# delivery database are both TCC-protected, so a script cannot even find out. Measured,
-# after two toasts that were sent, drained and never seen.
-#
-# So the toast is still raised, because it costs nothing and starts working the day
-# permission is granted, but it is not what carries the message. Sound is: afplay needs
-# no permission, cannot be silently dropped, and is the difference between knowing and
-# not. --say speaks the body for the ones with a clock on them.
+# WezTerm is not registered with Notification Centre, so its toasts show nothing and a
+# script cannot tell. The toast is still raised; the sound is what carries the message.
 cmd_notify() {
 	local sound=true speak=false
 	while (($#)); do
@@ -535,9 +510,8 @@ cmd_notify() {
 
 # --- events -----------------------------------------------------------------------
 #
-# A snapshot is pane, ws, session, state, title; diffing two of them is the whole event
-# model. wezterm has no outbound stream, and the states worth knowing about (busy,
-# asking, idle) are Claude's rather than wezterm's, so they would not be in one anyway.
+# Polled: wezterm has no outbound stream, and the states worth knowing are Claude's.
+# A snapshot is pane, ws, session, state, title; diffing two is the whole event model.
 
 snapshot() {
 	PANES=$(pane_tsv)
@@ -580,7 +554,9 @@ events_daemon() {
 			die "events: already running as pid $running (wz events --stop)"
 	fi
 	echo $$ >"$EVENT_PID"
-	trap 'rm -f "$EVENT_PID"' EXIT INT TERM
+	# INT and TERM must exit: a trap that only cleans up lets the loop carry on.
+	trap 'rm -f "$EVENT_PID"' EXIT
+	trap 'exit 0' INT TERM
 
 	seq=$(last_seq)
 	prev=$(snapshot) || die "events: no wezterm mux to talk to"
@@ -591,14 +567,12 @@ events_daemon() {
 			[[ -n $line ]] || continue
 			seq=$((seq + 1))
 			now=$(date +%s)
-			# -R: the line is raw TSV, not JSON, so jq must read it as a string.
 			printf '%s\n' "$line" | jq -R -c --argjson seq "$seq" --argjson at "$now" \
 				'split("\t") | {seq: $seq, at: $at, name: .[0], pane: .[1],
 					ws: .[2], session: .[3], detail: .[4]}' >>"$EVENT_LOG"
 		done < <(emit_diff "$prev" "$cur")
 		prev=$cur
-		# Trimmed rarely and only well past the keep mark: a rewrite races a reader's
-		# tail, and the log gains only a few lines a minute even on a busy machine.
+		# Trimmed only well past the keep mark: a rewrite races a reader.
 		if (($(wc -l <"$EVENT_LOG" 2>/dev/null || echo 0) > EVENT_KEEP * 2)); then
 			tail -n "$EVENT_KEEP" "$EVENT_LOG" >"$EVENT_LOG.tmp" &&
 				mv "$EVENT_LOG.tmp" "$EVENT_LOG"
@@ -696,8 +670,7 @@ wait_event() {
 	die "wait: timed out after ${timeout}s waiting for $event"
 }
 
-# Polling cc-peers rather than the event log keeps this working with no daemon, and
-# cc-peers is what knows "asking" from "idle" in the first place.
+# Polls cc-roster rather than the event log, so it works with no daemon.
 wait_state() {
 	local pane=$1 state=$2 timeout=$3 waited=0 cur
 	while ((waited < timeout)); do
@@ -726,7 +699,9 @@ cmd_wait() {
 		shift
 	done
 	case $timeout in '' | *[!0-9]*) die "wait: --timeout needs seconds" ;; esac
-	[[ -n $target ]] && pane=$(resolve "$target")
+	if [[ -n $target ]]; then
+		pane=$(resolve "$target") || exit 1
+	fi
 	if [[ -n $event ]]; then
 		wait_event "$event" "$pane" "$timeout"
 		return
@@ -766,8 +741,7 @@ cmd_pipe() {
 	[[ -n $target ]] || die "pipe: need a target"
 	case $lines in '' | *[!0-9]*) die "pipe: -n needs a line count" ;; esac
 	pane=$(resolve "$target") || exit 1
-	# Line-diffing only reads cleanly for output that scrolls. A full-screen TUI
-	# repaints in place, so its "new" lines are whatever the redraw happened to touch.
+	# Reads cleanly only for output that scrolls: a TUI repaints in place.
 	if [[ -n $cmd ]]; then
 		pipe_loop "$pane" "$interval" "$lines" | sh -c "$cmd"
 	else

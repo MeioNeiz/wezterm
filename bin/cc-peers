@@ -1,21 +1,12 @@
 #!/bin/bash
-# Live Claude Code sessions on this machine, newest last; --help says what for. Read
-# by Claude to turn "the window doing the ingest migration" into an address, and by
-# the wezterm picker (LEADER+@) to type one into a prompt.
-#
-# The roster itself comes from cc-roster, which is the cheap half: who is alive, what
-# state, which pane. All this adds is a title per session, and a title is the whole
-# reason cc-peers used to cost 1.4s - a 256KB transcript tail, an awk and a jq each,
-# thirty-four times over, for a string that changes about twice in a session's life.
-# So titles are cached against the transcript's mtime and only recomputed when the
-# transcript has actually moved.
+# Live Claude Code sessions, newest last: cc-roster plus a title per session, memoised
+# against the transcript's mtime.
 
 set -u
 
 readonly TITLE_CACHE="$HOME/.claude/cache/statusline"
 readonly TITLE_MEMO="$HOME/.claude/cache/titles"
-# An idle session's transcript never moves, so it never recomputes. A busy one moves
-# on every turn, and without a floor it would pay the full scan on every call.
+# A busy transcript moves every turn; without a floor it would rescan on every call.
 readonly TITLE_TTL=60
 
 usage() {
@@ -34,8 +25,7 @@ conversation, and either way it is unique among live sessions. Each pane's statu
 ends with its own @name; in wezterm, LEADER+@ types another session's name at the
 cursor and CTRL+SHIFT+SPACE lifts one off the screen.
 
-cc-roster is this without the titles, and answers in a tenth of the time. Anything
-resolving an address rather than showing one to a human wants that instead.
+cc-roster is this without the titles. Anything resolving an address wants that instead.
 USAGE
 }
 
@@ -53,16 +43,10 @@ case ${1:-} in
 	;;
 esac
 
-# Same priority Claude's own titles use, and the same 256KB tail the statusLine
-# reads: title lines are rewritten throughout a session, so the tail almost always
-# has the current one.
+# Same priority and 256KB tail as the statusLine. Untitled falls back to the opening
+# prompt, then to a peer handover's sender and first line (it lands as isMeta).
 session_title() {
-	local id=$1 dir=$2 slug transcript title
-	slug=$(printf '%s' "$dir" | sed 's/[^A-Za-z0-9]/-/g')
-	transcript="$HOME/.claude/projects/$slug/$id.jsonl"
-	if [[ ! -r $transcript ]]; then
-		transcript=$(ls -t "$HOME"/.claude/projects/*/"$id.jsonl" 2>/dev/null | head -1)
-	fi
+	local id=$1 transcript=$2 title=""
 	if [[ -r $transcript ]]; then
 		title=$(tail -c 262144 "$transcript" | awk '
 			/"type":"custom-title"/ { custom = $0 }
@@ -71,8 +55,6 @@ session_title() {
 		' | jq -r '.customTitle // .aiTitle // empty' 2>/dev/null)
 	fi
 	[[ -z $title && -r $TITLE_CACHE/$id ]] && title=$(<"$TITLE_CACHE/$id")
-	# A session can run for hours without ever being titled, and its opening ask
-	# still identifies it better than "untitled" does.
 	if [[ -z $title && -r $transcript ]]; then
 		title=$(grep -m 60 '"type":"user"' "$transcript" | jq -r '
 			select((.isMeta // false) | not)
@@ -84,10 +66,7 @@ session_title() {
 			| gsub("\\s+"; " ")
 		' 2>/dev/null | head -1 | cut -c1-60)
 	fi
-	# A window bootstrapped by a peer handover has no ordinary prompt at all - the
-	# message lands as isMeta, which the pass above skips - so name it after the
-	# sender and the handover's opening line. Splitting on ">" and rejoining
-	# survives a body containing one.
+	# Splitting on ">" and rejoining survives a body containing one.
 	if [[ -z $title && -r $transcript ]]; then
 		title=$(grep -m 40 'cross-session-message from=' "$transcript" | jq -r '
 			.message.content
@@ -102,27 +81,14 @@ session_title() {
 	printf '%s' "${title:-untitled}"
 }
 
-# The transcript's mtime is the only thing that can change a title, so a session whose
-# transcript has not moved keeps the cached one for nothing. A busy session's mtime
-# moves every turn, which would put us straight back to a scan per call, so a memo
-# checked inside TITLE_TTL is taken without even looking at the transcript.
-#
-# Fork-free on a hit, which is the whole point: this runs once per live session, and a
-# command substitution plus a sed plus a stat was 378ms of the 470 this script cost.
-# The slug is bash's own substitution rather than a sed - identical output, 12x faster
-# on a path-length string - and the answer comes back in TITLE rather than on stdout.
-#
-# The one case that must not be held back is a session too young to have been titled:
-# holding "untitled" for a minute is the difference between a new pane naming itself
-# and a new pane looking broken. So an untitled memo is never reused.
+# Fork-free on a memo hit, which is the common case: TITLE is a global, not stdout.
+# An untitled memo is never reused, or a new pane would look broken for a minute.
 TITLE=""
 cached_title() {
 	local id=$1 dir=$2 now=$3
 	local file transcript mtime cached_mtime cached_at cached_title
-	# Split from the declaration above on purpose: bash 3.2 declares every name in one
-	# `local` before it assigns any of them, so "$TITLE_MEMO/$id" on that line expands
-	# an id that is local and still unset, and set -u kills the script.
 	file="$TITLE_MEMO/$id"
+	transcript="$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$id.jsonl"
 
 	if [[ -r $file ]]; then
 		IFS=$'\x1f' read -r cached_mtime cached_at cached_title <"$file"
@@ -131,31 +97,30 @@ cached_title() {
 				TITLE=$cached_title
 				return
 			fi
-			# Past the TTL, so ask the one question that can change the answer. Two
-			# forks a session a minute, and none at all in between.
-			transcript="$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$id.jsonl"
-			mtime=$(stat -f %m "$transcript" 2>/dev/null || echo 0)
-			if [[ ${cached_mtime:-0} == "$mtime" ]]; then
-				printf '%s\x1f%s\x1f%s\n' "$mtime" "$now" "$cached_title" \
-					>"$file" 2>/dev/null
-				TITLE=$cached_title
-				return
+			if [[ -r $transcript ]]; then
+				mtime=$(stat -f %m "$transcript" 2>/dev/null || echo 0)
+				if [[ ${cached_mtime:-0} == "$mtime" ]]; then
+					printf '%s\x1f%s\x1f%s\n' "$mtime" "$now" "$cached_title" \
+						>"$file" 2>/dev/null
+					TITLE=$cached_title
+					return
+				fi
 			fi
 		fi
 	fi
 
-	transcript="$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$id.jsonl"
+	# The registry cwd can differ from the one the transcript was filed under.
+	[[ -r $transcript ]] ||
+		transcript=$(ls -t "$HOME"/.claude/projects/*/"$id.jsonl" 2>/dev/null | head -1)
 	mtime=$(stat -f %m "$transcript" 2>/dev/null || echo 0)
-	TITLE=$(session_title "$id" "$dir")
+	TITLE=$(session_title "$id" "$transcript")
 	mkdir -p "$TITLE_MEMO" 2>/dev/null &&
 		printf '%s\x1f%s\x1f%s\n' "$mtime" "$now" "$TITLE" >"$file" 2>/dev/null
 }
 
 now=$(date +%s)
 rows=""
-# Unit separator rather than tab: tab is IFS whitespace, so bash folds an empty
-# `detail` into its neighbour and shifts the rest of the row left. cc-roster emits
-# tabs because awk splits them properly; read does not.
+# Unit separator: tab is IFS whitespace, so read would fold an empty detail.
 while IFS=$'\x1f' read -r sid name status detail pane cwd pid seen started; do
 	[[ -n $sid ]] || continue
 	state=$status
@@ -164,8 +129,6 @@ while IFS=$'\x1f' read -r sid name status detail pane cwd pid seen started; do
 	rows="$rows$name	$sid	$state	$pane	${cwd##*/}	$TITLE"$'\n'
 done < <(cc-roster 2>/dev/null | tr '\t' '\037')
 
-# Plain -z, never a pattern substitution: ${rows//[...]/} walks a 4KB string
-# character by character under a UTF-8 locale and cost 3.3s of this script's 3.7.
 if [[ -z $rows ]]; then
 	$tsv || echo "No live Claude sessions." >&2
 	exit 0
@@ -175,7 +138,6 @@ printf '%s' "$rows" |
 	if $tsv; then
 		cat
 	else
-		# Marking this session so the list reads as "the others are over there".
 		awk -F'\t' -v self="${CLAUDE_CODE_SESSION_ID:-}" '
 			BEGIN { print "NAME\tSTATE\tPANE\tDIR\tTITLE" }
 			{ mark = ($2 == self) ? " ←you" : ""

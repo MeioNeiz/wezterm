@@ -2,14 +2,9 @@ local wezterm = require("wezterm")
 local act = wezterm.action
 local config = wezterm.config_builder()
 
--- config_builder() is strict: assigning a field it does not know raises, and a raise while
--- loading this file means wezterm throws away the entire config and falls back to defaults.
--- One typo in a cosmetic setting therefore costs every keybinding, the tab bar and the whole
--- colour scheme. Field names also come and go between versions.
---
--- So anything optional goes through here, where an unknown field is skipped with a warning.
--- Note that no `wezterm` CLI subcommand validates these - show-keys and ls-fonts both load
--- the file and report nothing - so the GUI is the only thing that will ever tell you.
+-- config_builder() raises on unknown field and a raise discards the whole config. Field
+-- names vary by version, so optional ones go through here.
+-- Check: `wezterm --config-file wezterm.lua ls-fonts 2>&1 | grep ERROR`
 local function try_set(key, value)
 	if not pcall(function()
 		config[key] = value
@@ -22,7 +17,7 @@ local is_windows = wezterm.target_triple:find("windows") ~= nil
 local is_macos = wezterm.target_triple:find("darwin") ~= nil
 
 -- ============================================================
--- Appearance  (your original settings, preserved)
+-- Appearance
 -- ============================================================
 config.font = wezterm.font_with_fallback({
 	{ family = "JetBrains Mono", weight = "Regular" },
@@ -32,79 +27,167 @@ config.line_height = 1.0
 config.harfbuzz_features = { "calt=1", "liga=1", "clig=1" } -- programming ligatures
 
 config.color_scheme = "Catppuccin Mocha"
+-- Lighter than the 0.8 default: FAINT text in an unfocused pane stays at 3.5:1 on base.
+-- Saturation left at the default so the cc-tint identity survives.
+config.inactive_pane_hsb = { saturation = 0.9, brightness = 0.85 }
 config.window_background_opacity = 1.0
-config.window_padding = { left = 4, right = 4, top = 2, bottom = 0 } -- minimal perimeter; set to 0 for edge-to-edge
+config.window_padding = { left = 4, right = 4, top = 2, bottom = 0 }
 config.adjust_window_size_when_changing_font_size = false
 config.audible_bell = "Disabled"
-config.scrollback_lines = 50000 -- bumped from 10k for long-running sessions
+config.scrollback_lines = 50000
 
--- Tab bar
+-- Tab bar. fancy_tab_bar.rs caps every tab at `pixel_width / num_tabs - 1.5 cells`,
+-- unconditionally. Cap is in PIXELS, so more characters means a narrower frame font
+-- (FRAME_FONT_SIZE). Retro bar: no per-tab cap but draws in the 14pt terminal font, so
+-- fewer cells overall. Flip to false and label_width switches models, see FANCY.
 config.use_fancy_tab_bar = true
+-- no macOS title bar; RESIZE keeps window draggable/resizable
+config.window_decorations = "INTEGRATED_BUTTONS|RESIZE"
 config.tab_bar_at_bottom = false
 config.hide_tab_bar_if_only_one_tab = false
--- Deliberately loose: this is the only width format-tab-title is told about, and
--- it is the config value, not the room actually left in the bar. The real sharing
--- happens in label_width, so this only has to be wide enough not to bind first - and
--- at 160 it was binding first, in every window wide enough to matter.
+-- Deliberately loose: format-tab-title only sees this config value, not the room left.
+-- Real sharing is in label_width; this must just never bind first.
 config.tab_max_width = 320
--- Two cells a tab, and nothing here is ever clicked.
---
--- Through try_set because this field has been spelled two different ways: assigning the
--- wrong one is not a warning, it is `error converting Lua table to Config` and the whole
--- file is discarded. Nothing in this config is worth that, least of all two cells.
+-- Fancy bar draws in window_frame.font, NOT terminal cells; label_width converts via
+-- FRAME_CELLS. Pinned so an upgrade cannot move the default. Smaller = more chars per tab
+-- (per-tab cap is pixels) but below 12 is unreadable here.
+local FRAME_FONT_SIZE = 12.0
+config.window_frame = {
+	font = wezterm.font({ family = "Roboto", weight = "Bold" }),
+	font_size = FRAME_FONT_SIZE,
+	-- no native title bar, so this IS the window top; crust matches the tab bar bg
+	active_titlebar_bg = "#11111b",
+	inactive_titlebar_bg = "#11111b",
+}
+-- Frame chars per terminal cell: point-size ratio x advance (Roboto Bold ~0.52em avg vs
+-- JetBrains Mono 0.586em = 1.13). MARGIN shades down since proportional widths vary and
+-- overshoot makes wezterm clip. Monospace frame font: both become 1.0.
+local FRAME_ADVANCE = 1.13
+local FRAME_MARGIN = 0.9
+-- retro bar draws in terminal font: a cell is a cell
+local FANCY = config.use_fancy_tab_bar == true
+local FRAME_CELLS = FANCY and ((config.font_size / FRAME_FONT_SIZE) * FRAME_ADVANCE * FRAME_MARGIN)
+	or 1.0
+-- try_set: field name differs across versions and a wrong one discards the whole config
 try_set("show_close_tab_button_in_tabs", false)
--- Doubles as how often the tab bar re-reads pane state, see update-right-status.
+-- also the tab bar's pane-state re-read rate, see update-right-status
 config.status_update_interval = 1000
 
--- Marks a tab title pinned by the save layer rather than typed by hand (LEADER+,).
--- Invisible if it ever reaches the tab bar, so format-tab-title can tell the two
--- apart and let live pane topics win over a pin that has since gone stale.
+-- Invisible mark on a title pinned by the save layer (vs typed via LEADER+,), so live
+-- pane topics can win over a stale pin.
 local AUTO_TITLE_MARK = "\u{2063}"
 
--- A tab can carry a hand-typed name *and* the live pane row. Text before the first
--- backslash is the name, the backslash onward is the row's to fill: "dtmf \". A title
--- with no backslash still means typed by hand, shown exactly as typed.
+-- "dtmf \": text before first backslash is a typed name, the live pane row fills the
+-- rest. No backslash = typed title shown as is.
 local TAB_GROUP_SEP = "\\"
 
--- (Optional) On Windows, default to PowerShell 7 — uncomment if you want it.
--- This same file works on macOS, Linux, and Windows.
+-- Windows, optional:
 -- if is_windows then
 -- 	config.default_prog = { "pwsh.exe", "-NoLogo" }
 -- end
 
 -- ============================================================
--- Session persistence: resurrect.wezterm
--- Saves every workspace's layout (tabs/panes/cwd) plus the Claude Code session
--- running in each pane, so a full quit comes back to the same desk.
--- Plugin auto-clones from GitHub the first time this config loads.
---
--- The plugin's own periodic_save is deliberately not used: it only snapshots
--- the *active* workspace, so everything else silently goes stale.
+-- Session persistence: resurrect.wezterm, every workspace plus each pane's Claude session.
+-- Not the plugin's periodic_save: it only snapshots the active workspace.
 -- ============================================================
 local resurrect = wezterm.plugin.require("https://github.com/MLFlexer/resurrect.wezterm")
 
 local session_map_dir = wezterm.home_dir .. "/.claude/wezterm-sessions"
--- What cc-tint last painted onto each pane, `<session id>\t<hue name>`. Only read here to
--- be wiped with the rest of the pane-keyed state.
+-- cc-tint's paint record; only here to be wiped with the other pane-keyed state
 local painted_dir = wezterm.home_dir .. "/.claude/cache/cc-tint-painted"
--- What each Claude pane is doing, written by hooks/wezterm-pane-state.sh; read by
--- format-tab-title, since a pane title only ever says working or not working.
+-- written by hooks/wezterm-pane-state.sh
 local pane_state_dir = wezterm.home_dir .. "/.claude/wezterm-state"
 local brief_script = wezterm.home_dir .. "/.claude/hooks/claude-session-brief.py"
 local save_interval_seconds = 120
+
+-- ============================================================
+-- Registry half of pane state, via `cc-roster --digest` (hooks are the other half; see
+-- pane_status and CLAUDE.md). jq over the registry is too slow for a 1s tick, so a
+-- background process writes one file and this reads it.
+local digest_path = wezterm.home_dir .. "/.claude/cache/fleet-digest"
+local digest_writer = wezterm.home_dir .. "/.claude/bin/cc-roster"
+local DIGEST_MAX_AGE = 5
+local digest = { read_at = 0, epoch = 0, rows = {} }
+
+---Rows keyed by pane id, reparsed at most once a second
+local function digest_rows()
+	local now = os.time()
+	if now == digest.read_at then
+		return digest.rows
+	end
+	digest.read_at = now
+	local file = io.open(digest_path, "r")
+	if not file then
+		digest.rows = {}
+		return digest.rows
+	end
+	local rows = {}
+	for line in file:lines() do
+		local stamp = line:match("^#(%d+)$")
+		if stamp then
+			digest.epoch = tonumber(stamp)
+		else
+			local pane, sid, status, detail, seen =
+				line:match("^(%d+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t(%d+)$")
+			if pane then
+				-- registry is ms, everything else here is s
+				rows[pane] = {
+					sid = sid,
+					status = status,
+					detail = detail,
+					seen = math.floor(tonumber(seen) / 1000),
+				}
+			end
+		end
+	end
+	file:close()
+	digest.rows = rows
+	return rows
+end
+
+---Every window calls this, so duplicate writes in one second are possible; accepted, the
+---write is atomic and cheaper than electing an owner window.
+local function digest_refresh()
+	digest_rows()
+	if os.time() - digest.epoch < DIGEST_MAX_AGE then
+		return
+	end
+	-- claim locally so a broken cc-roster is retried per DIGEST_MAX_AGE, not per second
+	digest.epoch = os.time()
+	wezterm.background_child_process({ digest_writer, "--digest" })
+end
 
 local function is_claude(argv)
 	return argv ~= nil and argv[1] ~= nil and argv[1]:match("claude$") ~= nil
 end
 
--- The saved pane tree drops pane ids and pids, but keeps cwd and start_time from
--- the same get_foreground_process_info() call, so those identify a pane across
--- the save. Collision needs two claudes started in one cwd in the same second.
+-- Saved tree drops pane ids and pids; cwd + start_time identify a pane across the save.
+-- Collides only for two claudes started in one cwd in the same second.
 local function process_key(cwd, start_time)
 	return tostring(cwd) .. "\0" .. tostring(start_time)
 end
 
-local function read_session_id(pane_id)
+-- tab bar, attention counts and pickers read the same panes in the same tick
+local function memo_per_second(read)
+	local at, hits = 0, {}
+	return function(key)
+		local now = os.time()
+		if now ~= at then
+			at, hits = now, {}
+		end
+		local hit = hits[key]
+		if hit == nil then
+			hit = read(key)
+			if hit == nil then
+				hit = false
+			end
+			hits[key] = hit
+		end
+		return hit or nil
+	end
+end
+
+local read_session_id = memo_per_second(function(pane_id)
 	local file = io.open(session_map_dir .. "/" .. pane_id, "r")
 	if not file then
 		return nil
@@ -114,7 +197,7 @@ local function read_session_id(pane_id)
 	if id and id:match("^[%x%-]+$") then
 		return id
 	end
-end
+end)
 
 ---Claude session id and title for every live pane running Claude Code
 local function live_claude_panes()
@@ -138,8 +221,7 @@ local function live_claude_panes()
 	return live
 end
 
--- A pane already resumed once carries --resume with an id that may since have
--- been superseded, so drop any resume/continue flags before adding the current one.
+-- a resumed pane's --resume id may be superseded; drop old flags before adding current
 local function strip_resume_flags(argv)
 	local out, skip = {}, false
 	for _, arg in ipairs(argv) do
@@ -173,7 +255,7 @@ local function tag_claude_panes(node, live)
 			title = found.title
 		end
 	end
-	-- both subtrees must be walked, so no short-circuiting on the first title found
+	-- walk both subtrees, no short-circuit
 	local right = tag_claude_panes(node.right, live)
 	local bottom = tag_claude_panes(node.bottom, live)
 	return title or right or bottom
@@ -196,9 +278,7 @@ local function save_all_workspaces()
 			for _, window_state in ipairs(state.window_states) do
 				for _, tab_state in ipairs(window_state.tabs) do
 					local title = tag_claude_panes(tab_state.pane_tree, live)
-					-- untitled tabs fall back to the pane title, which after a restore
-					-- is just "zsh"; pin the Claude topic so the tab bar stays readable
-					-- until the resumed sessions start announcing their own again
+					-- restored pane title is just "zsh"; pin Claude topic until it resumes
 					if title and (tab_state.title == nil or tab_state.title == "") then
 						tab_state.title = AUTO_TITLE_MARK .. title
 					end
@@ -216,9 +296,8 @@ local function save_all_workspaces()
 		file:close()
 	end
 
-	-- The manifest, not the state dir, decides what comes back: saved states are
-	-- never deleted, so globbing the dir resurrects every workspace that ever
-	-- existed and closing one has no effect.
+	-- manifest decides what comes back: saved states are never deleted, so globbing the
+	-- dir would resurrect every workspace ever
 	local manifest = io.open(resurrect.state_manager.save_state_dir .. "live_workspaces", "w")
 	if manifest then
 		manifest:write(table.concat(live_names, "\n"))
@@ -228,9 +307,8 @@ local function save_all_workspaces()
 	return saved
 end
 
--- Claude panes are restored armed: the resume command is typed at the prompt but
--- not run, under a header saying what the conversation was. Stops every session
--- reconnecting at once and lets you skip the ones you are done with.
+-- Claude panes restore armed: resume typed but not run, under a brief header, so not
+-- every session reconnects at once.
 local function on_pane_restore(pane_tree)
 	local pane = pane_tree.pane
 
@@ -259,8 +337,7 @@ local function saved_workspace_names()
 		on_disk[path:match("([^/]+)%.json$")] = true
 	end
 
-	-- Restore what was open at the last save, not everything ever saved. No
-	-- manifest yet (first run after this change) means fall back to the dir.
+	-- no manifest: fall back to the dir
 	local names = {}
 	local manifest = io.open(resurrect.state_manager.save_state_dir .. "live_workspaces", "r")
 	if manifest then
@@ -282,11 +359,9 @@ local function saved_workspace_names()
 end
 
 wezterm.on("gui-startup", function()
-	-- pane ids restart from 0 with a new mux, so the old map, the old pane states and the
-	-- record of what colour each pane was painted would all mis-attribute; the ids we need
-	-- are already baked into the saved states. A stale paint record is the subtle one: it
-	-- would have a new session in pane 3 avoid the colour that the *previous* mux's pane 3
-	-- was wearing.
+	-- pane ids restart from 0 with a new mux, so every pane-keyed file would mis-attribute
+	-- (a stale paint record makes a new session avoid the old pane's colour). Needed ids
+	-- are in the saved states.
 	wezterm.background_child_process({
 		"/bin/sh", "-c",
 		string.format(
@@ -301,8 +376,7 @@ wezterm.on("gui-startup", function()
 
 	local restored = 0
 	for _, name in ipairs(saved_workspace_names()) do
-		-- fresh opts per workspace: restore_workspace writes its window/tab/pane
-		-- back into the table, and a reused window would swallow the next workspace
+		-- fresh opts per workspace: restore_workspace writes window/tab/pane back into it
 		local opts = {
 			relative = true,
 			restore_text = true,
@@ -335,28 +409,28 @@ wezterm.on("gui-startup", function()
 	end
 end)
 
--- Note: editing this file restarts the timer chain without stopping the previous
--- one, so repeated config reloads stack duplicate (idempotent) saves until restart.
-local function periodic_save_all()
+-- reload starts a new timer chain without stopping the old; GLOBAL generation stops it
+wezterm.GLOBAL.save_generation = (wezterm.GLOBAL.save_generation or 0) + 1
+local function periodic_save_all(generation)
 	wezterm.time.call_after(save_interval_seconds, function()
+		if wezterm.GLOBAL.save_generation ~= generation then
+			return
+		end
 		local ok, err = pcall(save_all_workspaces)
 		if not ok then
 			wezterm.log_error("resurrect: periodic save failed: " .. tostring(err))
 		end
-		periodic_save_all()
+		periodic_save_all(generation)
 	end)
 end
-periodic_save_all()
+periodic_save_all(wezterm.GLOBAL.save_generation)
 
 -- ============================================================
--- Multiplexing keybindings   (leader = CTRL-a, tmux-style)
--- Press the leader, release, then press the action key.
+-- Multiplexing keybindings (leader = CTRL-Space, tmux-style)
 -- ============================================================
 config.leader = { key = "Space", mods = "CTRL", timeout_milliseconds = 1000 }
 
--- Assigned in the Claude fleet section at the foot of this file, which needs the roster and
--- the tab colours. Declared here because the keys table below closes over it: declared any
--- later and the binding resolves to a nil global instead.
+-- assigned in the fleet section; declared here since config.keys closes over it
 local workspace_picker
 
 
@@ -365,8 +439,8 @@ config.keys = {
 	{ key = "Space", mods = "LEADER|CTRL", action = act.SendKey({ key = "Space", mods = "CTRL" }) },
 
 	-- ---- Panes: split the current pane ----
-	{ key = "\\", mods = "LEADER", action = act.SplitHorizontal({ domain = "CurrentPaneDomain" }) }, -- split RIGHT
-	{ key = "-", mods = "LEADER", action = act.SplitVertical({ domain = "CurrentPaneDomain" }) },     -- split DOWN
+	{ key = "\\", mods = "LEADER", action = act.SplitHorizontal({ domain = "CurrentPaneDomain" }) }, -- right
+	{ key = "-", mods = "LEADER", action = act.SplitVertical({ domain = "CurrentPaneDomain" }) }, -- down
 
 	-- ---- Panes: move focus (vim hjkl) ----
 	{ key = "h", mods = "LEADER", action = act.ActivatePaneDirection("Left") },
@@ -375,12 +449,12 @@ config.keys = {
 	{ key = "l", mods = "LEADER", action = act.ActivatePaneDirection("Right") },
 
 	-- ---- Panes: manage ----
-	{ key = "z", mods = "LEADER", action = act.TogglePaneZoomState },          -- fullscreen this pane
+	{ key = "z", mods = "LEADER", action = act.TogglePaneZoomState },
 	{ key = "x", mods = "LEADER", action = act.CloseCurrentPane({ confirm = true }) },
-	{ key = "Space", mods = "LEADER", action = act.PaneSelect },               -- jump to a pane by label
-	{ key = "o", mods = "LEADER", action = act.RotatePanes("Clockwise") },     -- shuffle the layout
-	{ key = "s", mods = "LEADER", action = act.PaneSelect({ mode = "SwapWithActive" }) }, -- swap this pane with a labelled one
-	{ key = "m", mods = "LEADER", action = wezterm.action_callback(function(_, pane)      -- move this pane out to a new window
+	{ key = "Space", mods = "LEADER", action = act.PaneSelect },
+	{ key = "o", mods = "LEADER", action = act.RotatePanes("Clockwise") },
+	{ key = "s", mods = "LEADER", action = act.PaneSelect({ mode = "SwapWithActive" }) },
+	{ key = "m", mods = "LEADER", action = wezterm.action_callback(function(_, pane)
 		pane:move_to_new_window()
 	end) },
 	{ key = "r", mods = "LEADER", action = act.ActivateKeyTable({ name = "resize_pane", one_shot = false }) },
@@ -428,8 +502,8 @@ config.keys = {
 			end),
 		}),
 	},
-	{ key = "n", mods = "LEADER", action = act.SwitchWorkspaceRelative(1) },  -- next workspace
-	{ key = "p", mods = "LEADER", action = act.SwitchWorkspaceRelative(-1) }, -- previous workspace
+	{ key = "n", mods = "LEADER", action = act.SwitchWorkspaceRelative(1) },
+	{ key = "p", mods = "LEADER", action = act.SwitchWorkspaceRelative(-1) },
 
 	-- ---- Session persistence (resurrect): Save / Restore ----
 	{ key = "S", mods = "LEADER", action = wezterm.action_callback(function(win, _)
@@ -438,9 +512,9 @@ config.keys = {
 	end) },
 	{ key = "R", mods = "LEADER", action = wezterm.action_callback(function(win, pane)
 		resurrect.fuzzy_loader.fuzzy_load(win, pane, function(id)
-			local kind = string.match(id, "^([^/]+)")       -- workspace | window | tab
-			id = string.match(id, "([^/]+)$")               -- strip dir
-			id = string.match(id, "(.+)%..+$")              -- strip .json
+			local kind = string.match(id, "^([^/]+)") -- workspace | window | tab
+			id = string.match(id, "([^/]+)$")
+			id = string.match(id, "(.+)%..+$")
 			local opts = {
 				relative = true,
 				restore_text = true,
@@ -462,6 +536,9 @@ config.keys = {
 	-- ---- Scrollback: copy mode & search ----
 	{ key = "[", mods = "LEADER", action = act.ActivateCopyMode },
 	{ key = "/", mods = "LEADER", action = act.Search("CurrentSelectionOrEmptyString") },
+	-- prompt to prompt: needs the shell integration sourced in .zshrc
+	{ key = "UpArrow", mods = "LEADER", action = act.ScrollToPrompt(-1) },
+	{ key = "DownArrow", mods = "LEADER", action = act.ScrollToPrompt(1) },
 }
 
 -- Direct tab access: LEADER + 1..9
@@ -473,20 +550,51 @@ for i = 1, 9 do
 	})
 end
 
--- ---- Close pane / tab: consistent across macOS, Windows & Linux ----
--- Same chord everywhere so muscle memory transfers:
---   CTRL+SHIFT+W = close the focused PANE  (last pane closes its tab too, like iTerm2/VS Code)
---   CTRL+SHIFT+Q = close the whole TAB
+-- LEADER+Tab flips to the tab you were last on; closing a tab lands there too
+config.switch_to_last_active_tab_when_closing_tab = true
+table.insert(config.keys, { key = "Tab", mods = "LEADER", action = act.ActivateLastTab })
+
+-- Open a URL on screen from the keyboard: labels every link, the letter opens it
+table.insert(config.keys, {
+	key = "u",
+	mods = "LEADER",
+	action = act.QuickSelectArgs({
+		label = "open url",
+		patterns = { "https?://[^\\s\"'<>()]+" },
+		action = wezterm.action_callback(function(window, pane)
+			wezterm.open_with(window:get_selection_text_for_pane(pane))
+		end),
+	}),
+})
+
+-- links open on CMD+click only: plain click is how a pane gets focus back
+config.mouse_bindings = {
+	{
+		event = { Up = { streak = 1, button = "Left" } },
+		mods = "NONE",
+		action = act.CompleteSelection("ClipboardAndPrimarySelection"),
+	},
+	{
+		event = { Up = { streak = 1, button = "Left" } },
+		mods = "CMD",
+		action = act.OpenLinkAtMouseCursor,
+	},
+	-- else CMD-down starts a selection and the Up never sees a link
+	{ event = { Down = { streak = 1, button = "Left" } }, mods = "CMD", action = act.Nop },
+}
+
+-- OSC 9 / toasts from the pane you are looking at are noise; from any other pane, not
+config.notification_handling = "SuppressFromFocusedPane"
+
+-- Close: CTRL+SHIFT+W pane, CTRL+SHIFT+Q tab, same on every OS
 table.insert(config.keys, { key = "w", mods = "CTRL|SHIFT", action = act.CloseCurrentPane({ confirm = true }) })
 table.insert(config.keys, { key = "q", mods = "CTRL|SHIFT", action = act.CloseCurrentTab({ confirm = true }) })
 
--- macOS bonus: also honor the native CMD+W / CMD+SHIFT+W. Binding CMD+W here
--- is required to override WezTerm's built-in CMD+W (which would close the tab).
+-- binding CMD+W overrides wezterm's built-in (close tab)
 if is_macos then
 	table.insert(config.keys, { key = "w", mods = "CMD", action = act.CloseCurrentPane({ confirm = true }) })
 	table.insert(config.keys, { key = "w", mods = "CMD|SHIFT", action = act.CloseCurrentTab({ confirm = true }) })
-	-- Snapshot before quitting. The macOS menu's Quit bypasses this, so the
-	-- periodic save is still the backstop.
+	-- menu Quit bypasses this; periodic save is the backstop
 	table.insert(config.keys, { key = "q", mods = "CMD", action = wezterm.action_callback(function(win, pane)
 		pcall(save_all_workspaces)
 		win:perform_action(act.QuitApplication, pane)
@@ -506,58 +614,39 @@ config.key_tables = {
 }
 
 -- ============================================================
--- Status bar: show LEADER indicator, resize mode, and workspace
---
--- Also the heartbeat the tab bar rides on. format-tab-title only runs when
--- something invalidates the title, and most of what colours a tab has no
--- wezterm-visible event behind it: a hook writing a state file, or a finished
--- turn ageing past FRESH_SECONDS. Setting the status is the one thing that fires
--- on a timer, and it only invalidates when the string actually changes, so the
--- trailing blank alternates between space and NBSP: identical cell, different
--- bytes, every tab re-evaluated once per status_update_interval.
+-- Status bar: LEADER, resize mode, workspace.
+-- Also the tab bar's heartbeat: format-tab-title only reruns on invalidation, and hook
+-- writes or ageing past FRESH_SECONDS have no wezterm event. Status only invalidates when
+-- the string changes, so the trailing blank toggles space/NBSP: same cell, new bytes.
 -- ============================================================
 local tab_geometry = {} -- tab id -> the bar's size; see label_width
 local status_tick = 0
 
--- Assigned in the Claude fleet section at the foot of this file, which needs
--- read_pane_state and so cannot be hoisted up here. The status bar is its only caller.
+-- Forward decls, assigned in the fleet section (they need things defined later)
 local attention_elsewhere
 
--- Likewise: keeps LEADER+w's branch column warm from here, since the picker itself must not
--- wait on git. Throttled inside, so this costs nothing on the ticks in between.
 local ws_git_refresh
 
--- Also assigned down there: stamps the workspace you are looking at, which is what gives
--- LEADER+w its alt-tab order. The status bar is the only thing that fires often enough to
--- notice you arriving by any route - the picker, LEADER+n/p, or clicking a window.
+-- stamps the focused workspace for LEADER+w's alt-tab order; only the status tick sees
+-- every route of arrival
 local ws_touch
 
--- Likewise, and for the workspace name: it takes the colour of the pane you are actually
--- in, so the bar answers "which chat am I typing into" as well as "where am I". Defined
--- with the tab bar's identity palette, which cannot be hoisted above this handler.
+-- workspace name takes the focused pane's identity colour
 local focused_identity
 
----A file the shell can put wezterm actions in. It exists because `wezterm cli` cannot
----do everything the Lua API can, and the gap is not academic: **the CLI cannot switch
----workspace**. `activate-pane` on a pane in another workspace makes it active inside its
----own window and leaves the GUI where it was, so `wz go` has always half-worked - right
----pane, wrong screen - and there is no CLI verb that fixes it.
----
----OSC 1337 SetUserVar is the bridge this would normally use and it does nothing on this
----build (see CLAUDE.md). What is left is a file and a tick, and the status bar is already
----ticking once a second for the tab bar's sake.
----
----One line per action, tab separated. Claimed by rename, which is atomic, so exactly one
----window drains a batch however many are watching.
+-- see "the chime" at the foot
+local chime_overdue
+
+---Shell -> Lua action queue: the CLI cannot switch workspace (activate-pane leaves the GUI
+---where it was) and SetUserVar is dead on this build (CLAUDE.md). One tab-separated line
+---per action; claimed by atomic rename so exactly one window drains a batch.
 local ACTION_FILE = "/.claude/fleet/actions"
 
 local function perform_action_line(window, pane, verb, a, b)
 	if verb == "workspace" and a and a ~= "" then
 		window:perform_action(act.SwitchToWorkspace({ name = a }), pane)
 	elseif verb == "goto" and a and a ~= "" then
-		-- Workspace first, then the pane: switching brings that workspace's windows
-		-- forward, and activating before the switch lands puts focus somewhere the
-		-- switch then takes away.
+		-- workspace first: activating before the switch lands loses focus to it
 		if b and b ~= "" then
 			window:perform_action(act.SwitchToWorkspace({ name = b }), pane)
 		end
@@ -578,8 +667,7 @@ local function perform_action_line(window, pane, verb, a, b)
 			end)
 		end
 	elseif verb == "toast" then
-		-- wezterm's own notification rather than osascript's: it is tied to the
-		-- terminal, so it does not arrive claiming to be from Script Editor.
+		-- not osascript, which toasts as Script Editor
 		window:toast_notification(a or "wezterm", b or "", nil, 8000)
 	end
 end
@@ -611,6 +699,10 @@ end
 
 wezterm.on("update-right-status", function(window, pane)
 	drain_actions(window, pane)
+	digest_refresh()
+	if chime_overdue then
+		pcall(chime_overdue, window)
+	end
 
 	local parts = {}
 	local width = 0
@@ -627,19 +719,19 @@ wezterm.on("update-right-status", function(window, pane)
 		width = width + 10
 	end
 
-	-- What wants you in a workspace you are not looking at. Nothing else in this config
-	-- can say it, and with a dozen workspaces open a blocked pane can sit unseen for
-	-- hours. Ahead of the workspace name because it is the only part of the bar that is
-	-- about somewhere else.
+	-- what wants you in other workspaces
 	if attention_elsewhere then
 		local away = attention_elsewhere(window)
-		-- Ahead of the rest because it is the only one asking for something away
-		-- from the keyboard, and the only channel here that no notification
-		-- permission can silently drop.
+		-- first: the one channel no notification permission can drop
 		if (away.needs or 0) > 0 then
 			table.insert(parts, { Foreground = { Color = "#f38ba8" } })
 			table.insert(parts, { Text = string.format(" ●%d needs you", away.needs) })
 			width = width + 12
+		end
+		if away.errored > 0 then
+			table.insert(parts, { Foreground = { Color = "#f38ba8" } })
+			table.insert(parts, { Text = string.format(" !%d", away.errored) })
+			width = width + 4
 		end
 		if away.asking > 0 then
 			table.insert(parts, { Foreground = { Color = "#cba6f7" } })
@@ -653,8 +745,7 @@ wezterm.on("update-right-status", function(window, pane)
 		end
 	end
 
-	-- Kept warm from here rather than from the keypress: LEADER+w draws the branch column
-	-- from the last snapshot, so the snapshot has to already exist.
+	-- LEADER+w must not wait on git, so its branch snapshot is kept warm here (throttled)
 	if ws_git_refresh then
 		ws_git_refresh()
 	end
@@ -684,8 +775,7 @@ wezterm.on("update-right-status", function(window, pane)
 	table.insert(parts, { Text = "  " .. workspace .. " " .. blank })
 	width = width + #workspace + 4
 
-	-- format-tab-title is told the config's tab_max_width, not how much bar is
-	-- actually left, so measure it here where the window is in hand.
+	-- format-tab-title cannot see the real bar width, so measure it here
 	local ok, size = pcall(function()
 		return window:active_tab():get_size()
 	end)
@@ -701,32 +791,24 @@ wezterm.on("update-right-status", function(window, pane)
 end)
 
 -- ============================================================
--- Tab titles: name every Claude pane in the tab, not just the focused one
--- Claude Code writes each session's topic into its own pane title, prefixed with
--- a status glyph (spinner = working, anything else = waiting, see is_working), so a
--- 3-4 way split already knows what each chat is about; the tab bar has to show it.
--- Precedence: a title typed by hand (LEADER+,) wins, then live pane topics, then
--- a pin left by the save layer, then whatever the active pane calls itself.
+-- Tab titles: every Claude pane's topic, not just the focused one.
+-- Precedence: typed (LEADER+,), live pane topics, save-layer pin, active pane title.
 -- ============================================================
--- A whole topic, not half of one, and the only ceiling left. At 52, with label_width's
--- predecessor also limiting, a window with one tab and four hundred spare columns still
--- wrote "Audit and sync HubSp…": two caps on the same number, and the wrong one bound.
+-- a whole topic; the only ceiling left
 local SOLO_BUDGET = 96
 local MIN_LABEL = 10 -- a label with room for a subject, not just a verb
 local TERSE_LABEL = 5 -- squeezed, but still names something
 local GROUP_LABEL = 14 -- a tab's own name, the part before TAB_GROUP_SEP
--- Reserves for chrome this code cannot measure. Generous on purpose: unused bar is
--- just empty, whereas overshooting means wezterm clips the tabs itself, which is
--- the failure this whole calculation exists to avoid. Raise if tabs still clip.
--- Per-tab overhead this code cannot measure. It was 8 on the reasoning that unused bar
--- is harmless, which is true in a two-tab window and false in a ten-tab one: there it
--- was claiming 80 of 111 columns and starving every tab of a name. 5 with the close
--- button turned off. Raise it if tabs start clipping, which is the failure it exists
--- to avoid.
-local TAB_CHROME = 5
-local BAR_SLACK = 6 -- new tab button, and rounding
+-- fancy bar padding+border per tab: 0.5 cells each side + 1px, in *terminal* cells, hence
+-- the conversion. Raise if tabs clip.
+local TAB_CHROME = math.ceil(1.3 * FRAME_CELLS)
+-- retro bar: the " + " button; plus one separator cell per tab gap
+local NEW_TAB_CELLS = 3
+-- integrated buttons share the row but wezterm omits them from the per-tab divisor, so
+-- take them off first. Estimated.
+local WINDOW_BUTTON_CELLS = 10
 
--- Titles that name a program rather than a task.
+-- program names, not tasks
 local UNINFORMATIVE = {
 	zsh = true,
 	bash = true,
@@ -737,13 +819,12 @@ local UNINFORMATIVE = {
 	vim = true,
 	node = true,
 	tmux = true,
-	-- The cc-board overlay, before and after strip_glyph.
+	-- cc-board overlay, before and after strip_glyph
 	["▤ board"] = true,
 	["board"] = true,
 }
 
--- Leading verbs nearly every generated topic opens with. Dropping one keeps the
--- subject visible when four panes are sharing the budget.
+-- dropped to keep the subject visible when panes share the budget
 local FILLER_VERBS = {
 	"Set up",
 	"Review", "Investigate", "Implement", "Configure", "Refactor", "Simplify",
@@ -768,25 +849,20 @@ local function shorten(text, budget)
 		return text
 	end
 	local cut = text:sub(1, budget - 1)
-	-- cut back to a word boundary only when that still fills most of the budget;
-	-- at 12 chars a mid-word cut carries more than a lonely first word
+	-- word boundary only if it still fills most of the budget
 	local last_space = cut:match("^.*()%s")
 	if last_space and last_space > budget * 0.75 then
 		cut = cut:sub(1, last_space - 1)
 	end
-	-- never leave half a multi-byte glyph behind
-	while #cut > 0 and cut:byte(#cut) >= 0x80 and cut:byte(#cut) < 0xC0 do
-		cut = cut:sub(1, #cut - 1)
+	-- half a multibyte glyph makes wezterm reject the whole title
+	while #cut > 0 and not utf8.len(cut) do
+		cut = cut:sub(1, -2)
 	end
 	return cut .. "…"
 end
 
----Claude Code leads a working session's title with the circle-halves spinner,
----◐◓◑◒ (U+25D0-U+25D3, ie. E2 97 90..93 in UTF-8), and an idle one with a dingbat
----asterisk, ✳ (U+2733). Older builds spun braille, so that range still counts.
----Worth keeping in step with Claude Code: pane_status trusts this over the state
----file, so a spinner it cannot see leaves every busy pane reading as waiting, and
----leaves an answered permission prompt stuck on asking until the turn ends.
+---Working titles lead with ◐◓◑◒ (E2 97 90..93), idle with ✳ (U+2733); braille on old
+---builds. Keep in step with Claude Code: pane_status trusts this over the state file.
 local function is_working(title)
 	local b1, b2, b3 = title:byte(1), title:byte(2) or 0, title:byte(3) or 0
 	if b1 ~= 0xE2 then
@@ -796,10 +872,8 @@ local function is_working(title)
 		or (b2 >= 0xA0 and b2 <= 0xA3) -- braille, pre-2.1 builds
 end
 
----True for a title Claude wrote, whichever status glyph it happens to be carrying:
----the spinner above, or a dingbat asterisk (U+2733 and friends, E2 9C/9D xx). Used
----to spot a tab title that came from a Claude pane rather than from the keyboard,
----including pins saved before AUTO_TITLE_MARK existed.
+---Title written by Claude (spinner or dingbat E2 9C/9D xx), not typed; catches pins that
+---predate AUTO_TITLE_MARK.
 local function has_claude_glyph(title)
 	if is_working(title) then
 		return true
@@ -813,9 +887,7 @@ local function is_ascii_alnum(byte)
 		and ((byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122))
 end
 
----Drop the leading status glyph and the space after it.
----Done byte-wise on purpose: wezterm's Lua counts bytes above 0x7F as %w, so the
----character classes cannot be trusted to find where the title's words start.
+---Drop leading glyph + space. Byte-wise: wezterm's Lua counts bytes > 0x7F as %w.
 local function strip_glyph(title)
 	local at = 1
 	while at <= #title and not is_ascii_alnum(title:byte(at)) do
@@ -827,7 +899,7 @@ local function strip_glyph(title)
 	return title:sub(at)
 end
 
----@return string|nil label, boolean working, boolean silent pane exists but has announced no title
+---@return string|nil label, boolean working, boolean silent: pane has no title yet
 local function pane_label(pane)
 	local raw = (pane.title or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if raw == "" then
@@ -847,8 +919,7 @@ local function pane_label(pane)
 	return label, working
 end
 
----Last resort when no pane in the tab has announced a title: name its directory.
----The Url object is only on recent wezterm, hence the pcall.
+---Last resort title: the cwd's basename. pcall: Url object only on recent wezterm.
 local function pane_dir(pane)
 	local ok, path = pcall(function()
 		local cwd = pane.current_working_dir
@@ -863,46 +934,73 @@ end
 
 local FRESH_SECONDS = 90 -- how long a finished turn still reads as just-finished
 local STALE_SECONDS = 4 * 3600 -- past this, a waiting pane stops competing for attention
+-- Must match cc-roster and cc-board. A Monitor cannot outlive an hour.
+local PARKED_MONITOR_MAX = 3600
+local PARKED_MAX = 4 * 3600
 
----What hooks/wezterm-pane-state.sh last recorded for a pane: state, the epoch it
----was written, and for "asking" the tool Claude is blocked on.
-local function read_pane_state(pane_id)
+---Last hook record for a pane: state, epoch, detail, writing sid
+local read_pane_state = memo_per_second(function(pane_id)
 	local file = io.open(pane_state_dir .. "/" .. pane_id, "r")
 	if not file then
 		return nil
 	end
 	local line = file:read("*line") or ""
 	file:close()
-	local state, at, detail = line:match("^(%a+)\t(%d+)\t(.*)$")
+	local state, at, detail, sid = line:match("^(%a+)\t(%d+)\t([^\t]*)\t?(.*)$")
 	if state == nil then
 		return nil
 	end
-	return { state = state, at = tonumber(at), detail = detail }
-end
+	-- panes outlive sessions: drop a record another session wrote. No sid = old, trusted.
+	if sid ~= "" then
+		local reg = digest_rows()[tostring(pane_id)]
+		if reg ~= nil and reg.sid ~= "" and reg.sid ~= sid then
+			return nil
+		end
+	end
+	return { state = state, at = tonumber(at), detail = detail, sid = sid }
+end)
 
----Resolve what a pane should look like. The spinner in the live title outranks the
----state file, which Claude may have died still holding.
----@return string status "working"|"asking"|"fresh"|"waiting"|"stale", string detail
+---Registry + hook record, most decisive first:
+--- 1. registry `waiting`: clears when answered, which no hook can do
+--- 2. hook `errored`: registry reads idle after an API death. Cleared only by registry
+---    busy (a new turn), not idle and not the spinner, which keeps its turn-start glyph
+--- 3. hook `asking`: beats the registry by seconds; dropped once the title spins again
+--- 4. spinner or registry busy: each catches what the other misses
+--- 5. hook `parked`: registry also calls it idle
+--- 6. age since the later of the two clocks
+---@return string status working|asking|errored|parked|fresh|waiting|stale, string detail
 local function pane_status(pane, spinning)
-	if spinning then
-		return "working", ""
-	end
+	local reg = digest_rows()[tostring(pane.pane_id)]
 	local rec = read_pane_state(pane.pane_id)
-	if rec == nil then
-		return "waiting", "" -- no hook has run here yet: the old two-state behaviour
+	-- not a Claude pane, or one that has said nothing yet
+	if reg == nil and rec == nil then
+		return spinning and "working" or "waiting", ""
 	end
-	if rec.state == "asking" then
+	local busy = reg ~= nil and reg.status == "busy"
+	if reg ~= nil and reg.status == "waiting" then
+		return "asking", reg.detail
+	end
+	if rec ~= nil and rec.state == "errored" and not busy then
+		return "errored", rec.detail
+	end
+	if rec ~= nil and rec.state == "asking" and not busy and not spinning then
 		return "asking", rec.detail
 	end
-	if rec.state == "ended" then
+	if spinning or busy then
+		return "working", ""
+	end
+	-- parked has no writer when the background work ends, so it expires (CLAUDE.md)
+	if rec ~= nil and rec.state == "parked"
+		and os.time() - rec.at <= (rec.detail == "monitor" and PARKED_MONITOR_MAX or PARKED_MAX)
+	then
+		return "parked", rec.detail
+	end
+	if rec ~= nil and rec.state == "ended" then
 		return "stale", ""
 	end
-	-- "working" without a spinner means the turn is open but Claude is sitting at a
-	-- prompt of its own, so it still wants you; erring towards visible on purpose.
-	if rec.state == "working" then
-		return "waiting", ""
-	end
-	local age = os.time() - (rec.at or 0)
+	-- later clock: a registry file that stopped moving must not overrule a newer hook
+	local at = math.max(reg ~= nil and reg.seen or 0, rec ~= nil and rec.at or 0)
+	local age = os.time() - at
 	if age < FRESH_SECONDS then
 		return "fresh", ""
 	end
@@ -912,37 +1010,25 @@ local function pane_status(pane, spinning)
 	return "waiting", ""
 end
 
--- Pane state reads by hue rather than brightness, so a split tab says at a glance
--- which session wants you. Blue and orange are the session-brief header's own
--- accent and title colours; green is calm on purpose, since a working pane needs
--- nothing from you. Mauve outranks the lot: that session is blocked on a prompt.
+-- status by hue, not brightness; see docs/colour.md
 local TAB_COLOURS = {
 	index = "#6c7086",
 	divider = "#45475a",
 	active = "#87d7ff", -- focused, nothing else to say
 	asking = "#cba6f7", -- blocked on a permission or plan prompt
+	errored = "#f38ba8", -- the turn died on an API error and will not resume itself
 	fresh = "#f9e2af", -- finished in the last FRESH_SECONDS
 	waiting = "#ffd7af", -- stopped, waiting on you
 	working = "#a6e3a1", -- busy
+	parked = "#89dceb", -- turn over, its own background work still running
 	stale = "#6c7086", -- waited hours, or the session has exited
 }
 
--- When only one of a tab's panes can be named, name the one that wants you most.
-local NEED = { asking = 5, fresh = 4, waiting = 3, working = 2, stale = 1 }
+-- which pane to name when only one fits; errored first, a dead turn resumes for nobody
+local NEED = { errored = 6, asking = 5, fresh = 4, waiting = 3, parked = 2.5, working = 2, stale = 1 }
 
--- Identity, which is a different question from status: not "what does this pane want"
--- but "which pane is this". Twenty sessions in one workspace are all named d5-lca-
--- something and all drawn in whatever hue their state happens to be, so the tab bar
--- could say a tab had four chats in it without saying which four.
---
--- Mocha's own accents, and they overlap TAB_COLOURS on purpose. What separates the two
--- channels is role rather than hue: identity never lands on a glyph or a marker, so in
--- this bar it colours only the terse dot - the one that is standing in for a whole pane
--- because nothing else fits. Status keeps every named label, the markers that mean
--- something (? blocked, ✓ just finished), the shape ◆ for focus, and the greys.
---
--- Keep in step with ~/.claude/bin/cc-colour, which is the same ladder and the same
--- hash: the board, the statusLine and this bar have to agree or the colour is noise.
+-- Identity ("which pane is this"), a separate channel from status; see docs/colour.md.
+-- Keep in step with cc-colour: same ladder, same hash.
 local TAB_IDENTITY = {
 	"#f5c2e7", "#cba6f7", "#89b4fa", "#74c7ec", "#94e2d5",
 	"#a6e3a1", "#f9e2af", "#fab387", "#eba0ac",
@@ -956,14 +1042,8 @@ local IDENTITY_PIN_NAMES = {
 	green = 6, yellow = 7, peach = 8, maroon = 9,
 }
 
----Pinned colours: the ones cc-tint chose for itself first, then the hand-pinned ones over
----the top, which is the precedence cc-colour's load_pins uses. Re-read on a timer rather
----than per paint, because this runs for every pane in every tab, once a second.
----
----Three seconds rather than ten. cc-tint writes an auto pin at the moment a session starts,
----so the timer is how long the label can disagree with the ground the pane is already
----wearing, and a disagreement between those two at exactly the moment you start a session
----is the thing this whole scheme is for. Two small file reads every three seconds.
+---Auto pins, then hand pins over them (cc-colour's precedence). Re-read every 3s: that is
+---how long a new session's label can disagree with the tint cc-tint just painted.
 local IDENTITY_PIN_FILES = { "/.claude/session-colours-auto", "/.claude/session-colours" }
 
 local function load_identity_pins()
@@ -985,8 +1065,7 @@ local function load_identity_pins()
 			file:close()
 		end
 	end
-	-- pane_identity caches the resolved colour, so a pin that changed has to invalidate it
-	-- or the bar keeps the old hue for the rest of that cache's life.
+	-- a changed pin must invalidate pane_identity's cache
 	local changed = false
 	for id, slot in pairs(fresh) do
 		if identity_pins[id] ~= slot then
@@ -1008,9 +1087,8 @@ local function load_identity_pins()
 	end
 end
 
----The first 8 hex digits of the session id, mod the palette. Stateless on purpose, so
----this agrees with cc-colour without either of them coordinating, and a colour survives
----/rename and --resume: the id is the one name a session never changes.
+---First 8 hex of the session id mod the palette: stateless, so agrees with cc-colour and
+---survives /rename and --resume.
 local function identity_of(session_id)
 	if session_id == nil then
 		return nil
@@ -1027,8 +1105,7 @@ local function identity_of(session_id)
 	return TAB_IDENTITY[slot]
 end
 
--- pane id -> colour. read_session_id is a file open, and the bar repaints every pane
--- every second; the mapping only changes when a session starts in the pane.
+-- pane id -> colour; changes only when a session starts in the pane
 local identity_cache = {}
 local identity_cache_at = 0
 local identity_cache_generation = 0
@@ -1052,107 +1129,170 @@ end
 
 focused_identity = pane_identity
 
--- Status is a dot. Only asking and fresh get a shape of their own, because those are the
--- two you act on; everything else is the same ● in a different colour, which is what makes
--- a tab of four panes read as one row rather than as four unrelated marks. Giving each
--- state its own glyph was tried and it looked like punctuation.
---
--- The dot is also the whole of status in this bar now: the label text next to it belongs to
--- identity. One shape and two colours per pane, and no background tints, which is as few
--- things as this can be while still answering both questions.
+-- Status is a ●; only the states you act on (asking, errored, fresh) get their own shape.
+-- Label text belongs to identity.
 
 ---@return string colour, string marker, integer marker width in cells
 local function status_style(status, detail, active, budget)
 	if status == "asking" then
-		-- with room, the marker names what it is blocked on: "?bash pool DDI ag…"
+		-- with room, name the tool: "?bash ..."
 		if detail ~= "" and budget >= 20 then
 			local tool = "?" .. detail:lower() .. " "
 			return TAB_COLOURS.asking, tool, #tool
 		end
 		return TAB_COLOURS.asking, "?", 1
 	end
+	if status == "errored" then
+		if detail ~= "" and budget >= 20 then
+			local why = "!" .. detail:gsub("_", " ") .. " "
+			return TAB_COLOURS.errored, why, #why
+		end
+		return TAB_COLOURS.errored, "!", 1
+	end
 	if status == "fresh" then
 		return TAB_COLOURS.fresh, "✓", 1
 	end
-	-- calm blue only for the pane whose screen you are looking at; see on_screen
+	-- calm blue only for the pane on screen; see on_screen
 	if status == "waiting" and active then
 		return TAB_COLOURS.active, "", 0
 	end
 	return TAB_COLOURS[status] or TAB_COLOURS.waiting, "", 0
 end
 
--- Prefix is " 1: ", or " 10: " past nine tabs. Budgeted at the wider one, so a tenth tab
--- opening cannot make every label in the window one cell too long.
+-- " 10: " not " 1: ", so a tenth tab cannot push every label one cell over
 local PREFIX_CELLS = 5
 
----One label width for every pane in the window.
----
----This used to be a per-tab share, divided by that tab's pane count. Both halves were
----defensible - a busy tab has more topics to name, a tab you are looking at is worth more
----room - and together they made the same topic 13 cells wide in one tab and 18 in the next
----for reasons that were completely invisible from the bar. Every pane getting the same
----width turns out to be worth more than every tab getting a fair share, so the window is
----divided at once and the answer never depends on which tab a pane sits in.
----
----Nothing is held back either: what is left after chrome, prefixes and dividers is split
----between the panes on the bar, capped only at a whole topic each.
+---Cells one pane wants: label + shape + space. Nil = no topic (costs a `+N` instead).
+---Over-estimate is the safe direction.
+local function pane_demand(pane, terse)
+	local label = pane_label(pane)
+	if label == nil then
+		return nil
+	end
+	return #(terse and strip_filler(label) or label) + 2
+end
+
+---Largest cap W with sum(min(demand, W)) <= budget (water-fill). One cap per tab so
+---clipped labels clip at the same width.
+---@param demands integer[] mutated: sorted in place
+local function fill_cap(demands, budget)
+	table.sort(demands)
+	local left = #demands
+	for _, want in ipairs(demands) do
+		if budget < want * left then
+			return math.floor(budget / left)
+		end
+		budget = budget - want
+		left = left - 1
+	end
+	return SOLO_BUDGET -- every topic in the tab fits whole
+end
+
+---wezterm's per-tab ceiling in frame cells: fancy_tab_bar.rs `pixel_width / num_tabs -
+---1.5 cells`, num_tabs including the new-tab button, whether or not the bar is full.
+---tab_max_width does not affect it in fancy mode.
+---@return integer frame cells for one tab's whole row, chrome and prefix included
+local function tab_ceiling(geom, ntabs)
+	local bar = geom.cols * FRAME_CELLS - WINDOW_BUTTON_CELLS
+	-- +1 for the new-tab button: counted in wezterm's divisor, not capped by it
+	return math.floor(bar / (ntabs + 1) - 1.5 * FRAME_CELLS)
+end
+
+---Tab's own name: text before TAB_GROUP_SEP, or a hand-typed title. "" for a save-layer
+---pin. Separate because label_width prices every tab's name.
+local function tab_group(pinned)
+	pinned = pinned or ""
+	local sep = pinned:find(TAB_GROUP_SEP, 1, true)
+	if sep ~= nil then
+		return (pinned:sub(1, sep - 1):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+	if pinned == "" then
+		return ""
+	end
+	if pinned:find(AUTO_TITLE_MARK, 1, true) ~= nil or has_claude_glyph(pinned) then
+		return "" -- a pin, not a name: the pane topics are fresher
+	end
+	return (pinned:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+---What a tab spends before any label: its name, and the divider after it.
+local function group_cost(pinned)
+	local group = tab_group(pinned)
+	return group ~= "" and (#shorten(group, GROUP_LABEL) + 2) or 0
+end
+
+---Every label a tab will draw, in cells it would like to have.
+---@return integer[] demands
+local function tab_demands(tab)
+	local panes = tab.panes or { tab.active_pane }
+	if tab.active_pane ~= nil and tab.active_pane.is_zoomed then
+		panes = { tab.active_pane } -- a zoomed tab draws one label whatever it contains
+	end
+	local demands = {}
+	local terse = #panes > 1 -- format-tab-title drops filler verbs in a split
+	for _, pane in ipairs(panes) do
+		local want = pane_demand(pane, terse)
+		if want ~= nil then
+			table.insert(demands, want)
+		end
+	end
+	return demands
+end
+
+---One label width for this tab's panes. fancy: share within the tab, capped by
+---tab_ceiling. retro: share across the window; overshoot by one cell and wezterm clamps
+---every tab to `available / ntabs` at once. Both water-fill. See docs/cc-board.md.
+---@param overhead integer cells this row spends before any label: group name, +N, zoom
 ---@return integer cells per label, 0 when not even a terse row fits
-local function label_width(tab, tabs)
+local function label_width(tab, tabs, overhead)
 	local geom = tab_geometry[tab.tab_id]
 	if geom == nil then
-		-- Not measured yet: the first paint after a config reload runs before any status
-		-- tick. Claim room rather than guess narrow, so that frame shows labels and lets
-		-- tab_max_width clip if it must, instead of flashing a bar full of dots.
+		-- first paint after reload precedes any status tick; claim room, not a bar of dots
 		return SOLO_BUDGET
 	end
-	local ntabs, npanes = 0, 0
-	if tabs ~= nil and #tabs > 0 then
-		for _, other in ipairs(tabs) do
-			ntabs = ntabs + 1
-			npanes = npanes + math.max(1, #(other.panes or {}))
+	local ntabs = (tabs ~= nil and #tabs > 0) and #tabs or math.max(1, geom.tabs or 1)
+	local demands, room
+
+	if FANCY then
+		demands = tab_demands(tab)
+		local mine = math.max(1, #demands)
+		room = tab_ceiling(geom, ntabs) - TAB_CHROME - PREFIX_CELLS - (mine - 1) - (overhead or 0)
+		if room < mine then
+			return 0
 		end
 	else
-		ntabs = math.max(1, geom.tabs or 1)
-		npanes = math.max(ntabs, #(tab.panes or {}) * ntabs)
+		-- every pane on the bar; this tab's overhead is already inside the sum
+		demands = {}
+		local npanes = 0
+		room = geom.cols - geom.reserve - NEW_TAB_CELLS - WINDOW_BUTTON_CELLS - (ntabs - 1)
+		for _, other in ipairs(tabs or {}) do
+			local want = tab_demands(other)
+			npanes = npanes + math.max(1, #want)
+			room = room - PREFIX_CELLS - group_cost(other.tab_title) - math.max(0, #want - 1)
+			for _, cells in ipairs(want) do
+				table.insert(demands, cells)
+			end
+		end
+		if room < npanes then
+			return 0
+		end
 	end
-	-- one divider between panes inside a tab, so npanes - ntabs of them across the bar
-	local chrome = ntabs * (TAB_CHROME + PREFIX_CELLS) + (npanes - ntabs) + BAR_SLACK
-	local text = geom.cols - geom.reserve - chrome
-	if text < npanes then
-		return 0
+
+	if #demands == 0 then
+		return math.max(1, math.min(SOLO_BUDGET, room))
 	end
-	local mine = math.max(1, #(tab.panes or {}))
-	return math.max(
-		1,
-		math.min(
-			SOLO_BUDGET,
-			math.floor(text / npanes),
-			-- never so wide that wezterm's own tab_max_width clips the tab back
-			math.floor((config.tab_max_width - PREFIX_CELLS - mine) / mine)
-		)
-	)
+	return math.max(1, math.min(SOLO_BUDGET, fill_cap(demands, room)))
 end
 
 wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 	local prefix = " " .. (tab.tab_index + 1) .. ": "
 	local pinned = tab.tab_title or ""
 	local sep = pinned:find(TAB_GROUP_SEP, 1, true)
-	local group = sep and (pinned:sub(1, sep - 1):gsub("^%s+", ""):gsub("%s+$", "")) or ""
+	-- a typed name without the separator still becomes the group
+	local group = tab_group(pinned)
 
 	local ok, formatted = pcall(function()
-		local auto_pin = sep ~= nil
-			or pinned:find(AUTO_TITLE_MARK, 1, true) ~= nil
-			or has_claude_glyph(pinned)
-		-- A name typed without the separator is still a name, not an instruction to
-		-- drop every pane label, so it becomes the group. A tab with no Claude panes
-		-- builds no labels and falls through to the title exactly as typed.
-		if pinned ~= "" and not auto_pin then
-			group = pinned:gsub("^%s+", ""):gsub("%s+$", "")
-		end
-
-		-- A pane's is_active only means active *within its tab*, so all five tabs have
-		-- one. What earns the calm colour and the bold is the pane actually on screen:
-		-- a waiting pane in a tab you cannot see still has to shout.
+		-- is_active is only within its tab; calm colour and bold are for the pane on screen
 		local on_screen = tab.is_active == true
 		local labels = {}
 		local silent = 0
@@ -1194,18 +1334,13 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 
 		local count = #labels
 		local marks = (silent > 0 and not zoomed) and #(" +" .. silent) or 0
-		local per = label_width(tab, tabs)
-		-- Dropped when label_width has already said there is no room at all, so a name
-		-- can never resurrect a zero budget into a one-cell label.
-		local name = (group ~= "" and per > 0) and shorten(group, GROUP_LABEL) or ""
-		local name_cost = name ~= "" and (#name + 2) or 0
-		-- the +N, the name and the zoom arrow come out of the labels, not out of the bar
-		if marks > 0 or zoomed or name_cost > 0 then
-			per = math.max(1, per - math.ceil((marks + name_cost + (zoomed and 2 or 0)) / count))
-		end
-		-- What is left for a topic once a terse row has spent one cell per pane on its dot.
-		-- Must come off the row's own budget: taking it off the bar instead is how a tab
-		-- ends up wider than the share it was given and wezterm clips the lot.
+		-- +N, name and zoom arrow come off the ceiling before water-filling, not per label
+		local named = shorten(group, GROUP_LABEL)
+		local overhead = marks + (zoomed and 2 or 0) + (group ~= "" and (#named + 2) or 0)
+		local per = label_width(tab, tabs, overhead)
+		-- a name must not turn a zero budget into a one-cell label
+		local name = (group ~= "" and per > 0) and named or ""
+		-- terse row's leftover after one dot per pane; off the row's budget, not the bar's
 		local spare = per * count - count
 
 		local items = {
@@ -1215,9 +1350,7 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 		}
 
 		if name ~= "" then
-			-- Bold in the index's own grey, so the name reads as chrome beside the tab
-			-- number rather than as one more pane. No new hue: identity still means
-			-- only "which session is this".
+			-- index grey, bold: chrome, not one more pane
 			table.insert(items, { Attribute = { Intensity = "Bold" } })
 			table.insert(items, { Text = name })
 			table.insert(items, { Attribute = { Intensity = "Normal" } })
@@ -1226,14 +1359,7 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 		end
 
 		if per == 0 or (count > 1 and per < TERSE_LABEL) then
-			-- Too tight to name every pane, so drop to one glyph each. These used to be
-			-- status dots, which said how many chats were in the tab and who wanted you
-			-- but never which chats - and in a nine-tab window of four-way splits this
-			-- row of dots is the entire tab bar, so "which" is what it has to carry.
-			-- The dot takes the pane's identity colour; the two statuses that actually
-			-- want you keep their own hue and their own shape (? blocked, ✓ just
-			-- finished), focus stays the shape ◆ rather than a colour, and a stale pane
-			-- stays grey because which chat it is has stopped mattering.
+			-- too tight: one glyph per pane
 			for _, label in ipairs(labels) do
 				local colour, marker = status_style(label.status, label.detail, label.active, 0)
 				table.insert(items, { Attribute = { Intensity = label.active and "Bold" or "Normal" } })
@@ -1241,8 +1367,7 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 				table.insert(items, { Text = marker ~= "" and marker or (label.active and "◆" or "●") })
 			end
 			if spare >= TERSE_LABEL then
-				-- one topic fits, so name whichever pane wants you rather than the one
-				-- you are already looking at, whose screen is right there
+				-- one topic fits: name the pane that wants you most
 				local pick = labels[1]
 				for _, label in ipairs(labels) do
 					if (NEED[label.status] or 0) > (NEED[pick.status] or 0) then
@@ -1260,21 +1385,15 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 					table.insert(items, { Foreground = { Color = TAB_COLOURS.divider } })
 					table.insert(items, { Text = "│" })
 				end
-				-- with the tab split, generic verbs are pure noise: three panes reading
-				-- "Review customer…", "Review producti…" tell you nothing apart
 				local text = (count > 1 or per < MIN_LABEL) and strip_filler(label.text) or label.text
 				local colour, marker, marker_width =
 					status_style(label.status, label.detail, label.active, per)
 				if marker == "" then
 					marker, marker_width = label.active and "◆" or "●", 1
 				end
-				-- The same dot as the terse row, then the name in the pane's own colour:
-				-- the dot is what it wants, the name is which one it is. Two colours and
-				-- one shape per pane, so a split tab still reads as a row.
+				-- dot = status colour, name = identity colour
 				table.insert(items, { Attribute = { Intensity = label.active and "Bold" or "Normal" } })
 				table.insert(items, { Foreground = { Color = colour } })
-				-- a space after the dot: without it the status shape runs straight into
-				-- Claude's own topic and the two read as one word
 				table.insert(items, { Text = marker .. " " })
 				table.insert(items, { Foreground = { Color = label.identity or TAB_COLOURS.waiting } })
 				table.insert(items, { Text = shorten(text, math.max(1, per - marker_width - 1)) })
@@ -1283,8 +1402,7 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 
 		table.insert(items, { Attribute = { Intensity = "Normal" } })
 		if marks > 0 then
-			-- panes that exist but have not announced a title yet, so the tab bar
-			-- never understates how many chats are hiding in the split
+			-- untitled panes, so the count is never understated
 			table.insert(items, { Foreground = { Color = TAB_COLOURS.divider } })
 			table.insert(items, { Text = " +" .. silent })
 		end
@@ -1302,31 +1420,24 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 	if title == "" then
 		title = pane_dir(tab.active_pane) or "…"
 	end
-	local room = math.max(TERSE_LABEL, label_width(tab, tabs))
+	local room = math.max(TERSE_LABEL, label_width(tab, tabs, 0))
 	return prefix .. shorten(title, room) .. " "
 end)
 
 -- ============================================================
 -- Claude: address another session
--- Every live Claude session answers to a name, and its SendMessage tool routes by
--- that name. LEADER+@ lists them by topic and types the chosen one in at the cursor,
--- so "send this to " can be finished without leaving the prompt; it lands on the
--- clipboard too, for when the target is a browser or another app.
---
--- Names default to the cwd basename plus a random suffix, so four panes in one repo
--- all look alike until /rename has been run in them. ~/.claude/bin/cc-peers is the
--- shared roster, read by Claude itself to turn "the window doing the migration"
--- into an address, and by the statusLine to end each pane with its own @name. The key is
--- @ because that is the sigil the statusLine uses; what it types is the bare name, since
--- a literal @ in the Claude prompt opens the file-mention menu instead.
+-- LEADER+@ picks a live session by topic and types its SendMessage name at the cursor
+-- (and clipboard). Bare name: a literal @ in the Claude prompt opens file mentions.
 -- ============================================================
 local peers_script = wezterm.home_dir .. "/.claude/bin/cc-peers"
 
--- The statusLine's @name is the only @-token on its line, so quick-select
--- (CTRL+SHIFT+SPACE) can lift an address off the screen without a selection.
-config.quick_select_patterns = { "@[a-z0-9][a-z0-9_.-]{1,48}" }
+-- quick-select: statusLine @name, session ids, file:line (defaults cover URLs, SHAs)
+config.quick_select_patterns = {
+	"@[a-z0-9][a-z0-9_.-]{1,48}",
+	"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+	"[\\w./~-]+\\.\\w{1,6}:\\d+(?::\\d+)?",
+}
 
--- Same hues the tab bar uses, so a busy session reads as busy in both places.
 local PEER_STATE_COLOURS = {
 	busy = TAB_COLOURS.working,
 	asking = TAB_COLOURS.asking,
@@ -1383,7 +1494,7 @@ table.insert(config.keys, {
 					if not id then
 						return
 					end
-					-- Not on every wezterm build, and the typed name is the point anyway.
+					-- not on every build
 					pcall(function()
 						win:copy_to_clipboard(id)
 					end)
@@ -1397,24 +1508,8 @@ table.insert(config.keys, {
 
 -- ============================================================
 -- Claude: the fleet
--- A tab bar indexes the window you are already looking at. Past a dozen conversations
--- across a dozen workspaces that is the wrong index, and no amount of label_width fixes
--- it: the session you want is usually not in this window at all. Two gaps follow, and
--- this section closes both.
---
--- LEADER+; is the missing index. One fuzzy list of every live session in every
--- workspace, each with its state, how long since *you* last typed into it, and its
--- topic; picking one jumps there across the workspace boundary. Once that exists the tab
--- bar goes back to being a glance rather than navigation.
---
--- The right status gains a count of what wants you *elsewhere*, which nothing else here
--- can say: a pane sitting on a permission prompt two workspaces away is invisible until
--- you happen to switch to it.
---
--- ~/.claude/bin/cc-fleet is the shared roster underneath, read through cc-board, which is
--- the only layer that can see whether a stopped session finished or asked you something.
--- Its other half is the part no keybinding can do for you: `cc-fleet --stale` lists the
--- conversations you have not spoken to in hours, so they get closed rather than accumulated.
+-- LEADER+; fuzzy-lists every live session in every workspace and jumps across the
+-- workspace boundary. The right status counts what wants you elsewhere.
 -- ============================================================
 local board_script = wezterm.home_dir .. "/.claude/bin/cc-board"
 
@@ -1425,12 +1520,10 @@ local FLEET_GLYPH = {
 	shell = { "›", TAB_COLOURS.stale },
 }
 
--- Opens on whatever wants you rather than on whatever started first. Fuzzy search is the
--- main way in, but the top of an unfiltered list is free.
+-- unfiltered list opens on whatever wants you
 local FLEET_WEIGHT = { asking = 4, busy = 3, idle = 2, shell = 1 }
 
--- Past this, a session you have not prompted reads as archaeology rather than work, and
--- is dimmed in the picker. Matches cc-fleet's own default so the two agree.
+-- dimmed past this; matches cc-fleet's default
 local FLEET_STALE = 8 * 3600
 
 ---Time since your last prompt, in the width the picker can spare.
@@ -1455,11 +1548,7 @@ local function fleet_pad(text, width)
 end
 
 ---@return table InputSelector choices, id = the pane to jump to
----
----Fed by cc-board rather than cc-fleet, because cc-fleet cannot tell a session that
----finished from one that stopped to ask you something - only a pane's own screen can, and
----cc-board is what reads it. Costs about half a second to open, which is the price of the
----one column worth having.
+---cc-board, not cc-fleet: only the pane's screen tells finished from asking (~0.5s)
 local function fleet_choices()
 	local ok, ran, stdout = pcall(wezterm.run_child_process, { board_script, "--tsv", "--all" })
 	if not ok or not ran then
@@ -1486,7 +1575,6 @@ local function fleet_choices()
 				title = f[8],
 				last = f[9],
 				identity = (f[10] or ""):match("^#%x%x%x%x%x%x$"),
-				-- Waiting outranks working: one wants an answer, the other wants nothing.
 				weight = asks and 5 or (FLEET_WEIGHT[f[4]] or 0),
 			})
 		end
@@ -1496,7 +1584,7 @@ local function fleet_choices()
 		if a.weight ~= b.weight then
 			return a.weight > b.weight
 		end
-		-- Never-prompted sorts last within its state: it is a handover nobody has read.
+		-- never-prompted last within its state
 		local ai = a.idle < 0 and math.huge or a.idle
 		local bi = b.idle < 0 and math.huge or b.idle
 		return ai < bi
@@ -1520,8 +1608,7 @@ local function fleet_choices()
 			{ Text = marker .. " " },
 			{ Foreground = { Color = TAB_COLOURS.index } },
 			{ Text = fleet_pad(r.ws, 13) },
-			-- the name in the pane's own colour, the glyph above still in its state's:
-			-- scanning this list for "the teal one" is the whole point of having colours
+			-- name in identity colour, glyph in status colour
 			{ Foreground = { Color = r.identity or colour } },
 			{ Text = fleet_pad(r.name, 19) },
 			{ Foreground = { Color = TAB_COLOURS.index } },
@@ -1529,8 +1616,7 @@ local function fleet_choices()
 			{ Foreground = { Color = topic_colour } },
 			{ Text = fleet_pad(r.title, 44) },
 		}
-		-- The closing line last, so fuzzy matching reaches it: "staging?" finds the session
-		-- asking whether to commit, without you remembering which one that was.
+		-- last line last, so fuzzy matching reaches it
 		if r.last ~= "" then
 			table.insert(label, { Foreground = { Color = r.asks and TAB_COLOURS.asking or TAB_COLOURS.divider } })
 			table.insert(label, { Text = "▸ " .. r.last })
@@ -1540,15 +1626,9 @@ local function fleet_choices()
 	return choices
 end
 
----Focus a pane wherever it lives. Two steps, because they are two different layers:
----activating at the mux level moves the focus within the pane's own workspace, and the
----workspace then has to be brought to the front.
----
----Which is a window raise, not a workspace switch. Every workspace here has its own GUI
----window, so SwitchToWorkspace would repoint *this* window at a workspace that already
----has one, leaving two windows claiming it and the one you came from showing the wrong
----desk. Falling back to a switch only for a workspace with no window of its own: one
----restored from a save, or left behind when its window was closed.
+---Focus a pane anywhere: mux activate, then raise its gui_window(). Not SwitchToWorkspace,
+---which would repoint *this* window at a workspace that already has one. Switch only when
+---the workspace has no window of its own.
 local function fleet_jump(window, pane, pane_id)
 	local target = wezterm.mux.get_pane(pane_id)
 	if not target then
@@ -1564,8 +1644,7 @@ local function fleet_jump(window, pane, pane_id)
 		return
 	end
 
-	-- Falling through rather than returning if the raise fails, so an older wezterm
-	-- without GuiWindow:focus still lands you on the right desk via the switch below.
+	-- no GuiWindow:focus on older wezterm: fall through to the switch
 	local gui = mux_window:gui_window()
 	if gui then
 		local raised = pcall(function()
@@ -1609,22 +1688,13 @@ table.insert(config.keys, {
 	end),
 })
 
--- Only two states are worth interrupting a different workspace for: blocked on a prompt,
--- and just finished. "Waiting" would be true of thirty panes at once and so says nothing.
---
--- Throttled because update-right-status fires every second and this walks the mux, but
--- the walk is the cheap half: the cost is one open() per off-window pane, so it is kept
--- to the panes that are not already on screen in front of you.
-local fleet_attention = { at = 0, asking = 0, fresh = 0, needs = 0 }
+-- Status computed once per 3s for all windows; each window counts the panes it cannot see
+-- (counts per window, since "here" differs).
+local fleet_panes = { at = 0, rows = {} }
+local fleet_counts = {} -- window id -> counts, recomputed when fleet_panes moves
 
----What each session has said about itself, out of cc-note. Only `mute` matters in this
----file: a muted session is one Jacob has said he does not want chased, so it must not
----count towards the "wants you elsewhere" marker in the status bar - that marker exists
----to catch a blocked pane in a workspace he is not looking at, and one he has already
----decided to leave is noise in exactly the place noise is most expensive.
----
----Re-read on the same 3s timer the identity pins use, and for the same reason: this runs
----off the status bar tick, which is once a second per window.
+---cc-note flags per sid; `mute` keeps a session out of the elsewhere counts and the chime,
+---`needs` feeds "needs you". Re-read every 3s.
 local notes_flags = {}
 local notes_at = 0
 
@@ -1666,16 +1736,42 @@ local function pane_muted(pane_id)
 	return pane_flagged(pane_id, "mute")
 end
 
-attention_elsewhere = function(window)
+local function fleet_scan()
 	local now = os.time()
-	if now - fleet_attention.at < 3 then
-		return fleet_attention
+	if now - fleet_panes.at < 3 then
+		return fleet_panes
 	end
-	fleet_attention.at = now
-	fleet_attention.asking = 0
-	fleet_attention.fresh = 0
-	fleet_attention.needs = 0
 	load_notes()
+	local rows = {}
+	pcall(function()
+		for _, mux_window in ipairs(wezterm.mux.all_windows()) do
+			for _, tab in ipairs(mux_window:tabs()) do
+				for _, p in ipairs(tab:panes()) do
+					local id = p:pane_id()
+					-- via pane_status so counts cannot disagree with the tab bar
+					table.insert(rows, {
+						id = id,
+						needs = pane_flagged(id, "needs"),
+						muted = pane_muted(id),
+						status = pane_status({ pane_id = id }, is_working(p:get_title() or "")),
+					})
+				end
+			end
+		end
+	end)
+	fleet_panes = { at = now, rows = rows }
+	return fleet_panes
+end
+
+attention_elsewhere = function(window)
+	local scan = fleet_scan()
+	local wid = window:window_id()
+	local counts = fleet_counts[wid]
+	if counts and counts.at == scan.at then
+		return counts
+	end
+	counts = { at = scan.at, errored = 0, asking = 0, fresh = 0, needs = 0 }
+	fleet_counts[wid] = counts
 
 	local here = {}
 	local ok = pcall(function()
@@ -1686,52 +1782,111 @@ attention_elsewhere = function(window)
 		end
 	end)
 	if not ok then
-		return fleet_attention
+		return counts
 	end
 
-	pcall(function()
-		for _, mux_window in ipairs(wezterm.mux.all_windows()) do
-			for _, tab in ipairs(mux_window:tabs()) do
-				for _, p in ipairs(tab:panes()) do
-					local id = p:pane_id()
-					-- `needs` counts wherever the pane is, including this window:
-					-- it means someone has to do something away from the keyboard,
-					-- so having the pane on screen does not discharge it.
-					if pane_flagged(id, "needs") then
-						fleet_attention.needs = fleet_attention.needs + 1
-					end
-					if not here[id] and not pane_muted(id) then
-						local rec = read_pane_state(id)
-						if rec and rec.state == "asking" then
-							fleet_attention.asking = fleet_attention.asking + 1
-						elseif rec and rec.state == "done" and now - (rec.at or 0) < FRESH_SECONDS then
-							fleet_attention.fresh = fleet_attention.fresh + 1
+	for _, row in ipairs(scan.rows) do
+		-- `needs` counts here too: being on screen does not discharge it
+		if row.needs then
+			counts.needs = counts.needs + 1
+		end
+		if not here[row.id] and not row.muted then
+			if counts[row.status] ~= nil then
+				counts[row.status] = counts[row.status] + 1
+			end
+		end
+	end
+	return counts
+end
+
+-- ============================================================
+-- The chime: the only push in this config. OFF (CHIME_ENABLED) because a third
+-- notification channel teaches you to ignore all of them.
+local CHIME_ENABLED = false
+local CHIME_AFTER = 15 * 60
+local chime_dir = wezterm.home_dir .. "/.claude/cache/cc-chimed"
+local chime_at = 0
+
+-- not waiting: too common, it would be noise
+local CHIME_STATES = { asking = true, errored = true }
+
+---One chime per episode, keyed by the state record's epoch so reblocking re-arms it and a
+---reload does not. True when already chimed.
+local function chime_marked(pane_id, epoch)
+	local path = chime_dir .. "/" .. pane_id
+	local file = io.open(path, "r")
+	if file then
+		local was = file:read("*line")
+		file:close()
+		if was == tostring(epoch) then
+			return true
+		end
+	end
+	local out = io.open(path, "w")
+	if not out then
+		return true -- cannot record it, so do not risk chiming every thirty seconds
+	end
+	out:write(tostring(epoch))
+	out:close()
+	return false
+end
+
+chime_overdue = function(window)
+	if not CHIME_ENABLED then
+		return
+	end
+	local now = os.time()
+	if now - chime_at < 30 then
+		return
+	end
+	chime_at = now
+
+	-- One window per pass, claimed by mkdir (atomic, fails if present). Not os.rename:
+	-- POSIX rename overwrites, so every caller wins. Not lowest window id: it may not be
+	-- ticking. Time-bucketed so claims expire; cleanup is the bucket before last.
+	local bucket = math.floor(now / 30)
+	local claimed = wezterm.run_child_process({ "/bin/mkdir", chime_dir .. "/.pass-" .. bucket })
+	if not claimed then
+		return
+	end
+	wezterm.background_child_process({ "/bin/rm", "-rf", chime_dir .. "/.pass-" .. (bucket - 2) })
+
+	for _, mux_window in ipairs(wezterm.mux.all_windows()) do
+		for _, tab in ipairs(mux_window:tabs()) do
+			for _, p in ipairs(tab:panes()) do
+				local id = p:pane_id()
+				local rec = read_pane_state(id)
+				local watched = rec ~= nil and CHIME_STATES[rec.state] == true
+				if watched and not pane_muted(id) and now - (rec.at or 0) >= CHIME_AFTER then
+					if not chime_marked(id, rec.at) then
+						local mins = math.floor((now - rec.at) / 60)
+						local who = strip_glyph(p:get_title() or "")
+						if who == "" then
+							who = "pane " .. id
 						end
+						local why = (rec.detail or ""):gsub("_", " ")
+						local title, body
+						if rec.state == "errored" then
+							title = who .. " died on " .. (why ~= "" and why or "an api error")
+							body = string.format("%dm ago, and it is not coming back on its own", mins)
+						else
+							title = who .. " is still asking"
+							body = string.format("%dm%s", mins, why ~= "" and (" · " .. why) or "")
+						end
+						wezterm.background_child_process({
+							wezterm.home_dir .. "/.claude/bin/wz", "notify", title, body,
+						})
 					end
 				end
 			end
 		end
-	end)
-	return fleet_attention
+	end
 end
 
 -- ============================================================
--- Claude: the workspace board
--- LEADER+b brings up cc-board: every session in this workspace as a frame of its own,
--- coloured by what it wants from you, with context drawn as a bar and the last thing Claude
--- actually said underneath. Enter jumps to one, m marks and M moves the marked panes into
--- the tab you came from, which is the regrouping job done from one screen.
---
--- A left split of the pane you are on, sharing the space rather than covering it. It was a tab of its own first, then a zoomed split; both made it somewhere
--- you went instead of something you glance at beside the work. Unzoomed, so zoom stays
--- something you reach for - LEADER+z on it if you want the whole tab, and it reflows,
--- which is why the board measures itself every cycle rather than trusting a width it was
--- told once.
---
--- A tab with nothing running in it gets the board in place instead, since there is nothing
--- there to make room for.
---
--- Pressing it again puts it away, so the pair reads as one toggle.
+-- Claude: the workspace board (LEADER+b, cc-board; see docs/cc-board.md)
+-- Left split of the leftmost pane, zoomed (settled, see CLAUDE.md); in place if the tab has
+-- nothing live. Press again to close.
 -- ============================================================
 local BOARD_TITLE = "▤ board"
 
@@ -1748,46 +1903,19 @@ local function board_in_tab(tab)
 end
 
 -- ============================================================
--- Claude: switch workspace, knowing what is in it
--- The stock launcher lists workspace names, which at thirteen of them is thirteen words with
--- nothing to choose between. This adds what is in each, in the glyphs the tab bar and the
--- status bar already use: ⚠ blocked on a prompt, ✓ just finished, ✳ stopped and waiting on
--- you, ◐ working, · cold for hours, › a pane whose session has exited. Then the topic of
--- whichever session wants you most, and the branch they are all sharing with a count of
--- dirty files - usually the deciding fact, since a workspace with a dirty tree and three
--- chats waiting is where you should be.
---
--- The counts replace one that was wrong twice over. It called a workspace's "waiting" count
--- asking+busy, so a session happily working read as one wanting you, which is the opposite
--- of what busy means; and a single number could not say whether six chats were blocked, done
--- or cold, which is the only thing you press this key to find out.
---
--- The order is alt-tab: most recently used first, so row one is the workspace you just came
--- from and LEADER+w Enter flips back to it. Deliberately not ranked by who wants you - a list
--- that reorders itself between presses cannot be learned, and the glyph and its colour say
--- who wants you without moving anything. The workspace you are in sits at the bottom, out of
--- the way, for the same reason alt-tab starts on the second window rather than the first.
---
--- Nothing here forks. Every count comes from the mux and from the state files under
--- ~/.claude/wezterm-state that pane_status already reads for the tab bar, so the picker
--- opens in the time it takes to draw. Reading pane screens is what would make it accurate
--- about a session that stopped mid-prose on a question, and it is also what costs a third of
--- a second, so that stays where it belongs: LEADER+; and LEADER+b read screens, this key
--- picks a desk. Git is the one fact no hook writes down, so it arrives from a snapshot taken
--- in the background and is read here from a file.
---
--- Workspaces with no Claude session in them are still listed, dimmed: they are where new
--- work goes.
+-- Claude: switch workspace (LEADER+w), with per-state counts, top topic, branch + dirty.
+-- Alt-tab order (MRU, current last), deliberately not ranked by need: a list that
+-- reorders between presses cannot be learned. No forks and no screen reads; git comes from
+-- a background snapshot.
 -- ============================================================
 
--- Drawn in the order NEED ranks them, whatever wants you most first, so the ⚠ column is
--- always in the same place and the row it is on is the only thing that changes. "ended" is
--- pane_status's stale split in two, because a session that has exited is a pane to close
--- rather than a chat to go back to.
+-- NEED order. "ended" split from stale: an exited session is a pane to close.
 local WS_STATES = {
+	{ key = "errored", glyph = "!", colour = TAB_COLOURS.errored },
 	{ key = "asking", glyph = "⚠", colour = TAB_COLOURS.asking },
 	{ key = "fresh", glyph = "✓", colour = TAB_COLOURS.fresh },
 	{ key = "waiting", glyph = "✳", colour = TAB_COLOURS.waiting },
+	{ key = "parked", glyph = "◌", colour = TAB_COLOURS.parked },
 	{ key = "working", glyph = "◐", colour = TAB_COLOURS.working },
 	{ key = "stale", glyph = "·", colour = TAB_COLOURS.stale },
 	{ key = "ended", glyph = "›", colour = TAB_COLOURS.stale },
@@ -1795,19 +1923,17 @@ local WS_STATES = {
 
 local WS_NAME_W = 18
 local WS_COUNT_W = 9
-local WS_STATE_W = 18
+-- three cells x eight states
+local WS_STATE_W = 24
 local WS_GIT_W = 22
 
----fleet_pad counts bytes, which is right for the ASCII columns and wrong for any column with
----a glyph in it. Columns that tracked their own cell width pad with this instead, never to
----zero, so two of them cannot run together.
+---fleet_pad counts bytes; glyph columns track their own cell width and pad with this,
+---never to zero.
 local function ws_pad(used, target)
 	return string.rep(" ", math.max(1, target - used))
 end
 
--- Most recent first. Kept in a file rather than in memory because editing this config
--- re-evaluates it, and an in-memory order would reset to alphabetical on every save - which
--- is the one thing an alt-tab order cannot do.
+-- in a file, not memory: a config reload would reset it
 local ws_mru_path = wezterm.home_dir .. "/.claude/cache/wezterm-mru"
 local WS_MRU_MAX = 40
 local ws_mru
@@ -1829,8 +1955,7 @@ local function ws_mru_read()
 	return ws_mru
 end
 
----Move a workspace to the front, and write it out only when the front actually changed: this
----runs once a second off the status bar.
+---Writes only when the front changes: runs every status tick
 ws_touch = function(ws)
 	if ws == nil or ws == "" then
 		return
@@ -1856,8 +1981,7 @@ ws_touch = function(ws)
 	end
 end
 
----One directory per workspace: whatever its first pane is sitting in. They nearly all share
----a checkout, which is the assumption cc-board's own header makes too.
+---One dir per workspace: its first pane's cwd
 local function workspace_dirs()
 	local dirs = {}
 	pcall(function()
@@ -1884,9 +2008,7 @@ local function workspace_dirs()
 	return dirs
 end
 
--- $1 is the cache to write, the rest are the directories to look at. Built in a temp file
--- and moved into place, so a picker opening mid-snapshot reads the last whole one rather
--- than half of this one.
+-- $1 cache, rest dirs. Temp file + mv so a reader never sees half a snapshot.
 local WS_GIT_SNAPSHOT = [[
 out=$1
 shift
@@ -1906,10 +2028,7 @@ local ws_git_path = wezterm.home_dir .. "/.claude/cache/wezterm-git"
 local WS_GIT_INTERVAL = 90 -- a branch changes when you check out, not while you read a list
 local ws_git_at = 0
 
----Kick a snapshot and do not wait for it. Called from the status bar so the cache is warm
----before the first keypress, and again on the way out of the picker so the next one is
----current. A git call per workspace is a fifth of a second of nothing happening, which is
----the difference between a picker and a pause.
+---Background snapshot, never waited on: git per workspace would stall the picker
 ws_git_refresh = function()
 	local now = os.time()
 	if now - ws_git_at < WS_GIT_INTERVAL then
@@ -1963,7 +2082,7 @@ workspace_picker = function(window, pane)
 	end
 
 	for _, mux_window in ipairs(wezterm.mux.all_windows()) do
-		-- Listed even with nothing in it, so an empty workspace is still somewhere you can go.
+		-- listed even if empty
 		local ws = mux_window:get_workspace()
 		local r = ws and room(ws)
 		for _, tab in ipairs(r and mux_window:tabs() or {}) do
@@ -1974,8 +2093,7 @@ workspace_picker = function(window, pane)
 				title = (ok and title) or ""
 				local id = p:pane_id()
 				local rec = read_pane_state(id)
-				-- A pane is a chat if a hook has written state for it or if Claude has titled
-				-- it; anything else in the tab is a shell and none of this key's business.
+				-- a chat: hook state or a Claude title
 				if rec ~= nil or has_claude_glyph(title) then
 					local status
 					if rec ~= nil and rec.state == "ended" then
@@ -1987,9 +2105,7 @@ workspace_picker = function(window, pane)
 					if status ~= "ended" then
 						r.chats = r.chats + 1
 					end
-					-- Which session speaks for the workspace: a titled one first, since "new" as a
-					-- topic says less than the counts beside it already do, then the loudest,
-					-- then the one that moved most recently - the thread you were actually on.
+					-- topic: titled first, then loudest, then most recent
 					local label = pane_label({ title = title })
 					local weight = NEED[status] or 0
 					local named = (label ~= nil and label ~= "new") and 1 or 0
@@ -2010,8 +2126,7 @@ workspace_picker = function(window, pane)
 
 	local current = window:active_workspace()
 
-	-- Alt-tab: where you have been, most recent first, then a fixed tail of everywhere you
-	-- have not, then where you already are.
+	-- MRU, then unvisited, then current
 	local rank = {}
 	for i, name in ipairs(ws_mru_read()) do
 		if rank[name] == nil then
@@ -2029,8 +2144,7 @@ workspace_picker = function(window, pane)
 		if ra and rb then
 			return ra < rb
 		end
-		-- Not visited yet, so nothing to be recent about: chats first, then the empties,
-		-- which are somewhere to start work rather than somewhere to go back to.
+		-- unvisited: chats first, then empties
 		local ca, cb = rooms[a].chats > 0, rooms[b].chats > 0
 		if ca ~= cb then
 			return ca
@@ -2077,8 +2191,7 @@ workspace_picker = function(window, pane)
 			end
 		end
 
-		-- The dirty count is never the part to drop, so the branch is measured against what
-		-- is left after it: a long branch name loses its tail rather than pushing the topic.
+		-- branch shortened around the dirty count, never the reverse
 		local repo = git[dirs[ws] or ""]
 		local git_text, git_w = "", 0
 		if repo then
@@ -2092,8 +2205,7 @@ workspace_picker = function(window, pane)
 		table.insert(label, { Foreground = { Color = TAB_COLOURS.index } })
 		table.insert(label, { Text = ws_pad(used, WS_STATE_W) .. git_text .. ws_pad(git_w, WS_GIT_W) })
 
-		-- The topic last, so fuzzy matching reaches it: "wezterm" finds the desk the wezterm
-		-- work is on without you remembering what that workspace ended up being called.
+		-- topic last, so fuzzy matching reaches it
 		if r.topic ~= "" then
 			local cold = r.weight <= NEED.stale
 			table.insert(label, { Foreground = { Color = cold and TAB_COLOURS.stale or TAB_COLOURS.active } })
@@ -2115,14 +2227,10 @@ workspace_picker = function(window, pane)
 					return
 				end
 				ws_touch(ws) -- the status bar would catch this a second later; do not wait
-				-- A workspace with a GUI window of its own gets raised; one whose mux
-				-- window is detached, or a name typed into the picker, falls through to a
-				-- switch in the current window.
+				-- raise its own GUI window; detached or typed names fall through to a switch
 				for _, mux_window in ipairs(wezterm.mux.all_windows()) do
 					if mux_window:get_workspace() == ws then
-						-- gui_window() RAISES for a mux window with no GUI window attached,
-						-- it does not return nil, so it needs the pcall too or a detached
-						-- workspace aborts the callback before the switch below.
+						-- gui_window() RAISES (not nil) with no GUI window attached
 						local got, gui = pcall(function()
 							return mux_window:gui_window()
 						end)
@@ -2139,13 +2247,11 @@ workspace_picker = function(window, pane)
 		pane
 	)
 
-	-- On the way out, not the way in: the snapshot the list was drawn from is the one taken
-	-- last time, and this is what makes the next press current.
+	-- on the way out, so the next press is current
 	ws_git_refresh()
 end
 
--- Zoom hides every pane but one, so a board opened into a zoomed tab would be invisible and
--- the next press would open a second one.
+-- a board in a zoomed tab is hidden; the next press would open a second
 local function tab_is_zoomed(tab)
 	for _, p in ipairs(tab:panes_with_info()) do
 		if p.is_zoomed then
@@ -2155,10 +2261,7 @@ local function tab_is_zoomed(tab)
 	return false
 end
 
--- The one board, wherever it currently is. There is never more than one: LEADER+b in a tab
--- that has not got it moves the running pane here rather than starting another, so the
--- filter, the marks, the grouping and the cursor survive, and one process is reading pane
--- screens rather than one per tab you happened to press the key in.
+-- Only ever one board: LEADER+b elsewhere moves the running pane, keeping its state
 local function board_in_window(window)
 	local ok, tabs = pcall(function()
 		return window:mux_window():tabs()
@@ -2175,9 +2278,6 @@ local function board_in_window(window)
 	return nil, nil
 end
 
--- The far left of the tab, however the tab is arranged. Splitting off this pane rather than
--- off the focused one is what puts the board down the left edge instead of wherever you
--- happened to be standing when you pressed the key.
 local function leftmost_pane(tab)
 	local best, found
 	for _, p in ipairs(tab:panes_with_info()) do
@@ -2189,9 +2289,7 @@ local function leftmost_pane(tab)
 	return found
 end
 
--- A tab with nothing ongoing in it is somewhere the board can just live, rather than
--- somewhere it has to make room. "Ongoing" means a pane actually running Claude: a tab of
--- shells, or one whose sessions have exited, is scratch space.
+-- shells or exited sessions only: the board can run in place
 local function tab_has_live_claude(tab)
 	for _, p in ipairs(tab:panes()) do
 		local ok, info = pcall(function()
@@ -2210,8 +2308,7 @@ table.insert(config.keys, {
 	action = wezterm.action_callback(function(window, pane)
 		local tab = window:active_tab()
 		local open = board_in_tab(tab)
-		-- Zoomed on something else, so the board may be there and hidden. Unzoom and look
-		-- again rather than opening a second one on top of it.
+		-- zoomed: the board may be hidden, unzoom and look again
 		if not open and tab_is_zoomed(tab) then
 			pcall(function()
 				tab:set_zoomed(false)
@@ -2219,8 +2316,7 @@ table.insert(config.keys, {
 			open = board_in_tab(tab)
 		end
 
-		-- One key both ways. Quitting rather than killing, because the board may be running
-		-- in a shell pane that was already there and is not ours to close.
+		-- quit, not kill: the board may be in a shell pane that is not ours to close
 		if open then
 			pcall(function()
 				tab:set_zoomed(false)
@@ -2237,9 +2333,7 @@ table.insert(config.keys, {
 		}
 
 		if not tab_has_live_claude(tab) then
-			-- Nothing to make room for, so it runs where you already are. Typed at the
-			-- prompt rather than spawned, since the shell in that pane is not ours to
-			-- replace; quitting the board leaves you back at it.
+			-- typed at the prompt, not spawned: the shell is not ours to replace
 			pcall(function()
 				pane:send_text(
 					"CC_BOARD_ORIGIN=" .. env.CC_BOARD_ORIGIN ..
@@ -2249,9 +2343,7 @@ table.insert(config.keys, {
 			return
 		end
 
-		-- Open somewhere else in this workspace: move it here rather than starting a second
-		-- one. Nothing in the lua API moves a pane between tabs, so this is the same
-		-- `split-pane --move-pane-id` the board's own M key uses.
+		-- no Lua API moves a pane between tabs, hence the CLI (as the board's M key does)
 		local elsewhere, from_tab = board_in_window(window)
 		if elsewhere then
 			pcall(function()
@@ -2274,8 +2366,7 @@ table.insert(config.keys, {
 				end)
 				return
 			end
-			-- Could not move it - no room in this tab, most likely. Leave it where it is and
-			-- go to it, which is worse than bringing it here and better than a second board.
+			-- no room to move it: go to it rather than open a second
 			pcall(function()
 				elsewhere:activate()
 				from_tab:activate()
@@ -2284,16 +2375,8 @@ table.insert(config.keys, {
 			return
 		end
 
-		-- Split off the leftmost pane rather than the focused one, so the board is the left
-		-- hand column of the tab wherever you were standing, and zoom it: full width is the
-		-- size you actually read the fleet at, and LEADER+z drops back to the tab with the
-		-- board still down its left edge.
-		--
-		-- Not a top_level split, which is the obvious way to get a full height column and
-		-- the way that wedged a live tab: wezterm redistributes the reclaimed width
-		-- unevenly, three of four panes collapsed to a single column, adjust-pane-size
-		-- snapped straight back, and further splits failed with "No space for split!" until
-		-- the window was resized.
+		-- Split off the leftmost pane so the board is the tab's left column.
+		-- Never top_level: it wedges the tab ("No space for split!"), see CLAUDE.md.
 		local host = leftmost_pane(tab) or pane
 		local board
 		local ok = pcall(function()
@@ -2303,8 +2386,7 @@ table.insert(config.keys, {
 				set_environment_variables = env,
 			})
 		end)
-		-- The leftmost pane can be too narrow to halve. The pane you are on is a worse
-		-- place for it but a better one than a toast saying no.
+		-- leftmost may be too narrow to halve
 		if not ok and host ~= pane then
 			ok = pcall(function()
 				board = pane:split({
@@ -2326,5 +2408,28 @@ table.insert(config.keys, {
 		end)
 	end),
 })
+
+-- leader actions in the command palette; last because it reads the finished config.keys
+local PALETTE = {
+	b = "Fleet: board",
+	[";"] = "Fleet: jump to any session",
+	["@"] = "Fleet: type a peer session name",
+	w = "Workspace: switch (alt-tab order)",
+	W = "Workspace: new",
+	["<"] = "Workspace: rename",
+	S = "Save all workspaces",
+	R = "Restore a saved workspace, window or tab",
+	u = "Open a URL on screen",
+}
+wezterm.on("augment-command-palette", function()
+	local out = {}
+	for _, k in ipairs(config.keys) do
+		local brief = k.mods == "LEADER" and PALETTE[k.key]
+		if brief then
+			table.insert(out, { brief = brief, action = k.action })
+		end
+	end
+	return out
+end)
 
 return config

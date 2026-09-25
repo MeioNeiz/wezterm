@@ -1,23 +1,11 @@
 #!/bin/bash
-# Start a Claude session in a new pane, with a task. The one place that knows how.
-#
-# There is nothing clever here except the environment, and that part is not optional: a
-# session spawned from inside another one inherits its whole Claude environment, and
-# CLAUDE_CODE_CHILD_SESSION turns transcript saving off. The child then has no
-# transcript, so it never gets a title, cc-peers cannot name it, the statusLine has
-# nothing to show and it can never be handed over itself - and none of that announces
-# itself beyond one line of warning in a pane nobody is watching.
-#
-# So every launcher goes through here rather than calling `wezterm cli spawn` directly.
-#
-# It also starts every session with --dangerously-skip-permissions: that is how every
-# agent here is run, and a spawned session that stops to ask is wall clock nobody is
-# spending. --ask opts one out.
+# Start a Claude session in a new pane, with a task. Every launcher comes through here:
+# a session spawned inside another inherits CLAUDE_CODE_CHILD_SESSION and saves no
+# transcript (see docs/tools.md). Permissions are bypassed unless --ask.
 
 set -u
 
-# Cleared, not filtered: a session an agent starts should be the session a human would
-# have started from a plain shell.
+# Cleared, not filtered: the session a human would have started from a plain shell.
 readonly CLEAN_ENV=(env
 	-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID
 	-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_MESSAGING_SOCKET
@@ -36,6 +24,10 @@ cc-spawn - start a Claude session in a new pane, with a task
   --tab | --window   a new tab in the same window, or a new window
   --shell            a plain shell rather than Claude, for a pane to watch things in
   --ask              leave permission prompts on (default: bypassed)
+  --worktree[=<name>]  give the session its own git worktree, so it cannot collide with
+                     whatever else is working in that repo. Claude Code makes it at
+                     <repo>/.claude/worktrees/<name> on a branch of its own; a bare
+                     --worktree lets it pick the name
   --dry-run          print what it would run
 
 Prints the new pane id. The environment is cleaned first, which is the whole point:
@@ -43,6 +35,11 @@ without it the new session inherits CLAUDE_CODE_CHILD_SESSION and saves no trans
 
   cc-spawn --cwd ~/work/api 'read src/auth.ts and list every path that skips the guard'
   cc-spawn --tab --cwd ~/work/api 'run the failing test and tell me why it fails'
+  cc-spawn --worktree=auth-guard 'fix the guard in src/auth.ts'
+
+Worktrees are opt-in on purpose. Several sessions in one checkout is the normal way of
+working here and mostly fine; it stops being fine when two of them edit at once, and
+then nothing in the tree says which dirty file belongs to whom.
 USAGE
 }
 
@@ -57,6 +54,8 @@ where="--right"
 shell=false
 ask=false
 dry=false
+worktree=false
+wtname=""
 while (($#)); do
 	case $1 in
 	--cwd) shift; cwd=${1:-}; [[ -n $cwd ]] || die "--cwd needs a directory" ;;
@@ -68,6 +67,8 @@ while (($#)); do
 	--window) where="window" ;;
 	--shell) shell=true ;;
 	--ask) ask=true ;;
+	--worktree) worktree=true ;;
+	--worktree=*) worktree=true; wtname=${1#--worktree=} ;;
 	--dry-run) dry=true ;;
 	-h | --help) usage; exit 0 ;;
 	--) shift; break ;;
@@ -78,12 +79,12 @@ while (($#)); do
 done
 
 $shell || (($#)) || die "need a prompt (or --shell)"
+$worktree && $shell && die "--worktree needs a Claude session, not --shell"
 
-# A name resolves through cc-roster; a bare number is already a pane.
 pane=""
 if [[ -n $from ]]; then
 	case $from in
-	*[!0-9]*) pane=$(cc-roster --pane "$from" 2>/dev/null) ;;
+	*[!0-9]*) pane=$(cc-roster --pane "$from") ;;
 	*) pane=$from ;;
 	esac
 	[[ -n $pane && $pane != "-" ]] || die "no pane for \"$from\""
@@ -101,6 +102,11 @@ if [[ -z $cwd ]]; then
 fi
 [[ -d $cwd ]] || die "no such directory: $cwd"
 
+# Fail here rather than in a new pane nobody is watching.
+if $worktree && ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+	die "--worktree needs a git repo, and $cwd is not in one"
+fi
+
 prompt="$*"
 perm=" --dangerously-skip-permissions"
 $ask && perm=""
@@ -111,7 +117,13 @@ else
 	# built in pieces: an empty array expansion is unbound under bash 3.2 and set -u
 	cmd=("${CLEAN_ENV[@]}" claude)
 	$ask || cmd+=(--dangerously-skip-permissions)
-	cmd+=("$prompt")
+	if $worktree; then
+		cmd+=(--worktree)
+		[[ -n $wtname ]] && cmd+=("$wtname")
+	fi
+	# --worktree takes an optional value and would swallow a bare prompt as its name;
+	# -- also keeps a prompt that opens with a dash from reading as a flag.
+	cmd+=(-- "$prompt")
 fi
 
 if [[ $where != window ]]; then
@@ -124,7 +136,10 @@ if $dry; then
 	if $shell; then
 		printf '  %s\n' "$SHELL"
 	else
-		printf '  %s claude%s <prompt, %s chars>\n' "${CLEAN_ENV[*]}" "$perm" "${#prompt}"
+		wt=""
+		$worktree && wt=" --worktree${wtname:+ $wtname}"
+		printf '  %s claude%s%s -- <prompt, %s chars>\n' "${CLEAN_ENV[*]}" "$perm" "$wt" \
+		"${#prompt}"
 	fi
 	exit 0
 fi

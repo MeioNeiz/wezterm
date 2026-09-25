@@ -2,6 +2,60 @@
 
 Pointed at from CLAUDE.md.
 
+## addresses, and why a name is not one
+
+Two strings look like a session's identity and only one of them is.
+
+**The name** (`d5-lca-77`) is the registry's `name` and the address SendMessage takes.
+Claude derives it at launch as `<cwd basename>-<two hex of sha256(session id)>` and
+records where it came from in `nameSource`. **The title** ("AI Live Call Answering
+billing setup") is the `ai-title` Claude writes into the transcript and rewrites as the
+conversation moves; it is what the tab bar, `cc-peers` and `cc-board` show. A session
+that suddenly reads as something sensible has gained a title, not a new address.
+
+The name does move, though, in four ways, and `nameSource` says which:
+
+| `nameSource` | when |
+|---|---|
+| `derived` | at launch, and again whenever the process adopts a conversation |
+| `collision` | two live sessions want one name; the loser takes a new suffix |
+| `auto` | background and forked sessions, named after the task they were given |
+| `user` / `hook` | `/rename`, or `--name` at launch |
+
+Adoption means a resume, a remote attach or a spare claim, and the binary is explicit
+that `/clear`, a fork and a `cd` are not on that list: those keep the name. `auto` is how
+`743537e5` came to be called `bash command execution`. A `user` name is the only one that
+is sticky - nothing re-derives it.
+
+So the addresses that move under you are the ones nobody chose. Claude covers this with
+`formerNames` in the registry - up to three per session, each held for ten seconds or
+more - and its own resolver falls back to them. Everything here resolves through
+`cc-roster`, which now does the same, on the same terms:
+
+- **Claude's key, not ours**: trimmed, lowercased, runs of whitespace folded to hyphens.
+  That is why `bash-command-execution` reaches a session called "bash command execution",
+  which matters because half of these tools are driven from a shell where the spaces
+  would need quoting anyway.
+- **and it is the key that gets shown**, not the name as the registry spells it.
+  `cc-roster` folds it once, in the jq, so cc-peers, cc-fleet, cc-board, the wezterm
+  pickers and the tab bar all inherit an address with no spaces in it; `statusline.sh`
+  and `cc-colour` read the registry themselves and fold the same way. Only the *title*
+  column still reads like a sentence, which is what a title is for. There is nowhere
+  left that shows you a name you cannot type.
+- **only former names from the conversation the session is still in**, which is the cut
+  Claude's resolver makes too. A rename inside one conversation keeps its old address. A
+  resume does not, and should not: that name belonged to the empty session the pane
+  started with, not to the work that arrived afterwards.
+- **a current name always beats a former one**, and a former name two live sessions both
+  used to have resolves to neither. There is no right answer there and picking one
+  silently is how you brief the wrong pane.
+- **it says so**: `cc-roster: "743537e5" is now "bash command execution"` on stderr, once,
+  when a lookup lands through an alias. Callers no longer swallow cc-roster's stderr.
+
+What never moves is the session id, which is why `cc-note` is keyed by it and why
+`cc-handover` carries it. If you want an address you can write down for a week,
+`/rename` the session: that makes it `user` and nothing re-derives it.
+
 ## wz
 
 The cc-* scripts answer "which chats want me". `wz` answers "what is in that pane, and make
@@ -15,9 +69,10 @@ was make it cheap enough to reach for mid-task. The parts worth knowing:
   reports no pid, so per-pane CPU comes from joining `tty_name` against one `ps -ax` for the
   whole machine. A `ps -t` per pane would cost more than everything else here put together.
 - **Targets resolve through `cc-roster`**, so `wz read d5-lca-48` takes the same address
-  SendMessage does. `resolve` asserts the answer is digits before returning: a pane id
-  reaches `kill-pane` and once reached an `rm`, and nothing downstream should have to wonder.
-  It used to go through cc-peers and cost 1.4s a call; see "what it costs".
+  SendMessage does - including one the session has since been renamed away from. `resolve`
+  asserts the answer is digits before returning: a pane id reaches `kill-pane` and once
+  reached an `rm`, and nothing downstream should have to wonder. It used to go through
+  cc-peers and cost 1.4s a call; see "what it costs".
 - **The event log is polled, not pushed.** wezterm has no outbound event stream, and the
   states worth waking up for (busy, asking, idle) are Claude's rather than wezterm's, so
   they would not appear in one if it existed. `wz events --daemon` diffs a five-field
@@ -78,6 +133,22 @@ Two things that are not obvious and cost a while to find:
   script exists to prevent. It announces itself as one line of warning in a pane nobody
   is watching. `cc-spawn` clears the environment, and is why every launcher goes through
   it rather than calling `wezterm cli spawn -- claude` directly.
+- **a bare word in a cc-spawn argument list ends the options.** Its parser breaks on the
+  first non-flag so that a prompt needs no `--`, which means anything after that word is
+  prompt. cc-handover held `--tab` and `--window` as the bare words `tab` and `window` and
+  passed them straight through, so with either of those `--dry-run` became part of the
+  prompt and a run that promised to spawn nothing spawned a session and set it working.
+  The default `--right` is a flag and was always fine, which is how it survived. Fixed by
+  translating at the call site; worth knowing before adding the next positional.
+- **`--worktree` is a pass-through, not plumbing.** Claude Code grew native worktrees, so
+  this is one flag rather than the branch-and-checkout dance every third-party
+  orchestrator hand-rolls: it makes `<repo>/.claude/worktrees/<name>`, holds a
+  `git worktree lock` for the life of the session, sweeps locks left by sessions that were
+  killed but never one you set yourself, and marks its own worktrees in git metadata so
+  the sweep can tell them from yours. `.worktreeinclude` carries the gitignored files a
+  build needs. The only thing added here is the repo check, which happens before the pane
+  opens: claude refuses `--worktree` outside a repo and says so in a pane that has just
+  scrolled and is not being read.
 - **every spawned session starts with `--dangerously-skip-permissions`**, which is how
   every agent here is run. A pane that stopped to ask does show as `asking` on the board,
   so it is not invisible, it is just wall clock nobody is spending. `--ask` opts one out.

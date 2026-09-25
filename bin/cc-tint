@@ -1,26 +1,12 @@
 #!/bin/bash
 # cc-tint - paint a Claude pane in its own identity colour, from the inside
 #
-# wezterm has no per-pane colour setting of any kind: colors, inactive_pane_hsb and
-# colors.split are all global, and there is no pane equivalent. So nothing inside a pane
-# could be coloured per session, and the statusLine was the whole of it.
-#
-# Except that every wezterm pane is a separate terminal emulator with its own palette
-# state, and a terminal's palette is settable by the program in it. An OSC sequence written
-# to one pane's tty moves that pane's colours and nothing else. `wezterm cli list` hands
-# out tty_name, so any pane can be painted from anywhere - and it has to be, including by
-# the pane itself. See pane_tty below: a hook cannot reach its own pane through /dev/tty.
-#
-#   OSC 11  the pane background, and OSC 10 the pane foreground, rotated together to the
-#           same hue. Rotating the ground alone is what made this straining: it turns every
-#           glyph edge into a yellow-blue chromatic edge, which the eye localises about
-#           three times worse than a luminance one. Moving the text with it restores the
-#           near-pure lightness edge Catppuccin ships. See cc-colour for the numbers
+# wezterm has no per-pane colour setting, but each pane is its own terminal with its own
+# palette, so OSC 10/11 (text and ground, always together), 12 (cursor) and 17
+# (selection) written to one pane's tty move that pane alone. Why, and the numbers, in
+# docs/colour.md.
 #
 #   cc-tint --level off|whisper|faint|subtle|full   how much background, and remember it
-#   OSC 12  the cursor, at full strength. The one thing on screen that is always moving
-#   OSC 17  the selection background
-#
 #   cc-tint              paint this pane; reads session_id from stdin, for a SessionStart hook
 #   cc-tint --all        paint every live Claude pane, for panes that started before this
 #   cc-tint --pane N     paint one pane
@@ -33,24 +19,16 @@ set -u
 source "$HOME/.claude/bin/cc-colour" --lib
 
 readonly MAP="$HOME/.claude/wezterm-sessions"
-# What this last painted onto each pane, `<session id>\t<hue name>`. The only state cc-tint
-# writes, and it has to be its own rather than read back off the pane: wezterm reports no
-# colour in `cli list`, exposes no Lua getter, and an OSC 11 query is answered onto the
-# pane's stdin, where a live Claude session would type it into the input box.
+# What this last painted onto each pane, `<session id>\t<hue name>`. There is no reading a
+# pane's colour back: an OSC 11 query is answered onto stdin, into Claude's input box.
 readonly PAINTED="$HOME/.claude/cache/cc-tint-painted"
 
-# OSC 11/12/17 set, 111/112/117 restore. String-terminated with ESC backslash rather than
-# BEL: wezterm takes either, and BEL inside a hook can reach the bell.
-# The redirection is what fails when there is no controlling terminal, not the printf, and
-# bash reports that itself - so the whole compound has to be wrapped rather than the printf
-# given a 2>/dev/null. `[[ -w /dev/tty ]]` is true even where the open then fails.
+# ESC-backslash terminated, not BEL, which can reach the bell from a hook. The whole
+# compound is wrapped because the redirection is what fails, and bash reports it itself.
 paint() {
 	local tty=$1 sid=$2 pane=${3-}
 	id_colour "$sid" || return 0
-	# level=off restores the defaults rather than skipping, so turning it down actually
-	# turns it down on panes that are already painted. Ground and text always move
-	# together: setting one without the other is the failure mode this scheme exists to
-	# avoid, so they share a branch.
+	# off restores rather than skips, so turning it down reaches painted panes too
 	if [[ -n $IDC_TINT ]]; then
 		{ printf '\033]11;%s\033\\\033]10;%s\033\\' "$IDC_TINT" "$IDC_FG" >"$tty"; } 2>/dev/null
 	else
@@ -71,11 +49,7 @@ unpaint() {
 	return 0
 }
 
-# The tty of one pane, by pane id. Hook mode needs this rather than /dev/tty: Claude Code
-# runs hooks detached from the pane, with no controlling terminal at all - `tty` reports
-# "not a tty" and the open of /dev/tty fails, so a write there is a silent no-op. That is
-# what paint's 2>/dev/null used to swallow at every single session start. One wezterm call
-# is the price of the paint landing.
+# The tty of one pane, by pane id. Hooks run detached, so /dev/tty is not the pane.
 pane_tty() {
 	wezterm cli list --format json 2>/dev/null | python3 -c '
 import json, sys
@@ -85,6 +59,23 @@ for p in json.load(sys.stdin):
         print(p.get("tty_name") or "")
         break
 ' "$1" 2>/dev/null
+}
+
+# The pane tty, out of the claude this hook belongs to: its controlling terminal is the
+# pane. `none` for a claude with no terminal, one nested inside another session's Bash
+# tool, which inherits WEZTERM_PANE and would repaint a pane that is not its own. Empty
+# if ps gave nothing, for the slower pane_tty. Hooks are detached, so one shell up at most.
+claude_tty() {
+	local ppid tty comm
+	read -r ppid tty comm < <(ps -o ppid=,tty=,comm= -p "$PPID" 2>/dev/null)
+	case ${comm##*/} in
+	sh | bash | zsh | dash) read -r ppid tty comm < <(ps -o ppid=,tty=,comm= -p "$ppid" 2>/dev/null) ;;
+	esac
+	if [[ $tty == "??" ]]; then
+		printf 'none'
+	elif [[ -n $tty ]]; then
+		printf '/dev/%s' "$tty"
+	fi
 }
 
 # pane id, tty, tab-relative order. Only panes the SessionStart hook has claimed, so a
@@ -147,23 +138,16 @@ case ${1-} in
 	sed -n '/^#   cc-tint /,/^#$/p' "$0" | sed 's/^# \{0,2\}//'
 	;;
 "")
-	# Hook mode, for SessionStart. The session id comes from the hook payload rather than
-	# the map file: the map is written by a sibling hook in the same array, so at this
-	# moment it may hold the pane's previous session or nothing at all.
-	#
-	# A pane's palette belongs to the pane and outlives the program in it, so an unpainted
-	# session inherits whatever the last one left - which is why a missed paint reads as
-	# the wrong colour rather than as no colour. /clear is the common case: it starts a new
-	# session id, so the statusLine and the tab bar rehue at once and the ground would not.
+	# Hook mode, for SessionStart. The sid comes from the payload: the map is written by a
+	# sibling hook running in parallel. A pane's palette outlives the program in it, so a
+	# missed paint (a /clear, say) reads as the wrong colour, not as none.
 	[[ -n ${WEZTERM_PANE:-} ]] || exit 0
 	sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F-]*\)".*/\1/p')
 	[[ -n $sid ]] || sid=$(cat "$MAP/$WEZTERM_PANE" 2>/dev/null)
 	[[ -n $sid ]] || exit 0
 
-	# A new session in a pane that already had one: hold it at least ID_MIN_RING hues away
-	# from the colour it is replacing, so that starting a session looks like starting a
-	# session. Only when the session is genuinely new to the pane - a resume or a compact
-	# fires SessionStart too and carries the same id, and its colour must not move.
+	# A new session in a pane that had one lands at least ID_MIN_RING hues from the colour
+	# it replaces. Not on resume or compact, which fire SessionStart with the same id.
 	prev_sid=""
 	prev_hue=""
 	[[ -r $PAINTED/$WEZTERM_PANE ]] &&
@@ -172,7 +156,9 @@ case ${1-} in
 		hue=$(id_rehue "$sid" "$prev_hue") && [[ -n $hue ]] && id_autopin "$sid" "$hue"
 	fi
 
-	tty=$(pane_tty "$WEZTERM_PANE")
+	tty=$(claude_tty)
+	[[ $tty == none ]] && exit 0
+	[[ -n $tty ]] || tty=$(pane_tty "$WEZTERM_PANE")
 	[[ -n $tty ]] && paint "$tty" "$sid" "$WEZTERM_PANE"
 	;;
 *)

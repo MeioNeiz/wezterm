@@ -51,3 +51,34 @@ built, and it means the session has stopped and wants an answer; `waitingFor` sa
 session on the machine that actually wanted attention sorted below thirty idle ones and
 drew in the dimmest grey. It ranks with `asking` now. Anything else that switches on a
 state string has to be told about it too.
+
+## reading another session, in tokens
+
+The time table above is the human budget. This is the agent one, and it is paid per turn
+by every session that looks at the fleet. Measured 7 Sep on two real sessions in one tab,
+in characters of actual output, because that is the only part anyone can check later.
+
+| route | chars | what it carries |
+|---|---|---|
+| `wz last` x2 | 472 | the last thing each said |
+| `wz read --tail 20` x2 | 3,358 | the bottom of each screen |
+| `wz read` x2, whole screens | 8,923 | two screens, whatever was on them |
+| `cc-handover a b`, merged | 4,583 | prompt, queued, replies, branch, files, transcript |
+
+Two things fall out of that, and neither is what you would guess.
+
+**The brief is cheaper than the screens and carries more.** Half the tokens of two full
+`wz read`s, and the screens have already scrolled past the prompt that started the work,
+the branch and the file list. An agent asked to pick up someone else's work reaches for
+`wz read` because the ask sounds like "read that pane", and pays double for less.
+
+**Prose tokenises better than a terminal.** The brief had 11 non-ASCII bytes in 4,583; one
+pane's screen had 590 in 5,009, all of it box drawing and ANSI. So chars/4 is about right
+for a brief and optimistic for a screen, which widens the gap again.
+
+The brief is also purely additive: 1,043 characters for one session and 3,576 for the
+other, 4,583 merged. Size tracks how much the session had to hand over, not the tool, so
+there is no per-target overhead to weigh when handing over three at once.
+
+Method, if it needs redoing: run the command with its output redirected to a file and
+`wc -c` that, rather than letting it into the context you are trying to measure.
