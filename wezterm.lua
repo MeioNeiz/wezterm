@@ -84,10 +84,18 @@ local AUTO_TITLE_MARK = "\u{2063}"
 -- rest. No backslash = typed title shown as is.
 local TAB_GROUP_SEP = "\\"
 
--- PowerShell 7 if installed, else the Windows PowerShell every install has
+-- Windows: panes open in WSL. PowerShell 7 if installed, else the Windows PowerShell every
+-- install has, for the local domain: CTRL+ALT+P or the launcher
+local WSL_DOMAIN = "WSL:Ubuntu"
 if is_windows then
 	local pwsh = #wezterm.glob("C:/Program Files/PowerShell/*/pwsh.exe") > 0
-	config.default_prog = { pwsh and "pwsh.exe" or "powershell.exe", "-NoLogo" }
+	local shell = { pwsh and "pwsh.exe" or "powershell.exe", "-NoLogo" }
+	config.default_prog = shell
+	config.default_domain = WSL_DOMAIN
+	config.launch_menu = {
+		{ label = "PowerShell", args = shell, domain = { DomainName = "local" } },
+		{ label = "CMD", args = { "cmd.exe" }, domain = { DomainName = "local" } },
+	}
 end
 
 -- ============================================================
@@ -609,6 +617,16 @@ if is_macos then
 		pcall(save_all_workspaces)
 		win:perform_action(act.QuitApplication, pane)
 	end) })
+end
+
+-- Windows: CTRL+ALT+P a PowerShell tab outside WSL, CTRL+SHIFT+L the launcher
+if is_windows then
+	local shell = config.launch_menu[1].args
+	table.insert(config.keys, { key = "p", mods = "CTRL|ALT", action = act.SpawnCommandInNewTab({
+		args = shell,
+		domain = { DomainName = "local" },
+	}) })
+	table.insert(config.keys, { key = "l", mods = "CTRL|SHIFT", action = act.ShowLauncher })
 end
 
 -- Resize mode: LEADER r, then hjkl to resize, Esc/Enter to exit
