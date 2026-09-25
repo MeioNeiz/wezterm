@@ -209,10 +209,14 @@ Do not go looking again.
   hooks call these by full path, so everything keeps working and only a bare call from a
   shell - or from Claude - says "command not found"
 - no em-dashes in anything on screen
-- **Windows runs the config, not the fleet.** Every shell-out and cc-* key goes behind
-  `POSIX` in wezterm.lua (`fleet_key` for bindings); macOS behaviour must not branch on
-  anything else. `setup-windows.ps1` sets `WEZTERM_CONFIG_FILE` to this file, no symlinks.
-  Check a Windows load with a copy where `is_windows = true`, same ls-fonts trick
+- **macOS and Linux run everything, Windows runs the config, not the fleet.** Every
+  shell-out and cc-* key goes behind `POSIX` in wezterm.lua (`fleet_key` for bindings).
+  BSD vs GNU is chosen once per script, never tried and fallen back (a fork per call on
+  the Mac): `MTIME` for `stat`, since GNU `stat -f` means the filesystem and succeeds;
+  no tty is `??` from macOS ps and `?` from Linux ps, so match both. `setup.sh` makes every
+  link and registers the hooks (macOS or Linux, rerunnable); `setup-windows.ps1` only sets
+  `WEZTERM_CONFIG_FILE`. Check a Windows load with a copy where `is_windows = true`, same
+  ls-fonts trick
 
 ## do not
 

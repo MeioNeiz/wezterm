@@ -71,7 +71,8 @@ claude_tty() {
 	case ${comm##*/} in
 	sh | bash | zsh | dash) read -r ppid tty comm < <(ps -o ppid=,tty=,comm= -p "$ppid" 2>/dev/null) ;;
 	esac
-	if [[ $tty == "??" ]]; then
+	# no tty: ?? on macOS, ? on Linux
+	if [[ $tty == "??" || $tty == "?" ]]; then
 		printf 'none'
 	elif [[ -n $tty ]]; then
 		printf '/dev/%s' "$tty"

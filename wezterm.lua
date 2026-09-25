@@ -15,9 +15,11 @@ end
 
 local is_windows = wezterm.target_triple:find("windows") ~= nil
 local is_macos = wezterm.target_triple:find("darwin") ~= nil
--- Every shell-out here (the cc-* scripts, /bin/sh, /bin/zsh) is POSIX. Off on Windows,
--- where the rest of the config still runs: see setup-windows.ps1
+-- Every shell-out here (the cc-* scripts, /bin/sh, the login shell) is POSIX. Off on
+-- Windows, where the rest of the config still runs: see setup-windows.ps1
 local POSIX = not is_windows
+-- the board needs a login shell for PATH; Linux has no /bin/zsh to count on
+local LOGIN_SHELL = is_macos and "/bin/zsh" or os.getenv("SHELL") or "/bin/sh"
 
 -- ============================================================
 -- Appearance
@@ -2422,7 +2424,7 @@ fleet_key({
 		local ok = pcall(function()
 			board = host:split({
 				direction = "Left",
-				args = { "/bin/zsh", "-lc", board_script },
+				args = { LOGIN_SHELL, "-lc", board_script },
 				set_environment_variables = env,
 			})
 		end)
@@ -2431,7 +2433,7 @@ fleet_key({
 			ok = pcall(function()
 				board = pane:split({
 					direction = "Left",
-					args = { "/bin/zsh", "-lc", board_script },
+					args = { LOGIN_SHELL, "-lc", board_script },
 					set_environment_variables = env,
 				})
 			end)

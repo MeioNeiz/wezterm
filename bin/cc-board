@@ -7,6 +7,8 @@
 # field would fold into its neighbour.
 
 set -u
+# file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
+if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
 readonly FLEET="$HOME/.claude/bin/cc-fleet"
 # Sourced: a fork per row is what the render path may not do.
@@ -731,7 +733,7 @@ refresh_git() {
 # at any age.
 ROSTER_AT=0
 stamp_roster() {
-	ROSTER_AT=$( { stat -f %m "$ROSTER_CACHE"; } 2>/dev/null) || ROSTER_AT=0
+	ROSTER_AT=$( { stat "${MTIME[@]}" "$ROSTER_CACHE"; } 2>/dev/null) || ROSTER_AT=0
 	[[ $ROSTER_AT =~ ^[0-9]+$ ]] || ROSTER_AT=0
 }
 

@@ -14,7 +14,8 @@ set -- $(ps -o ppid=,tty=,comm= -p "$PPID" 2>/dev/null)
 case ${3##*/} in
 sh | bash | zsh | dash) set -- $(ps -o ppid=,tty=,comm= -p "$1" 2>/dev/null) ;;
 esac
-[ "${2:-}" != "??" ] || exit 0
+# no tty: ?? on macOS, ? on Linux
+{ [ "${2:-}" != "??" ] && [ "${2:-}" != "?" ]; } || exit 0
 
 dir="$HOME/.claude/wezterm-sessions"
 [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || exit 0

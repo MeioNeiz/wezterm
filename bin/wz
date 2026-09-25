@@ -3,6 +3,8 @@
 # resolve through cc-roster, so the address SendMessage takes works here too.
 
 set -u
+# file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
+if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
 readonly GREP_LINES=500
 readonly GREP_JOBS=16
@@ -237,7 +239,7 @@ cmd_last() {
 		jq -r 'select(.type == "assistant")
 			| [ .message.content[]? | select(.type == "text") | .text ] | join("")
 			| select(. != "")' 2>/dev/null | tail -1)
-	at=$(stat -f %m "$transcript" 2>/dev/null || echo 0)
+	at=$(stat "${MTIME[@]}" "$transcript" 2>/dev/null || echo 0)
 	now=$(date +%s)
 
 	local asking=no
@@ -326,7 +328,7 @@ cmd_top() {
 
 	# One ps for the machine joined on tty, not a ps -t per pane.
 	{
-		ps -axo tty=,pid=,pcpu=,rss=,comm= | awk '$1 != "??" {
+		ps -Ao tty=,pid=,pcpu=,rss=,comm= | awk '$1 != "??" && $1 != "?" {
 			c = $5
 			for (i = 6; i <= NF; i++) c = c " " $i
 			print "P\t" $1 "\t" $3 "\t" $4 "\t" c
@@ -498,12 +500,19 @@ cmd_notify() {
 
 	if wezterm cli list --format json >/dev/null 2>&1; then
 		queue_action toast "$title" "$body"
-	else
+	elif [[ $OSTYPE == darwin* ]]; then
 		osascript -e "display notification \"$(osa_quote "$body")\" \
 			with title \"$(osa_quote "$title")\"" 2>/dev/null
+	else
+		notify-send -- "$title" "$body" 2>/dev/null
 	fi
-	$sound && afplay /System/Library/Sounds/Glass.aiff >/dev/null 2>&1 &
-	$speak && say "${title}. ${body}" >/dev/null 2>&1 &
+	if [[ $OSTYPE == darwin* ]]; then
+		$sound && afplay /System/Library/Sounds/Glass.aiff >/dev/null 2>&1 &
+		$speak && say "${title}. ${body}" >/dev/null 2>&1 &
+	else
+		$sound && paplay /usr/share/sounds/freedesktop/stereo/complete.oga >/dev/null 2>&1 &
+		$speak && spd-say -w -- "${title}. ${body}" >/dev/null 2>&1 &
+	fi
 	wait 2>/dev/null
 	return 0
 }

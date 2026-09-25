@@ -27,7 +27,8 @@ resident() {
 	case ${3##*/} in
 	sh | bash | zsh | dash) set -- $(ps -o ppid=,tty=,comm= -p "$1" 2>/dev/null) ;;
 	esac
-	[ "${2:-}" != "??" ]
+	# no tty: ?? on macOS, ? on Linux
+	[ "${2:-}" != "??" ] && [ "${2:-}" != "?" ]
 }
 resident || exit 0
 

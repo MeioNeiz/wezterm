@@ -4,6 +4,8 @@
 # conversation through a pane move or a resume and stops at /clear.
 
 set -u
+# file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
+if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
 readonly FLEET="$HOME/.claude/fleet"
 readonly NOTES="$FLEET/notes.tsv"
@@ -72,7 +74,7 @@ take_lock() {
 	local waited=0
 	while ! mkdir "$LOCK" 2>/dev/null; do
 		if [[ -d $LOCK ]] &&
-			(($(stat -f %m "$LOCK" 2>/dev/null || echo 0) < $(date +%s) - 60)); then
+			(($(stat "${MTIME[@]}" "$LOCK" 2>/dev/null || echo 0) < $(date +%s) - 60)); then
 			rmdir "$LOCK" 2>/dev/null
 			continue
 		fi
