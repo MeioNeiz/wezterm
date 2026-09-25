@@ -15,6 +15,9 @@ end
 
 local is_windows = wezterm.target_triple:find("windows") ~= nil
 local is_macos = wezterm.target_triple:find("darwin") ~= nil
+-- Every shell-out here (the cc-* scripts, /bin/sh, /bin/zsh) is POSIX. Off on Windows,
+-- where the rest of the config still runs: see setup-windows.ps1
+local POSIX = not is_windows
 
 -- ============================================================
 -- Appearance
@@ -81,10 +84,11 @@ local AUTO_TITLE_MARK = "\u{2063}"
 -- rest. No backslash = typed title shown as is.
 local TAB_GROUP_SEP = "\\"
 
--- Windows, optional:
--- if is_windows then
--- 	config.default_prog = { "pwsh.exe", "-NoLogo" }
--- end
+-- PowerShell 7 if installed, else the Windows PowerShell every install has
+if is_windows then
+	local pwsh = #wezterm.glob("C:/Program Files/PowerShell/*/pwsh.exe") > 0
+	config.default_prog = { pwsh and "pwsh.exe" or "powershell.exe", "-NoLogo" }
+end
 
 -- ============================================================
 -- Session persistence: resurrect.wezterm, every workspace plus each pane's Claude session.
@@ -149,6 +153,9 @@ end
 ---write is atomic and cheaper than electing an owner window.
 local function digest_refresh()
 	digest_rows()
+	if not POSIX then
+		return
+	end
 	if os.time() - digest.epoch < DIGEST_MAX_AGE then
 		return
 	end
@@ -334,7 +341,7 @@ local function saved_workspace_names()
 	local on_disk = {}
 	local pattern = resurrect.state_manager.save_state_dir .. "workspace/*.json"
 	for _, path in ipairs(wezterm.glob(pattern)) do
-		on_disk[path:match("([^/]+)%.json$")] = true
+		on_disk[path:match("([^/\\]+)%.json$")] = true
 	end
 
 	-- no manifest: fall back to the dir
@@ -362,17 +369,19 @@ wezterm.on("gui-startup", function()
 	-- pane ids restart from 0 with a new mux, so every pane-keyed file would mis-attribute
 	-- (a stale paint record makes a new session avoid the old pane's colour). Needed ids
 	-- are in the saved states.
-	wezterm.background_child_process({
-		"/bin/sh", "-c",
-		string.format(
-			"rm -rf %q %q %q && mkdir -p %q %q",
-			session_map_dir,
-			pane_state_dir,
-			painted_dir,
-			session_map_dir,
-			pane_state_dir
-		),
-	})
+	if POSIX then
+		wezterm.background_child_process({
+			"/bin/sh", "-c",
+			string.format(
+				"rm -rf %q %q %q && mkdir -p %q %q",
+				session_map_dir,
+				pane_state_dir,
+				painted_dir,
+				session_map_dir,
+				pane_state_dir
+			),
+		})
+	end
 
 	local restored = 0
 	for _, name in ipairs(saved_workspace_names()) do
@@ -567,7 +576,8 @@ table.insert(config.keys, {
 	}),
 })
 
--- links open on CMD+click only: plain click is how a pane gets focus back
+-- links open on CMD+click only (CTRL off macOS): plain click is how a pane gets focus back
+local LINK_MODS = is_macos and "CMD" or "CTRL"
 config.mouse_bindings = {
 	{
 		event = { Up = { streak = 1, button = "Left" } },
@@ -576,11 +586,11 @@ config.mouse_bindings = {
 	},
 	{
 		event = { Up = { streak = 1, button = "Left" } },
-		mods = "CMD",
+		mods = LINK_MODS,
 		action = act.OpenLinkAtMouseCursor,
 	},
 	-- else CMD-down starts a selection and the Up never sees a link
-	{ event = { Down = { streak = 1, button = "Left" } }, mods = "CMD", action = act.Nop },
+	{ event = { Down = { streak = 1, button = "Left" } }, mods = LINK_MODS, action = act.Nop },
 }
 
 -- OSC 9 / toasts from the pane you are looking at are noise; from any other pane, not
@@ -819,6 +829,9 @@ local UNINFORMATIVE = {
 	vim = true,
 	node = true,
 	tmux = true,
+	pwsh = true,
+	powershell = true,
+	cmd = true,
 	-- cc-board overlay, before and after strip_glyph
 	["▤ board"] = true,
 	["board"] = true,
@@ -905,7 +918,9 @@ local function pane_label(pane)
 	if raw == "" then
 		return nil, false, true
 	end
-	if UNINFORMATIVE[raw] then
+	-- Windows titles a shell by its full path: C:\WINDOWS\system32\cmd.exe
+	local program = is_windows and (raw:match("([^\\/]+)$") or raw):gsub("%.[Ee][Xx][Ee]$", "")
+	if UNINFORMATIVE[raw] or (program and UNINFORMATIVE[program:lower()]) then
 		return nil, false, false
 	end
 	local working = is_working(raw)
@@ -1431,6 +1446,13 @@ end)
 -- ============================================================
 local peers_script = wezterm.home_dir .. "/.claude/bin/cc-peers"
 
+-- a key that runs a cc-* script: unbound where they cannot run
+local function fleet_key(binding)
+	if POSIX then
+		table.insert(config.keys, binding)
+	end
+end
+
 -- quick-select: statusLine @name, session ids, file:line (defaults cover URLs, SHAs)
 config.quick_select_patterns = {
 	"@[a-z0-9][a-z0-9_.-]{1,48}",
@@ -1474,7 +1496,7 @@ local function claude_peer_choices(own_session)
 	return choices
 end
 
-table.insert(config.keys, {
+fleet_key({
 	key = "@",
 	mods = "LEADER",
 	action = wezterm.action_callback(function(window, pane)
@@ -1661,7 +1683,7 @@ local function fleet_jump(window, pane, pane_id)
 	end
 end
 
-table.insert(config.keys, {
+fleet_key({
 	key = ";",
 	mods = "LEADER",
 	action = wezterm.action_callback(function(window, pane)
@@ -1832,7 +1854,7 @@ local function chime_marked(pane_id, epoch)
 end
 
 chime_overdue = function(window)
-	if not CHIME_ENABLED then
+	if not (CHIME_ENABLED and POSIX) then
 		return
 	end
 	local now = os.time()
@@ -2031,7 +2053,7 @@ local ws_git_at = 0
 ---Background snapshot, never waited on: git per workspace would stall the picker
 ws_git_refresh = function()
 	local now = os.time()
-	if now - ws_git_at < WS_GIT_INTERVAL then
+	if not POSIX or now - ws_git_at < WS_GIT_INTERVAL then
 		return
 	end
 	ws_git_at = now
@@ -2302,7 +2324,7 @@ local function tab_has_live_claude(tab)
 	return false
 end
 
-table.insert(config.keys, {
+fleet_key({
 	key = "b",
 	mods = "LEADER",
 	action = wezterm.action_callback(function(window, pane)
