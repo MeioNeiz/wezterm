@@ -2107,29 +2107,34 @@ local function fleet_jump(window, pane, pane_id)
 		notify(window, "wezterm", "That pane has gone")
 		return
 	end
-	target:activate()
-
-	local ok, mux_window = pcall(function()
-		return target:tab():window()
+	local ok, tab, mux_window = pcall(function()
+		local t = target:tab()
+		return t, t:window()
 	end)
 	if not ok or not mux_window then
+		target:activate()
 		return
 	end
 
-	-- no GuiWindow:focus on older wezterm: fall through to the switch
-	local gui = mux_window:gui_window()
-	if gui then
-		local raised = pcall(function()
-			gui:focus()
+	local function land()
+		pcall(function()
+			tab:activate()
+			target:activate()
+			local gui = mux_window:gui_window()
+			if gui then
+				gui:focus()
+			end
 		end)
-		if raised then
-			return
-		end
 	end
 
+	-- workspace first: the switch restores that workspace's own front tab, so a pane
+	-- activated before it lands is overruled (toast clicks to another workspace did this)
 	local workspace = mux_window:get_workspace()
 	if workspace and workspace ~= window:active_workspace() then
 		window:perform_action(act.SwitchToWorkspace({ name = workspace }), pane)
+		wezterm.time.call_after(0.05, land)
+	else
+		land()
 	end
 end
 jump_to = fleet_jump
