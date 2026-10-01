@@ -235,7 +235,8 @@ render_session() {
 
 	replies=$(jq -r --argjson min "$TRIVIAL_TEXT" 'select(.type == "assistant")
 		| [ .message.content[]? | select(.type == "text") | .text ] | join("")
-		| select(length > $min)' "$tailfile" 2>/dev/null | tail -n "$turns")
+		| select(length > $min) | tojson' "$tailfile" 2>/dev/null | tail -n "$turns" |
+		jq -rs 'join("\n\n---\n\n")' 2>/dev/null)
 
 	files=$(jq -r 'select(.type == "assistant") | .message.content[]?
 		| select(.type == "tool_use")
