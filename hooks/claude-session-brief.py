@@ -5,7 +5,11 @@ Claude Code already records an `ai-title` and a `last-prompt` in the transcript,
 so nothing has to be regenerated. Output is written with CRLF because wezterm
 injects it straight into a pty.
 
-Usage: claude-session-brief.py <session-id>
+Usage: claude-session-brief.py <session-id> [warm|cold] [cold-at-epoch]
+
+The second argument says what wezterm.lua armed: warm, `claude --resume`; cold, a fresh
+session seeded with cc-handover's brief, since resuming a cold cache pays for the whole
+context again. Without it the footer says resume, as before.
 """
 
 import calendar
@@ -82,10 +86,37 @@ def wrap(text, width, indent):
     return [(indent if i else "") + line for i, line in enumerate(lines)]
 
 
+def span(secs):
+    secs = max(0, int(secs))
+    if secs >= 86400:
+        return "%dd %dh" % (secs // 86400, secs % 86400 // 3600)
+    if secs >= 3600:
+        return "%dh %dm" % (secs // 3600, secs % 3600 // 60)
+    return "%dm" % (secs // 60)
+
+
+def footer(mode, cold_at):
+    now = time.time()
+    if mode == "cold":
+        if not cold_at:
+            return "Enter starts a fresh session from a handover (no record of its cache, " \
+                "so treated as cold)"
+        return "Enter starts a fresh session from a handover (cache cold %s; resuming " \
+            "would pay for the whole context again)" % span(now - cold_at)
+    if mode == "warm" and cold_at:
+        return "Enter to resume (cache warm, %s left)" % span(cold_at - now)
+    return "Enter to resume"
+
+
 def main():
     if len(sys.argv) < 2:
         return 1
     session_id = sys.argv[1]
+    mode = sys.argv[2] if len(sys.argv) > 2 else ""
+    try:
+        cold_at = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    except ValueError:
+        cold_at = 0
     path = transcript_for(session_id)
 
     out = []
@@ -108,7 +139,7 @@ def main():
             meta.append("idle %s" % idle)
         if meta:
             out.append("%s│  %s%s" % (DIM, " · ".join(meta), OFF))
-        out.append("%s╰─ Enter to resume%s" % (DIM, OFF))
+        out.append("%s╰─ %s%s" % (DIM, footer(mode, cold_at), OFF))
 
     sys.stdout.write("\r\n".join(out) + "\r\n")
     return 0

@@ -21,6 +21,24 @@ local POSIX = not is_windows
 -- the board needs a login shell for PATH; Linux has no /bin/zsh to count on
 local LOGIN_SHELL = is_macos and "/bin/zsh" or os.getenv("SHELL") or "/bin/sh"
 
+local wz_script = wezterm.home_dir .. "/.claude/bin/wz"
+---A message you will see. toast_notification shows nothing on macOS (wezterm is not
+---registered with Notification Centre, CLAUDE.md), so it goes through `wz notify`, which
+---knows the route that does. Quiet unless `loud`: most of these answer a key you pressed.
+local function notify(window, title, body, loud)
+	if not POSIX then
+		window:toast_notification(title, body or "", nil, 4000)
+		return
+	end
+	-- wz calls jq and wezterm by name; the GUI's PATH has neither
+	wezterm.background_child_process({
+		"/bin/sh", "-c",
+		'PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH" exec "$0" notify '
+			.. (loud and "" or "--quiet ") .. '-- "$1" "$2"',
+		wz_script, title, body or "",
+	})
+end
+
 -- ============================================================
 -- Appearance
 -- ============================================================
@@ -117,6 +135,11 @@ local painted_dir = wezterm.home_dir .. "/.claude/cache/cc-tint-painted"
 local pane_state_dir = wezterm.home_dir .. "/.claude/wezterm-state"
 local brief_script = wezterm.home_dir .. "/.claude/hooks/claude-session-brief.py"
 local save_interval_seconds = 120
+local context_dir = wezterm.home_dir .. "/.claude/cache/context"
+-- the prompt cache's life: past it a stopped pane has gone cold, and picking it up pays
+-- for its whole context again. The fallback only: the statusLine's own expiry wins (see
+-- cache_expiry_of), since ttl drops to 5m in overage. Must match cc-board and cc-fleet
+local CACHE_TTL = 3600
 
 -- ============================================================
 -- Registry half of pane state, via `cc-roster --digest` (hooks are the other half; see
@@ -125,7 +148,7 @@ local save_interval_seconds = 120
 local digest_path = wezterm.home_dir .. "/.claude/cache/fleet-digest"
 local digest_writer = wezterm.home_dir .. "/.claude/bin/cc-roster"
 local DIGEST_MAX_AGE = 5
-local digest = { read_at = 0, epoch = 0, rows = {} }
+local digest = { read_at = 0, epoch = 0, claimed_at = 0, rows = {} }
 
 ---Rows keyed by pane id, reparsed at most once a second
 local function digest_rows()
@@ -170,11 +193,13 @@ local function digest_refresh()
 	if not POSIX then
 		return
 	end
-	if os.time() - digest.epoch < DIGEST_MAX_AGE then
+	local now = os.time()
+	-- the claim is its own field: digest_rows rewrites epoch from the file every second, so a
+	-- broken cc-roster would otherwise be respawned every second rather than per max age
+	if now - math.max(digest.epoch, digest.claimed_at) < DIGEST_MAX_AGE then
 		return
 	end
-	-- claim locally so a broken cc-roster is retried per DIGEST_MAX_AGE, not per second
-	digest.epoch = os.time()
+	digest.claimed_at = now
 	wezterm.background_child_process({ digest_writer, "--digest" })
 end
 
@@ -328,16 +353,72 @@ local function save_all_workspaces()
 	return saved
 end
 
--- Claude panes restore armed: resume typed but not run, under a brief header, so not
--- every session reconnects at once.
+---statusUpdatedAt (s) per session id from every registry file, read once per startup
+local registry_seen
+local function registry_seen_of(sid)
+	if registry_seen == nil then
+		registry_seen = {}
+		for _, path in ipairs(wezterm.glob(wezterm.home_dir .. "/.claude/sessions/*.json")) do
+			local file = io.open(path, "r")
+			if file then
+				local text = file:read("*a") or ""
+				file:close()
+				local id = text:match('"sessionId"%s*:%s*"([%x%-]+)"')
+				local at = text:match('"statusUpdatedAt"%s*:%s*(%d+)')
+				if id and at then
+					registry_seen[id] = math.floor(tonumber(at) / 1000)
+				end
+			end
+		end
+	end
+	return registry_seen[sid]
+end
+
+---When a session's prompt cache goes cold: the statusLine's expires_at, else its last reply
+---plus CACHE_TTL, else the statusLine's last render plus CACHE_TTL. nil: nothing to go on
+local function cache_cold_at(sid)
+	local file = io.open(context_dir .. "/" .. sid, "r")
+	local line = ""
+	if file then
+		line = file:read("*line") or ""
+		file:close()
+	end
+	local rendered, expires = line:match("^[^\t]*\t[^\t]*\t(%d+)\t?(%d*)")
+	if expires and expires ~= "" then
+		return tonumber(expires)
+	end
+	local seen = registry_seen_of(sid) or tonumber(rendered)
+	return seen and seen + CACHE_TTL or nil
+end
+
+-- Claude panes restore armed: typed but not run, under a brief header, so not every
+-- session reconnects at once. A warm session arms its --resume. A cold one is never
+-- resumed (Jacob's rule): that pays for its whole context again, so it arms a fresh
+-- session seeded with cc-handover's brief, which reads the old one from disk. Unknown
+-- warmth counts as cold.
 local function on_pane_restore(pane_tree)
 	local pane = pane_tree.pane
 
 	if pane_tree.alt_screen_active and pane_tree.process then
 		local cmd = wezterm.shell_join_args(pane_tree.process.argv)
-		if pane_tree.claude_session then
+		local sid = pane_tree.claude_session
+		if sid then
+			local cold_at = cache_cold_at(sid)
+			local warm = cold_at ~= nil and os.time() < cold_at
+			if not warm then
+				cmd = wezterm.shell_join_args(strip_resume_flags(pane_tree.process.argv))
+				-- built when Enter is pressed, so the brief is current; the substitution
+				-- is quoted, so its length and content never meet the shell's parser.
+				-- No transcript, no brief: then it is just a fresh session
+				local glob = "/.claude/projects/*/" .. sid .. ".jsonl"
+				if #wezterm.glob(wezterm.home_dir .. glob) > 0 then
+					cmd = cmd .. ' "$(PATH="$HOME/.claude/bin:$HOME/.local/bin:$PATH" cc-handover '
+						.. sid .. ')"'
+				end
+			end
 			local ok, ran, stdout = pcall(wezterm.run_child_process, {
-				"/usr/bin/python3", brief_script, pane_tree.claude_session,
+				"/usr/bin/python3", brief_script, sid,
+				warm and "warm" or "cold", tostring(cold_at or 0),
 			})
 			if ok and ran and stdout ~= "" then
 				pane:inject_output(stdout)
@@ -531,7 +612,7 @@ config.keys = {
 	-- ---- Session persistence (resurrect): Save / Restore ----
 	{ key = "S", mods = "LEADER", action = wezterm.action_callback(function(win, _)
 		local saved = save_all_workspaces()
-		win:toast_notification("wezterm", "Saved " .. saved .. " workspaces", nil, 2000)
+		notify(win, "wezterm", "Saved " .. saved .. " workspaces")
 	end) },
 	{ key = "R", mods = "LEADER", action = wezterm.action_callback(function(win, pane)
 		resurrect.fuzzy_loader.fuzzy_load(win, pane, function(id)
@@ -675,9 +756,12 @@ local chime_overdue
 local unread_tick
 
 ---Shell -> Lua action queue: the CLI cannot switch workspace (activate-pane leaves the GUI
----where it was) and SetUserVar is dead on this build (CLAUDE.md). One tab-separated line
----per action; claimed by atomic rename so exactly one window drains a batch.
+---where it was) and SetUserVar is dead on this build (CLAUDE.md). One file per action in
+---ACTION_DIR, each one tab-separated line, written whole and renamed in by `wz`; claimed by
+---atomic rename so exactly one window runs it. ACTION_FILE is the older single-file queue,
+---still drained: a line appended to it after the claim could be lost, which is why it went.
 local ACTION_FILE = "/.claude/fleet/actions"
+local ACTION_DIR = "/.claude/fleet/actions.d"
 
 local function perform_action_line(window, pane, verb, a, b)
 	if verb == "workspace" and a and a ~= "" then
@@ -704,22 +788,13 @@ local function perform_action_line(window, pane, verb, a, b)
 			end)
 		end
 	elseif verb == "toast" then
-		-- not osascript, which toasts as Script Editor
+		-- wz queues this only off macOS, where wezterm's own toast is seen
 		window:toast_notification(a or "wezterm", b or "", nil, 8000)
 	end
 end
 
-local function drain_actions(window, pane)
-	local path = wezterm.home_dir .. ACTION_FILE
-	local probe = io.open(path, "r")
-	if not probe then
-		return
-	end
-	probe:close()
-	local claimed = path .. ".taken." .. tostring(window:window_id())
-	if not os.rename(path, claimed) then
-		return -- another window got this batch
-	end
+---Runs every line of a file this window has claimed, then removes it
+local function run_claimed(window, pane, claimed)
 	local file = io.open(claimed, "r")
 	if not file then
 		return
@@ -732,6 +807,107 @@ local function drain_actions(window, pane)
 	end
 	file:close()
 	os.remove(claimed)
+end
+
+local function drain_actions(window, pane)
+	local taken = ".taken." .. tostring(window:window_id())
+	local ok, entries = pcall(wezterm.read_dir, wezterm.home_dir .. ACTION_DIR)
+	if ok and type(entries) == "table" and #entries > 0 then
+		-- names lead with the epoch, so this is arrival order
+		table.sort(entries)
+		for _, path in ipairs(entries) do
+			local name = path:match("([^/]+)$") or ""
+			if name:sub(1, 1) ~= "." and not name:find(".tmp", 1, true)
+				and not name:find(".taken.", 1, true) and os.rename(path, path .. taken)
+			then
+				run_claimed(window, pane, path .. taken)
+			end
+		end
+	end
+	local path = wezterm.home_dir .. ACTION_FILE
+	local probe = io.open(path, "r")
+	if not probe then
+		return
+	end
+	probe:close()
+	if os.rename(path, path .. taken) then
+		run_claimed(window, pane, path .. taken)
+	end
+end
+
+-- Rate limits, from the statusLine: per account, so one figure for the machine. Written by
+-- statusline.sh as `epoch\t5h_pct\t5h_resets\t7d_pct\t7d_resets\tspend`, `-` when absent
+local RATE_FILE = wezterm.home_dir .. "/.claude/cache/rate-limits"
+local RATE_MAX_AGE = 600 -- older than this, no pane has rendered and the figure may be wrong
+local RATE_WEEK_SHOWN = 75 -- the 7d window joins only once it is the one closing in
+local rate = { read_at = 0 }
+
+local function rate_colour(pct)
+	if pct >= 90 then
+		return "#f38ba8"
+	elseif pct >= 75 then
+		return "#fab387"
+	elseif pct >= 50 then
+		return "#f9e2af"
+	end
+	return "#9399b2"
+end
+
+-- Pace: share used against share of the window gone. Too early in a window, one burst
+-- reads as a runaway, so nothing is said before PACE_FROM of it has passed
+local PACE_FROM = 0.1
+local PACE_AHEAD = 10 -- points over an even burn before it is worth a mark
+
+---"▲ out <when>" once PACE_AHEAD over an even burn, which at this rate always runs out
+---before the reset: yellow, red when that is under a quarter of the window away
+local function pace(pct, resets, span, now, fmt)
+	local gone = span - (resets - now)
+	if gone < span * PACE_FROM or pct <= 0 or pct - 100 * gone / span < PACE_AHEAD then
+		return nil
+	end
+	local out_at = now + (100 - pct) * gone // pct
+	local colour = out_at - now < span / 4 and "#f38ba8" or "#f9e2af"
+	return { text = " ▲ out " .. os.date(fmt, out_at), colour = colour }
+end
+
+---{ text, colour } per window worth showing, or {}
+local function rate_parts()
+	local now = os.time()
+	if rate.read_at == now then
+		return rate.parts
+	end
+	rate.read_at, rate.parts = now, {}
+	local file = io.open(RATE_FILE, "r")
+	if not file then
+		return rate.parts
+	end
+	local line = file:read("*line") or ""
+	file:close()
+	local at, p5, r5, p7, r7 = line:match("^(%d+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)")
+	if not at or now - tonumber(at) > RATE_MAX_AGE then
+		return rate.parts
+	end
+	-- a window past its reset has rolled over, and its percentage belongs to the last one
+	local function add(label, pct, resets, span, fmt, always)
+		pct, resets = tonumber(pct), tonumber(resets)
+		if not (pct and resets and resets > now) then
+			return
+		end
+		local mark = pace(pct, resets, span, now, fmt)
+		if not (always or mark or pct >= RATE_WEEK_SHOWN) then
+			return
+		end
+		table.insert(rate.parts, {
+			text = string.format(" %s %d%% %s", label, pct, os.date(fmt, resets)),
+			colour = rate_colour(pct),
+		})
+		if mark then
+			table.insert(rate.parts, mark)
+		end
+	end
+	add("5h", p5, r5, 5 * 3600, "%H:%M", true)
+	add("7d", p7, r7, 7 * 86400, "%a %H:%M", false)
+	return rate.parts
 end
 
 wezterm.on("update-right-status", function(window, pane)
@@ -783,6 +959,12 @@ wezterm.on("update-right-status", function(window, pane)
 			table.insert(parts, { Text = string.format(" ✓%d", away.fresh) })
 			width = width + 4
 		end
+	end
+
+	for _, r in ipairs(rate_parts()) do
+		table.insert(parts, { Foreground = { Color = r.colour } })
+		table.insert(parts, { Text = r.text })
+		width = width + utf8.len(r.text)
 	end
 
 	-- LEADER+w must not wait on git, so its branch snapshot is kept warm here (throttled)
@@ -978,11 +1160,11 @@ local function pane_dir(pane)
 end
 
 local FRESH_SECONDS = 90 -- how long a finished turn still reads as just-finished
--- the prompt cache's life: past it a stopped pane has gone cold, and picking it up pays
--- for its whole context again. Must match cc-board and cc-fleet
-local CACHE_TTL = 3600
--- Must match cc-roster and cc-board. A Monitor cannot outlive an hour.
-local PARKED_MONITOR_MAX = 3600
+-- How long parked can stand with no writer, by the task type in its detail. Must match
+-- cc-roster and cc-board. A Monitor is capped at 30 min (2.1.271), a background shell at 2h
+-- (2.1.285); a subagent or workflow has no cap, so 4h is a guess
+local PARKED_MONITOR_MAX = 1800
+local PARKED_SHELL_MAX = 7200
 local PARKED_MAX = 4 * 3600
 
 ---Last hook record for a pane: state, epoch, detail, writing sid
@@ -1007,14 +1189,29 @@ local read_pane_state = memo_per_second(function(pane_id)
 	return { state = state, at = tonumber(at), detail = detail, sid = sid }
 end)
 
+---Epoch the session's prompt cache goes cold: field 4 of the statusLine's context file,
+---from the payload's prompt_cache.expires_at. nil when no render has reported one
+local read_cache_expiry = memo_per_second(function(sid)
+	local file = io.open(context_dir .. "/" .. sid, "r")
+	if not file then
+		return nil
+	end
+	local line = file:read("*line") or ""
+	file:close()
+	return tonumber(line:match("^[^\t]*\t[^\t]*\t[^\t]*\t(%d+)"))
+end)
+
 ---Registry + hook record, most decisive first:
 --- 1. registry `waiting`: clears when answered, which no hook can do
 --- 2. hook `errored`: registry reads idle after an API death. Cleared only by registry
 ---    busy (a new turn), not idle and not the spinner, which keeps its turn-start glyph
---- 3. hook `asking`: beats the registry by seconds; dropped once the title spins again
+--- 3. hook `asking`: beats the registry by seconds; dropped once the title spins again, or
+---    once the registry has stopped since the ask (Esc on a dialog fires no Stop)
 --- 4. spinner or registry busy: each catches what the other misses
---- 5. hook `parked`: registry also calls it idle
---- 6. age since the later of the two clocks
+--- 5. registry `shell`: turn over, its background shell still running. Level-triggered,
+---    so unlike the hook's parked it needs no expiry
+--- 6. hook `parked`: registry also calls it idle
+--- 7. age since the later of the two clocks; cold by the cache's own expiry when known
 ---@return string status working|asking|errored|parked|fresh|waiting|stale, string detail
 local function pane_status(pane, spinning)
 	local reg = digest_rows()[tostring(pane.pane_id)]
@@ -1030,16 +1227,25 @@ local function pane_status(pane, spinning)
 	if rec ~= nil and rec.state == "errored" and not busy then
 		return "errored", rec.detail
 	end
-	if rec ~= nil and rec.state == "asking" and not busy and not spinning then
+	if rec ~= nil and rec.state == "asking" and not busy and not spinning
+		and (reg == nil or reg.seen <= rec.at or (reg.status ~= "idle" and reg.status ~= "shell"))
+	then
 		return "asking", rec.detail
 	end
 	if spinning or busy then
 		return "working", ""
 	end
+	if reg ~= nil and reg.status == "shell" then
+		return "parked", "shell"
+	end
 	-- parked has no writer when the background work ends, so it expires (CLAUDE.md)
-	if rec ~= nil and rec.state == "parked"
-		and os.time() - rec.at <= (rec.detail == "monitor" and PARKED_MONITOR_MAX or PARKED_MAX)
-	then
+	local parked_max = PARKED_MAX
+	if rec ~= nil and rec.detail == "monitor" then
+		parked_max = PARKED_MONITOR_MAX
+	elseif rec ~= nil and rec.detail == "shell" then
+		parked_max = PARKED_SHELL_MAX
+	end
+	if rec ~= nil and rec.state == "parked" and os.time() - rec.at <= parked_max then
 		return "parked", rec.detail
 	end
 	if rec ~= nil and rec.state == "ended" then
@@ -1047,11 +1253,18 @@ local function pane_status(pane, spinning)
 	end
 	-- later clock: a registry file that stopped moving must not overrule a newer hook
 	local at = math.max(reg ~= nil and reg.seen or 0, rec ~= nil and rec.at or 0)
-	local age = os.time() - at
-	if age < FRESH_SECONDS then
+	local now = os.time()
+	if now - at < FRESH_SECONDS then
 		return "fresh", ""
 	end
-	if age > CACHE_TTL then
+	local sid = (reg ~= nil and reg.sid ~= "" and reg.sid)
+		or (rec ~= nil and rec.sid ~= "" and rec.sid)
+	local expires = sid and read_cache_expiry(sid) or nil
+	-- an expiry older than the last activity was written before it, by a render since gone
+	if expires ~= nil and expires >= at then
+		return now >= expires and "stale" or "waiting", ""
+	end
+	if now - at > CACHE_TTL then
 		return "stale", ""
 	end
 	return "waiting", ""
@@ -1076,7 +1289,36 @@ for id in (wezterm.GLOBAL.read_marked or ""):gmatch("%d+") do
 	marked[id] = true
 end
 
+---Pane ids alive now, or nil if the mux would not say
+local function live_pane_ids()
+	local ids = {}
+	local ok = pcall(function()
+		for _, w in ipairs(wezterm.mux.all_windows()) do
+			for _, t in ipairs(w:tabs()) do
+				for _, p in ipairs(t:panes()) do
+					ids[tostring(p:pane_id())] = true
+				end
+			end
+		end
+	end)
+	return ok and next(ids) ~= nil and ids or nil
+end
+
 local function unread_save()
+	-- closed panes are forgotten here, or left_at grows with every pane ever opened
+	local live = live_pane_ids()
+	if live then
+		for id in pairs(left_at) do
+			if not live[id] then
+				left_at[id] = nil
+			end
+		end
+		for id in pairs(marked) do
+			if not live[id] then
+				marked[id] = nil
+			end
+		end
+	end
 	local left, marks = {}, {}
 	local lines = { string.format("focus\t%s\t%d", focus_pane or "-", looking and 1 or 0) }
 	for id, at in pairs(left_at) do
@@ -1445,7 +1687,7 @@ local function label_width(tab, tabs, overhead)
 	return math.max(1, math.min(SOLO_BUDGET, fill_cap(demands, room)))
 end
 
-wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
+wezterm.on("format-tab-title", function(tab, tabs)
 	local prefix = " " .. (tab.tab_index + 1) .. ": "
 	local pinned = tab.tab_title or ""
 	local sep = pinned:find(TAB_GROUP_SEP, 1, true)
@@ -1651,7 +1893,7 @@ fleet_key({
 	action = wezterm.action_callback(function(window, pane)
 		local choices = claude_peer_choices(read_session_id(pane:pane_id()))
 		if #choices == 0 then
-			window:toast_notification("wezterm", "No other live Claude sessions", nil, 2000)
+			notify(window, "wezterm", "No other live Claude sessions")
 			return
 		end
 		window:perform_action(
@@ -1810,7 +2052,7 @@ end
 local function fleet_jump(window, pane, pane_id)
 	local target = wezterm.mux.get_pane(pane_id)
 	if not target then
-		window:toast_notification("wezterm", "That pane has gone", nil, 2000)
+		notify(window, "wezterm", "That pane has gone")
 		return
 	end
 	target:activate()
@@ -1844,16 +2086,10 @@ end
 -- into an idle session. cc-handover builds the brief from the transcript and cc-note; the
 -- old pane stays for you to close. Handovers were typed prompts, ~5 a day, and donors went
 -- at a median 332k after 80 calls above 300k (jevlab round 7). Tabs are ordered by title
--- words shared with this session, this workspace first, unless Kev is up: then by cc-sort
--- --rank (Kev's p that a tab's sessions share this one's topic; cached pairs plus what it
--- answers in 1 s, which the picker waits for; cc-watch warms the focused pane's pairs),
--- Kev-scored tabs first. Every pick is
--- logged to ~/.cache/kev/handover-dest.jsonl with which ranking it saw.
+-- words shared with this session, this workspace first. Kev ranking (cc-sort --rank) was
+-- taken out on 2026-10-01: every LEADER+H paid its 1 s wait, and in handover-dest.jsonl no
+-- pick ever went to a Kev-ranked tab. Every pick is logged there with the ranking it saw.
 local handover_script = wezterm.home_dir .. "/.claude/bin/cc-handover"
-local sort_script = wezterm.home_dir .. "/.claude/bin/cc-sort"
--- Off since 2026-10-01: Kev is always up now, so every LEADER+H paid the 1 s wait, and in
--- handover-dest.jsonl no pick ever went to a Kev-ranked tab (both were "Beside this pane")
-local KEV_RANK = false
 local handover_log = wezterm.home_dir .. "/.cache/kev/handover-dest.jsonl"
 
 local function title_words(text)
@@ -1895,9 +2131,10 @@ local function run_handover(window, pane_id, args)
 		handover_script, pane_id, args)
 	local ok, ran, stdout, stderr = pcall(wezterm.run_child_process, { LOGIN_SHELL, "-lc", cmd })
 	if ok and ran then
-		window:toast_notification("wezterm", (stdout:match("[^\n]+") or "Handed over"), nil, 3000)
+		notify(window, "Handed over", stdout:match("[^\n]+") or "")
 	else
-		window:toast_notification("wezterm", "Handover failed: " .. tostring(stderr or ""), nil, 4000)
+		local why = tostring(stderr or ""):match("[^\n]+") or "cc-handover exited non-zero"
+		notify(window, "Handover failed", why, true)
 	end
 end
 
@@ -1943,30 +2180,7 @@ fleet_key({
 			end
 		end
 		local by = "words"
-		local ok_rank, ran, out = false, false, nil
-		if KEV_RANK then
-			ok_rank, ran, out = pcall(wezterm.run_child_process, {
-				LOGIN_SHELL, "-lc", string.format(
-					'PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH" \'%s\' --rank %d --timeout 1',
-					sort_script, here) })
-		end
-		if ok_rank and ran then
-			local kev = {}
-			for id, p in out:gmatch("(%d+)\t([%d.]+)") do
-				kev[tonumber(id)] = tonumber(p)
-			end
-			for _, t in ipairs(tabs) do
-				t.kev = kev[t.id]
-				by = t.kev and "kev" or by
-			end
-		end
 		table.sort(tabs, function(a, b)
-			if (a.kev ~= nil) ~= (b.kev ~= nil) then
-				return a.kev ~= nil
-			end
-			if a.kev and a.kev ~= b.kev then
-				return a.kev > b.kev
-			end
 			return a.score > b.score
 		end)
 
@@ -1981,7 +2195,8 @@ fleet_key({
 			table.insert(choices, { id = "in:" .. t.first, label = "New pane in " .. label })
 		end
 		for _, r in ipairs(rows) do
-			if r.pane ~= here and r.kind == "idle" and not r.asks then
+			-- warm only: pasting wakes the session, and a cold one pays for its context again
+			if r.pane ~= here and r.kind == "idle" and not r.asks and r.cache_left > 0 then
 				table.insert(choices, { id = "to:" .. r.pane,
 					label = string.format("Paste into %s · %s", r.name, r.title) })
 			end
@@ -2047,7 +2262,7 @@ fleet_key({
 		end
 		if #waiting == 0 then
 			focus_seen = {}
-			window:toast_notification("wezterm", "Nothing is waiting on you", nil, 2000)
+			notify(window, "wezterm", "Nothing is waiting on you")
 			return
 		end
 		local pick
@@ -2072,7 +2287,7 @@ fleet_key({
 	action = wezterm.action_callback(function(window, pane)
 		local choices = fleet_choices()
 		if #choices == 0 then
-			window:toast_notification("wezterm", "No live Claude sessions", nil, 2000)
+			notify(window, "wezterm", "No live Claude sessions")
 			return
 		end
 		window:perform_action(
@@ -2211,6 +2426,7 @@ local CHIME_ENABLED = false
 local CHIME_AFTER = 15 * 60
 local chime_dir = wezterm.home_dir .. "/.claude/cache/cc-chimed"
 local chime_at = 0
+local chime_dir_made = false
 
 -- not waiting: too common, it would be noise
 local CHIME_STATES = { asking = true, errored = true }
@@ -2249,6 +2465,10 @@ chime_overdue = function(window)
 	-- One window per pass, claimed by mkdir (atomic, fails if present). Not os.rename:
 	-- POSIX rename overwrites, so every caller wins. Not lowest window id: it may not be
 	-- ticking. Time-bucketed so claims expire; cleanup is the bucket before last.
+	if not chime_dir_made then
+		-- the claim below is a plain mkdir, which fails for ever without its parent
+		chime_dir_made = wezterm.run_child_process({ "/bin/mkdir", "-p", chime_dir })
+	end
 	local bucket = math.floor(now / 30)
 	local claimed = wezterm.run_child_process({ "/bin/mkdir", chime_dir .. "/.pass-" .. bucket })
 	if not claimed then
@@ -2260,27 +2480,33 @@ chime_overdue = function(window)
 		for _, tab in ipairs(mux_window:tabs()) do
 			for _, p in ipairs(tab:panes()) do
 				local id = p:pane_id()
-				local rec = read_pane_state(id)
-				local watched = rec ~= nil and CHIME_STATES[rec.state] == true
-				if watched and not pane_muted(id) and now - (rec.at or 0) >= CHIME_AFTER then
-					if not chime_marked(id, rec.at) then
-						local mins = math.floor((now - rec.at) / 60)
+				-- pane_status, not the raw record: it drops an ask Esc left behind and
+				-- sees the registry's dialog, which no hook writes
+				local spinning = is_working(p:get_title() or "")
+				local status, detail = pane_status({ pane_id = id }, spinning)
+				local since
+				if CHIME_STATES[status] then
+					local rec, reg = read_pane_state(id), digest_rows()[tostring(id)]
+					since = (rec ~= nil and rec.state == status and rec.at)
+						or (reg ~= nil and reg.seen)
+				end
+				if since and not pane_muted(id) and now - since >= CHIME_AFTER then
+					if not chime_marked(id, since) then
+						local mins = math.floor((now - since) / 60)
 						local who = strip_glyph(p:get_title() or "")
 						if who == "" then
 							who = "pane " .. id
 						end
-						local why = (rec.detail or ""):gsub("_", " ")
+						local why = (detail or ""):gsub("_", " ")
 						local title, body
-						if rec.state == "errored" then
+						if status == "errored" then
 							title = who .. " died on " .. (why ~= "" and why or "an api error")
 							body = string.format("%dm ago, and it is not coming back on its own", mins)
 						else
 							title = who .. " is still asking"
 							body = string.format("%dm%s", mins, why ~= "" and (" · " .. why) or "")
 						end
-						wezterm.background_child_process({
-							wezterm.home_dir .. "/.claude/bin/wz", "notify", title, body,
-						})
+						notify(window, title, body, true)
 					end
 				end
 			end
@@ -2423,7 +2649,8 @@ tmp="$out.$$"
 for dir in "$@"; do
 	branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || continue
 	[ -n "$branch" ] || continue
-	dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+	# no index.lock: a session committing in this repo at the same moment would fail on it
+	dirty=$(git --no-optional-locks -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
 	printf '%s\t%s\t%s\n' "$dir" "$branch" "$dirty" >>"$tmp"
 done
 mv "$tmp" "$out"
@@ -2802,7 +3029,7 @@ fleet_key({
 			end)
 		end
 		if not ok then
-			window:toast_notification("wezterm", "could not open the board", nil, 2000)
+			notify(window, "wezterm", "Could not open the board", true)
 			return
 		end
 		pcall(function()

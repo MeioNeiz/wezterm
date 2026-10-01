@@ -58,14 +58,27 @@ notify)
 	;;
 asking)
 	# PermissionRequest: fires at once, where Notification waits ~6s and resets on every
-	# keystroke. Nothing clears it; readers let the title spinner win once Claude resumes.
+	# keystroke. Nothing clears it: readers drop it once the title spins again, or once the
+	# registry stops after it, since Esc on the dialog ends the turn without a Stop.
 	detail=$(field tool_name 'A-Za-z0-9_-')
 	;;
 done)
-	# Non-empty background_tasks: the turn ended with the session's own children running.
-	# [^]] stops the match running past the array.
-	if printf '%s' "$payload" |
+	# A live entry in background_tasks: the turn ended with the session's own children
+	# running. Entries carry a status, and a finished one must not park the pane. jq,
+	# because a task's command can hold any bracket a grep would stop at.
+	if command -v jq >/dev/null 2>&1; then
+		live=$(printf '%s' "$payload" | jq -r '
+			[ .background_tasks[]? | select((.status // "running")
+				| test("^(completed|done|failed|killed|stopped|cancell?ed|errored)$") | not) ]
+			| if length > 0 then "live:" + ((.[0].type // "") | gsub("[\t\n]"; " "))
+			  else empty end' 2>/dev/null)
+		if [ -n "$live" ]; then
+			state=parked
+			detail=${live#live:}
+		fi
+	elif printf '%s' "$payload" |
 		grep -q '"background_tasks"[[:space:]]*:[[:space:]]*\[[[:space:]]*{'; then
+		# [^]] stops the match running past the array
 		state=parked
 		detail=$(printf '%s' "$payload" |
 			sed -n 's/.*"background_tasks"[[:space:]]*:[[:space:]]*\[[^]]*"type"[[:space:]]*:[[:space:]]*"\([A-Za-z_ -]*\)".*/\1/p' |

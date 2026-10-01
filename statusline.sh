@@ -32,6 +32,8 @@ readonly MAX_TITLE=64
 readonly MAX_NOTE=52
 readonly NOTES="$HOME/.claude/fleet/notes.tsv"
 readonly CTX_DIR="$HOME/.claude/cache/context"
+readonly RATE_FILE="$HOME/.claude/cache/rate-limits"
+readonly RATE_EVERY=5
 
 # ${#title} below must count characters, not bytes
 export LC_CTYPE=${LC_CTYPE:-en_GB.UTF-8}
@@ -40,8 +42,10 @@ payload=$(cat)
 
 # Split on a unit separator, not a tab: tab is IFS whitespace, so bash would fold
 # the empty fields an older build leaves behind and shift every value left one.
-IFS=$'\x1f' read -r transcript session dir title ctx_used ctx_size model effort fast now < <(
+IFS=$'\x1f' read -r transcript session dir title ctx_used ctx_size model effort fast now \
+	pc_expires pc_ttl pc_recache pc_hit rl_5h rl_5h_at rl_7d rl_7d_at rl_spend < <(
 	printf '%s' "$payload" | jq -r '
+		def pct(f): if type == "number" then f | round else . end;
 		[ .transcript_path // "",
 		  .session_id // "",
 		  (.workspace.current_dir // .cwd // ""),
@@ -51,7 +55,17 @@ IFS=$'\x1f' read -r transcript session dir title ctx_used ctx_size model effort 
 		  (.model.display_name // ""),
 		  (.effort.level // ""),
 		  (if .fast_mode then "fast" else "" end),
-		  (now | floor) ]
+		  (now | floor),
+		  (.prompt_cache.expires_at // "-"),
+		  ((.prompt_cache.ttl // "" | capture("^(?<n>[0-9]+)(?<u>[smhd])$")
+		   | (.n | tonumber) * {s: 1, m: 60, h: 3600, d: 86400}[.u]) // "-"),
+		  (.prompt_cache.recache_tokens_if_cold // "-"),
+		  (.prompt_cache.hit_ratio // "-" | pct(. * 100)),
+		  (.rate_limits.five_hour.used_percentage // "-" | pct(.)),
+		  (.rate_limits.five_hour.resets_at // "-"),
+		  (.rate_limits.seven_day.used_percentage // "-" | pct(.)),
+		  (.rate_limits.seven_day.resets_at // "-"),
+		  (.rate_limits.spend_limit // "-" | if type == "string" then . else tojson end) ]
 		| map(tostring | gsub("\\s+"; " ")) | join("\u001f")
 	' 2>/dev/null
 )
@@ -182,13 +196,26 @@ if ((${#note_status} > MAX_NOTE)); then
 	note_status="${note_status:0:$((MAX_NOTE - 1))}…"
 fi
 
-# How full this session is, for everything that cannot ask: Claude hands this number to
-# the statusLine and nowhere else (see CLAUDE.md). Silent on failure, since a pane's own
-# line must never break over a cache it writes for others.
+# How full this session is and when its prompt cache goes cold, for everything that
+# cannot ask: Claude hands both to the statusLine and nowhere else (see CLAUDE.md). Silent
+# on failure, since a pane's own line must never break over a cache it writes for others.
 if [[ -n $session && $ctx_used =~ ^[0-9]+$ ]]; then
 	[[ -d $CTX_DIR ]] || mkdir -p "$CTX_DIR" 2>/dev/null
-	printf '%s\t%s\t%s\n' "$ctx_used" "${ctx_size:-0}" "${now:-0}" \
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ctx_used" "${ctx_size:-0}" "${now:-0}" \
+		"${pc_expires:--}" "${pc_ttl:--}" "${pc_recache:--}" "${pc_hit:--}" \
 		>"$CTX_DIR/$session" 2>/dev/null
+fi
+
+# Rate limits are per account, so every session reports the same pair: one file for the
+# machine, rewritten at most every RATE_EVERY seconds by whichever pane renders first.
+if [[ $rl_5h != "-" || $rl_7d != "-" ]] && [[ -n $rl_5h ]]; then
+	rl_last=0
+	[[ -r $RATE_FILE ]] && read -r rl_last _ <"$RATE_FILE"
+	if ((${now:-0} - ${rl_last:-0} >= RATE_EVERY)); then
+		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${now:-0}" "$rl_5h" "${rl_5h_at:--}" "$rl_7d" \
+			"${rl_7d_at:--}" "${rl_spend:--}" >"$RATE_FILE.$$" 2>/dev/null &&
+			mv -f "$RATE_FILE.$$" "$RATE_FILE" 2>/dev/null
+	fi
 fi
 
 # The registry holds the name SendMessage addresses, and the payload does not carry it.
