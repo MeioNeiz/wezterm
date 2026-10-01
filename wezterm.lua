@@ -1295,6 +1295,16 @@ local left_at = {} -- pane id -> epoch you last left it, or first saw it
 local marked = {} -- pane id -> true
 local focus_pane = wezterm.GLOBAL.read_focus -- your pane, kept while wezterm is in back
 local looking = wezterm.GLOBAL.read_looking == true
+-- seconds on a pane before leaving it counts as having read it: flicking past on the way
+-- somewhere else is not reading, and it used to clear both ✓ and LEADER+t's unseen
+local READ_DWELL = 2
+local arrived_at = os.time()
+
+local function left(id)
+	if os.time() - arrived_at >= READ_DWELL then
+		left_at[id] = os.time()
+	end
+end
 
 for id, at in (wezterm.GLOBAL.read_left or ""):gmatch("(%d+):(%d+)") do
 	left_at[id] = tonumber(at)
@@ -1369,18 +1379,20 @@ unread_tick = function(window)
 	if focused then
 		if id ~= focus_pane then
 			if focus_pane ~= nil and looking then
-				left_at[focus_pane] = os.time()
+				left(focus_pane)
 			end
 			marked[id] = nil
 			focus_pane = id
 			looking = true
+			arrived_at = os.time()
 			unread_save()
 		elseif not looking then
 			looking = true
+			arrived_at = os.time()
 			unread_save()
 		end
 	elseif looking and id == focus_pane then
-		left_at[id] = os.time()
+		left(id)
 		looking = false
 		unread_save()
 	end
@@ -2384,7 +2396,7 @@ fleet_key({
 			end
 		end
 		if not pick then
-			notify(window, "wezterm", "Nothing new in the toasts")
+			notify(window, "wezterm", "Every recent toast seen; LEADER+T steps through them")
 			return
 		end
 		fleet_jump(window, pane, pick.pane)

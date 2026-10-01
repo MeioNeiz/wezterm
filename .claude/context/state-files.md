@@ -70,7 +70,8 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
   Jacob has read. wezterm.lua writes it on focus moves (it lives in `wezterm.GLOBAL`, this is
   the mirror); cc-board and cc-toast read it. Unread: hook record done or parked with an
   epoch after `left_at`, or marked (LEADER+U), and not the pane he is on. First sight is a
-  baseline, never unread
+  baseline, never unread. Leaving updates `left_at` only after 2s on the pane
+  (`READ_DWELL`): passing through is not reading
 - **`cache/notify-log`** `epoch, pane, rank, title` per `wz notify`, trimmed to 200: what
   LEADER+t (Kev's top unseen) and LEADER+T (newest) jump to
 - **`cache/cc-toast/<slot>`** `<pid> <height> <sticky 0|1> <started_ms>`, space-separated:
