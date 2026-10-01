@@ -6,11 +6,14 @@
 set -u
 
 # Cleared, not filtered: the session a human would have started from a plain shell.
+# TERM_PROGRAM=kitty as in the zsh alias: as WezTerm, claude wraps frames in synchronized
+# updates and the mux freezes the pane on an unclosed one; FORCE_HYPERLINK keeps OSC 8 links
 readonly CLEAN_ENV=(env
 	-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID
 	-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_MESSAGING_SOCKET
 	-u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_EXECPATH
-	-u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT)
+	-u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT
+	TERM_PROGRAM=kitty FORCE_HYPERLINK=1)
 
 usage() {
 	cat <<'USAGE'
