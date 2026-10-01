@@ -1,0 +1,66 @@
+#!/bin/bash
+# Close the sessions a gather (LEADER+G, cc-handover .tab) pulled into this pane, once the
+# handover has landed. The gather types `!ccx` here unsent; Enter runs it in bash mode, so
+# its one line of output lands in this session's context: keep it short.
+# Closes a source only if its pane still holds the same session and that session is not
+# mid-turn or holding a prompt open. Transcripts stay on disk.
+
+set -u
+export PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+readonly GATHERED="$HOME/.claude/fleet/gathered"
+readonly MAP="$HOME/.claude/wezterm-sessions"
+
+me=${WEZTERM_PANE:-}
+[[ -n $me ]] || { echo "ccx: not in a wezterm pane"; exit 1; }
+list="$GATHERED/$me"
+[[ -s $list ]] || { echo "ccx: nothing gathered into this pane"; exit 0; }
+
+roster=$(cc-roster 2>/dev/null)
+live=" $(wezterm cli list --format json 2>/dev/null | jq -r '.[].pane_id' | tr '\n' ' ') "
+
+closed="" kept="" left=""
+nclosed=0
+while IFS=$'\x1f' read -r pane sid name; do
+	[[ -n $pane && $pane != "$me" ]] || continue
+	[[ $live == *" $pane "* ]] || continue
+	held=""
+	{ IFS= read -r held <"$MAP/$pane"; } 2>/dev/null
+	if [[ $held != "$sid" ]]; then
+		kept+=" $name (pane reused)"
+		continue
+	fi
+	status=$(printf '%s\n' "$roster" | awk -F'\t' -v s="$sid" '$1 == s { print $3; exit }')
+	case $status in
+	busy | asking | waiting | shell)
+		kept+=" $name ($status)"
+		left+="$pane"$'\t'"$sid"$'\t'"$name"$'\n'
+		continue
+		;;
+	esac
+	if wezterm cli kill-pane --pane-id "$pane" 2>/dev/null; then
+		closed+=" $name"
+		nclosed=$((nclosed + 1))
+	else
+		kept+=" $name (kill failed)"
+		left+="$pane"$'\t'"$sid"$'\t'"$name"$'\n'
+	fi
+done < <(awk -F'\t' '{ printf "%s\x1f%s\x1f%s\n", $1, $2, $3 }' "$list")
+
+# what is still working stays listed, so a later ccx closes it once it has stopped
+if [[ -n $left ]]; then
+	printf '%s' "$left" >"$list"
+else
+	rm -f "$list"
+fi
+# Claude answers a bash-mode command with a turn of its own, so the line says what it means
+if [[ -n $left ]]; then
+	printf 'ccx closed %d:%s; kept%s, mid-turn: ccx again once stopped. %s\n' \
+		"$nclosed" "${closed:- none}" "$kept" "Nothing else to do"
+elif [[ -n $kept ]]; then
+	printf 'ccx closed %d:%s; kept%s. Nothing else to do\n' "$nclosed" "${closed:- none}" \
+		"$kept"
+else
+	printf 'ccx closed %d:%s. Handover sources done with; nothing else to do\n' "$nclosed" \
+		"${closed:- none}"
+fi

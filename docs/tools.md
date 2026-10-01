@@ -211,6 +211,24 @@ because a long turn pushes the prompt that started it well past 400KB back.
 so a multi-KB markdown brief with newlines, backticks and quotes in it arrives
 byte-identical. Checked, because the obvious assumption is that it would not.
 
+### gathering a tab: LEADER+G and ccx
+
+LEADER+G hands every session on the tab into one: **into this session** (offered only while
+it is warm, since the brief wakes it), or into a fresh one beside it or on a new tab, which
+takes this session too. It runs `cc-handover .tab --to <here>` or `cc-handover <here> .tab
+--new`. Any `.tab` or multi-source handover is a gather: cc-handover sends the brief (a
+plain `--to` only pastes it), records the sources in `fleet/gathered/<receiver>`, and once
+the receiver is busy on the brief types `!ccx` into its prompt, unsent, with
+`send-text --no-paste` so the `!` switches it to bash mode as a typed key does. A fresh
+session is polled every 0.5s for up to a minute first: keys typed before its prompt is up
+are lost.
+
+Enter on it runs **ccx**, which closes each source whose pane still holds the same session
+and is not busy, asking, waiting or running a background shell, and keeps the rest listed
+for a later `ccx`. It never closes the receiver. Claude answers a bash-mode command with a
+turn of its own, so ccx's one line says what it did and that nothing else is needed:
+without that the session guessed at why a source was kept, wrongly.
+
 ## Kev's three: cc-sort, cc-watch, cc-handovers
 
 Local Kev (kev-mcp) answers yes/no and choice questions in under a second for no Claude

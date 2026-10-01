@@ -2327,6 +2327,80 @@ fleet_key({
 	end),
 })
 
+-- LEADER+G: gather this tab. Every session on the tab handed into one: this session (when
+-- warm: pasting wakes it, cold pays its whole context) or a fresh one. cc-handover then
+-- types `!ccx` there unsent, and Enter on it closes the sources once the brief has landed
+do
+	local function run_gather(window, here, args)
+		local cmd = string.format(
+			'WEZTERM_PANE=%d PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH" '
+				.. "'%s' %s",
+			here, handover_script, args)
+		local ok, ran, stdout, stderr =
+			pcall(wezterm.run_child_process, { LOGIN_SHELL, "-lc", cmd })
+		if ok and ran then
+			notify(window, "Gathered", stdout:match("[^\n]+") or "")
+		else
+			local why = tostring(stderr or ""):match("[^\n]+") or "cc-handover exited non-zero"
+			notify(window, "Gather failed", why, true)
+		end
+	end
+
+	fleet_key({
+		key = "G",
+		mods = "LEADER",
+		action = wezterm.action_callback(function(window, pane)
+			local here = pane:pane_id()
+			local by_pane = {}
+			for _, r in ipairs(fleet_rows()) do
+				by_pane[r.pane] = r
+			end
+			local me, others = by_pane[here], {}
+			local ok = pcall(function()
+				for _, p in ipairs(pane:tab():panes()) do
+					local r = by_pane[p:pane_id()]
+					if r and p:pane_id() ~= here then
+						table.insert(others, r.name)
+					end
+				end
+			end)
+			if not ok or #others == 0 or (#others == 1 and not me) then
+				notify(window, "wezterm", "Nothing to gather: one session on this tab")
+				return
+			end
+			local all = me and (here .. " .tab") or ".tab"
+			local n = #others + (me and 1 or 0)
+			local choices = {}
+			local cold = me and me.kind == "idle" and me.cache_left == 0
+			if me and not cold then
+				table.insert(choices, { id = "here",
+					label = string.format("Into this session (%s) · %s", me.name,
+						table.concat(others, ", ")) })
+			end
+			table.insert(choices, { id = "new",
+				label = string.format("Into a new session beside this pane · all %d", n) })
+			table.insert(choices, { id = "tab",
+				label = string.format("Into a new tab · all %d", n) })
+			window:perform_action(
+				act.InputSelector({
+					title = "Gather this tab" .. (cold and " (this session is cold)" or ""),
+					choices = choices,
+					action = wezterm.action_callback(function(win, _, id)
+						if id == "here" then
+							run_gather(win, here, ".tab --to " .. here)
+						elseif id == "new" then
+							run_gather(win, here, all .. " --new --right")
+						elseif id == "tab" then
+							run_gather(win, here, all .. " --new --tab")
+						end
+					end),
+				}),
+				pane
+			)
+		end),
+	})
+end
+
 -- Straight to the next pane waiting on you, no picker. Waiting is cc-board's asks: a dialog,
 -- or Kev's verdict that the final reply needs you (jevlab stop-asks; the "?" rule when Kev
 -- is down). Blocked stops used to wait as long as finished ones (median 2.7 vs 3.0 min),

@@ -109,6 +109,8 @@ work for a successor. The brief, the transcript, its background tasks' output fi
 `.tab` is the same target grammar as `.`, and it means every *other* live session on this
 pane's tab, in wezterm's own left-to-right order, skipping panes holding no session. It
 exists because "hand me the rest of this tab" otherwise takes three calls and a join.
+Jacob's key for it is LEADER+G; a gather leaves `!ccx` typed in the receiver, and Enter on
+it closes the sources that have stopped.
 
 **A bare word in a cc-spawn argument list ends the options** and the rest becomes the
 prompt, `--dry-run` included. Flags only, before the prompt.

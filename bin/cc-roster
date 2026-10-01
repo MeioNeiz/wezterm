@@ -246,12 +246,12 @@ reap() {
 	while IFS=$'\t' read -r sid _; do
 		[[ -n $sid ]] && printf -v "rs_${sid//-/_}" 1
 	done <"$work/registry"
-	for f in "$PANE_STATE"/* "$PANE_MAP"/*; do
+	for f in "$PANE_STATE"/* "$PANE_MAP"/* "$HOME/.claude/fleet/gathered"/*; do
 		p=${f##*/}
 		[[ $p =~ ^[0-9]+$ ]] || continue
 		k="lp_$p"
 		if [[ -z ${!k:-} ]]; then
-			rm -f "$PANE_STATE/$p" "$PANE_MAP/$p"
+			rm -f "$PANE_STATE/$p" "$PANE_MAP/$p" "$HOME/.claude/fleet/gathered/$p"
 			continue
 		fi
 		[[ $f == "$PANE_MAP/$p" ]] || continue

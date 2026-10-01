@@ -18,6 +18,7 @@ wezterm.lua and the hooks call the scripts by their `~/.claude/bin` paths.
 | `bin/wz` | same | panes as a queryable surface, the event log, notify |
 | `bin/cc-tint`, `cc-note` | same | paints a pane at SessionStart; what a session says |
 | `bin/cc-spawn`, `cc-handover` | same | starts a session cleanly; moves work to a fresh one |
+| `bin/ccx` | same | closes what a gather (LEADER+G) pulled in, typed `!ccx` |
 | `bin/cc-sort`, `cc-watch`, `cc-handovers` | same | Kev: topic sort, output watch (off), digest |
 | `bin/cc-toast` | same | built by setup.sh from `toast/`, gitignored |
 | `skills/fleet` | `~/.claude/skills/fleet` | the skill sessions use to drive all of it |

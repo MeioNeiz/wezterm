@@ -84,6 +84,9 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
 - **`fleet/notes.tsv`** cc-note: `sid, at, flags, progress, status`, one line per annotated
   session. Read by the statusLine, cc-fleet and the tab bar. `fleet/todo/<sid>`,
   `fleet/log/<sid>` are read on demand only, never on a timer
+- **`fleet/gathered/<receiver pane>`** `pane\tsid\tname` per source of a gather, written by
+  cc-handover, read and pruned by ccx (it keeps what it could not close); reaped with the
+  pane by `cc-roster --digest`
 - **`fleet/handover/<name>-<stamp>.md`** cc-handover's briefs; cc-handovers writes
   `fleet/handover-days/` (`HANDOVER_DAYS` overrides), read by the vault's /weekly-review
 - **`cache/wz-events.jsonl`** wz's event log, `wz-events.pid` beside it

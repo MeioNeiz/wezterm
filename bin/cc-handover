@@ -8,6 +8,15 @@ set -u
 
 readonly FLEET="$HOME/.claude/fleet"
 readonly OUT="$FLEET/handover"
+# A gather (.tab, or several sources) records its sources here, keyed by the receiving
+# pane: `pane\tsid\tname` per line. ccx reads it to close them once Jacob is satisfied
+readonly GATHERED="$FLEET/gathered"
+# What a gather types, unsent, into the receiver: Enter on it closes the sources
+readonly PREFILL='!ccx'
+# A fresh session is polled until it is busy on the brief; typing before its prompt is up
+# loses the keys
+readonly PREFILL_POLL=0.5
+readonly PREFILL_TRIES=120
 # Transcripts reach 13MB; the useful part is the end.
 readonly TAIL_BYTES=400000
 # Past this inline, the new session is handed the file path instead.
@@ -30,7 +39,9 @@ cc-handover - hand a session's work to a fresh one
   cc-handover [T] --new [--right|--down|--tab|--window]
                                      open a fresh session, seeded with it
   cc-handover [T] --new --in <pane>  open it split from that pane, in that pane's tab
-  cc-handover [T] --to <pane>        paste the brief into a session already open; refused
+  cc-handover [T] --to <pane>        paste the brief into a session already open
+  cc-handover .tab --to <pane>       gather: send it, then type !ccx there (unsent) to
+                                     close the sources once you are satisfied; refused
                                      when that one is idle and cold, since pasting wakes it
   cc-handover [T] --save             just write the file and print its path
   cc-handover [T] --new --dry-run    print the command it would run, and stop
@@ -350,7 +361,9 @@ task_outputs() {
 
 # Expanded first, so the section count is real. Command substitution, not process
 # substitution: die in the latter would leave an empty target list.
+gather=false
 if [[ " ${targets[*]} " == *" .tab "* ]]; then
+	gather=true
 	sibs=$(tab_siblings) || exit 1
 	expanded=()
 	for t in "${targets[@]}"; do
@@ -370,6 +383,35 @@ for t in "${targets[@]}"; do
 	row=$(row_for "$t") || exit 1
 	rows+=("$row")
 done
+((${#rows[@]} > 1)) && gather=true
+
+# The sources, minus the receiver, for ccx
+write_gathered() {
+	local receiver=$1 row
+	mkdir -p "$GATHERED" 2>/dev/null
+	for row in "${rows[@]}"; do
+		printf '%s\n' "$row"
+	done | awk -F'\t' -v r="$receiver" '$5 != r && $5 != "-" && $5 != "" {
+		print $5 "\t" $1 "\t" $2 }' >"$GATHERED/$receiver"
+}
+
+# Detached: once the receiver is busy on the brief, type PREFILL into its prompt as keys,
+# so the leading ! switches it to bash mode. Gives up silently
+prefill_later() {
+	local receiver=$1
+	(
+		for ((i = 0; i < PREFILL_TRIES; i++)); do
+			if cc-roster 2>/dev/null |
+				awk -F'\t' -v p="$receiver" '$5 == p && $3 == "busy" { f = 1 } END { exit !f }'
+			then
+				wezterm cli send-text --no-paste --pane-id "$receiver" -- "$PREFILL"
+				exit 0
+			fi
+			sleep "$PREFILL_POLL"
+		done
+	) </dev/null >/dev/null 2>&1 &
+	disown 2>/dev/null
+}
 
 # --to: settle the target before writing anything. Pasting wakes it, and an idle one gone
 # cold pays its whole context to read the brief
@@ -443,7 +485,16 @@ print)
 	;;
 to)
 	wezterm cli send-text --pane-id "$pane_to" -- "$brief"
-	echo "handover pasted into pane $pane_to (press enter there to send it)"
+	if $gather; then
+		# chosen as the receiver on purpose, so sent: the prefill needs an empty prompt
+		sleep 0.3
+		wezterm cli send-text --no-paste --pane-id "$pane_to" -- $'\r'
+		write_gathered "$pane_to"
+		prefill_later "$pane_to"
+		echo "gathered ${#rows[@]} sessions into pane $pane_to; $PREFILL there closes them"
+	else
+		echo "handover pasted into pane $pane_to (press enter there to send it)"
+	fi
 	;;
 new)
 	[[ $pane != "-" || $split == window ]] ||
@@ -464,7 +515,13 @@ new)
 		exit 0
 	fi
 	[[ -n $new ]] || die "could not open a pane for the handover"
-	echo "handed $name over to pane $new"
+	if $gather; then
+		write_gathered "$new"
+		prefill_later "$new"
+		echo "gathered ${#rows[@]} sessions into pane $new; $PREFILL is typed there to close them"
+	else
+		echo "handed $name over to pane $new"
+	fi
 	echo "brief: $file"
 	;;
 esac
