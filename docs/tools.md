@@ -1,6 +1,6 @@
 # The tools: wz, cc-note, cc-handover, cc-spawn, and Kev's three
 
-Pointed at from CLAUDE.md.
+Pointed at from CLAUDE.md and docs/INDEX.md.
 
 ## addresses, and why a name is not one
 
@@ -94,6 +94,14 @@ corner because native banners draw into one full-screen window, so there is no s
 below them. Toasts stack by slot, hovering holds the countdown, the countdown holds while
 another app is in front, and one closes itself once you are on its pane. A click with
 `--pane` runs `wz go <pane>` and brings WezTerm forward. It plays the sound unless `--quiet`.
+
+A toast with `--pane` wears that session's identity hue (cc-colour, resolved by wz): a
+gradient over the glass, a 3pt bar down the left and the title in the hue, so it reads as
+the pane it came from. **`--sticky`** has no countdown and is marked by a small dot in the
+hue; it closes only when you are on its pane, click it, or press x. stop-asks makes one
+sticky when the verdict is blocked at p >= 0.6, the rank is >= 0.75, or Kev is down and the
+reply ends on a question. The stack holds five: past that the oldest non-sticky one goes
+first, and a toast whose pane has closed dismisses itself within about 10s.
 
 Every notify is logged to `~/.claude/cache/notify-log` with its pane and `--rank`, so the
 toasts can be followed after they have gone: **LEADER+t** goes to the one Kev ranked

@@ -1,5 +1,9 @@
 # What is out there, September 2026
 
+> Evidence as of 2026-09, not current state. Where it disagrees with the code or
+> `.claude/context/`, they win: background jobs, rate limits, `prompt_cache` and the parked
+> caps have all moved since. What is new: `docs/research/claude-code-2026-10.md`.
+
 A survey of agent-control tooling, done because this rig was built against the 2025
 picture and most of that picture has changed. Raw agent reports are in `research/`;
 this is the distillation.

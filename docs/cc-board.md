@@ -1,6 +1,6 @@
 # cc-board, and the tab bar
 
-Pointed at from CLAUDE.md.
+Pointed at from CLAUDE.md and docs/INDEX.md.
 
 ## the point of cc-board
 

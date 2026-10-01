@@ -62,4 +62,4 @@ pins in `~/.claude/session-colours` win.
 Useful side effect: two sessions sharing a name still get different colours.
 
 The full reasoning, including the four approaches that were tried and abandoned, is in
-`~/personal/wezterm/CLAUDE.md`. Read it before changing any of this.
+`~/personal/wezterm/docs/colour.md`. Read it before changing any of this.

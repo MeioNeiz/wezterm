@@ -1,6 +1,6 @@
 # What it costs, in time and in tokens
 
-Pointed at from CLAUDE.md.
+Pointed at from CLAUDE.md and docs/INDEX.md.
 
 ## what it costs
 
@@ -82,3 +82,9 @@ there is no per-target overhead to weigh when handing over three at once.
 
 Method, if it needs redoing: run the command with its output redirected to a file and
 `wc -c` that, rather than letting it into the context you are trying to measure.
+
+## cc-fleet, piped
+
+`cc-fleet` was 55% escape codes when piped: invisible to a human, about 960 tokens of noise
+to a session reading it, so it only colours a tty now. `cc-fleet --brief` answers "what
+wants me" in about 18 tokens, against the dashboard's 767 and `--json`'s 1958. Prefer it.

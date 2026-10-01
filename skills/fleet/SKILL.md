@@ -196,6 +196,10 @@ Otherwise use `status` when you park work or are blocked on something off-machin
 - Don't kill a `never`-prompted session without saying what it was: usually a handover
   nobody has read, and the ask may still matter.
 - Prefer `cc-fleet --stale` over inventing a staleness rule.
+- **PushNotification reaches Jacob as a sticky toast** that waits until he looks. Use it
+  only for what cannot wait for him to glance at the board: a decision blocking work, a
+  failure, something done that he asked to hear about at once. Not for routine finishes;
+  the Stop hook already toasts those.
 
 ## Gotchas
 
@@ -217,5 +221,5 @@ Otherwise use `status` when you park work or are blocked on something off-machin
   two panes share one; don't call a colour unique without checking.
 
 More: `reference/watching.md` (wait, events, pipe, and rearranging panes),
-`reference/colour.md` (the two colour channels). Machinery notes and the rules for
-changing any of this: `~/personal/wezterm/CLAUDE.md`.
+`reference/colour.md` (the two colour channels). Changing any of this: work in
+`~/personal/wezterm`, whose CLAUDE.md routes to the rules and the state-file formats.

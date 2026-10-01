@@ -1,8 +1,8 @@
 # Colour: the two channels, the pane tint, and the palette
 
-Pointed at from CLAUDE.md. Read this before changing anything that puts colour on a
-screen; most of it is measurement rather than taste, and four of the approaches in here
-were tried and abandoned.
+Pointed at from CLAUDE.md and docs/INDEX.md. Read this before changing anything that puts
+colour on a screen; most of it is measurement rather than taste, and four of the approaches
+in here were tried and abandoned.
 
 ## two colour channels, and why they cannot be one
 
