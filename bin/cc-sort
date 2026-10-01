@@ -9,11 +9,14 @@
                                                      (cc-watch, on a focus change)
 
 Kev answers one yes/no per pair of Claude sessions in a workspace: same project and topic?
-(name, title, folder, last request). A pane's affinity for a tab is its best pair there; it
+(name, title, folder). A pane's affinity for a tab is its best pair there; it
 moves beside that partner when the affinity is >= --min (0.7) and beats staying put by
 MARGIN. A pane alone in its tab counts as ALONE for staying. Only Claude panes move;
-shells stay (the plan says when one is left behind). Pairs are cached a day in
-~/.cache/kev/cc-sort-pairs.json, so a rerun is instant and LEADER+H reuses them.
+shells stay (the plan says when one is left behind). It moves panes and never types into
+one, so a session whose prompt cache has gone cold is not woken. Pairs are cached a day in
+~/.cache/kev/cc-sort-pairs.json, so a rerun is instant and LEADER+H reuses them. A
+description leaves out the last request: it changes every prompt, so no cached pair would
+survive one.
 
 Measured 2026-09-26 on 16 live sessions (120 pairs): telling workspaces apart AUROC 0.99,
 current tabmates against other tabs of the same workspace 0.57. So it is good at "this is
@@ -24,6 +27,7 @@ fleet) and exits 2 if Kev is down.
 Plans and rankings are logged to ~/.cache/kev/cc-sort.jsonl."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -52,48 +56,11 @@ def die(msg: str, code: int = 1):
     sys.exit(code)
 
 
-def clip(s: str, n: int) -> str:
-    s = " ".join(s.split())
-    return s if len(s) <= n else s[: n - 3] + "..."
-
-
-def text_of(content) -> str:
-    if isinstance(content, str):
-        return content
-    return " ".join(c.get("text", "") for c in content or [] if c.get("type") == "text")
-
-
-def last_request(sid: str, cwd: str) -> str:
-    path = HOME / ".claude/projects" / "".join(c if c.isalnum() else "-" for c in cwd) / (
-        sid + ".jsonl")
-    if not path.is_file():
-        found = sorted(HOME.glob(f".claude/projects/*/{sid}.jsonl"),
-                       key=lambda p: p.stat().st_mtime)
-        if not found:
-            return ""
-        path = found[-1]
-    with path.open("rb") as f:
-        f.seek(max(0, path.stat().st_size - 400_000))
-        lines = f.read().decode(errors="replace").splitlines()[1:]
-    for line in reversed(lines):
-        if '"type":"user"' not in line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        content = (ev.get("message") or {}).get("content")
-        if isinstance(content, list) and any(c.get("type") == "tool_result" for c in content):
-            continue
-        text = text_of(content).strip()
-        if text and not text.startswith("<") and not ev.get("isMeta"):
-            return text
-    return ""
-
-
 def snapshot() -> tuple[list[dict], dict[int, dict]]:
     """-> (wezterm panes, pane id -> fleet row)."""
-    panes = json.loads(subprocess.run(["wezterm", "cli", "list", "--format", "json"],
+    # a dead socket must fail, not start a stray wezterm-mux-server
+    panes = json.loads(subprocess.run(["wezterm", "cli", "--no-auto-start", "list", "--format",
+                                       "json"],
                                       capture_output=True, text=True, check=True).stdout)
     out = subprocess.run([str(HOME / ".claude/bin/cc-fleet"), "--tsv"],
                          capture_output=True, text=True).stdout
@@ -110,16 +77,11 @@ def cwd_of(p: dict) -> str:
     return p.get("cwd", "").removeprefix("file://").rstrip("/") or "?"
 
 
-def describe(p: dict, row: dict | None, with_request: bool) -> str:
+def describe(p: dict, row: dict | None) -> str:
     folder = Path(cwd_of(p)).name
     if not row:
         return f"a shell in {folder}"
-    s = f"{row['name']} in {folder}: {row['title']}"
-    if with_request:
-        req = last_request(row["sid"], cwd_of(p))
-        if req:
-            s += f" (last asked: {clip(req, 90)})"
-    return s
+    return f"{row['name']} in {folder}: {row['title']}"
 
 
 def kev_up() -> bool:
@@ -132,7 +94,7 @@ def ensure_kev():
     if kev_up():
         return
     print("cc-sort: starting Kev (~35 s)", file=sys.stderr)
-    subprocess.run(["kev", "start"], stdout=subprocess.DEVNULL)
+    subprocess.run([str(HOME / ".local/bin/kev"), "start"], stdout=subprocess.DEVNULL)
     if not kev_up():
         die("Kev did not start: kev status, ~/.cache/kev/serve-8009.log", 2)
 
@@ -181,10 +143,24 @@ class Pairs:
         return p
 
     def save(self):
+        # a --warm and a --rank overlap: merge into what is on disk under a lock, or the
+        # last writer drops the other's pairs
         PAIRS.parent.mkdir(parents=True, exist_ok=True)
-        tmp = PAIRS.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.cache))
-        tmp.replace(PAIRS)
+        with open(PAIRS.with_suffix(".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                disk = json.loads(PAIRS.read_text())
+            except (OSError, json.JSONDecodeError):
+                disk = {}
+            now = time.time()
+            merged = {k: v for k, v in disk.items() if now - v[1] < PAIR_TTL}
+            for k, v in self.cache.items():
+                if k not in merged or merged[k][1] < v[1]:
+                    merged[k] = v
+            tmp = PAIRS.with_suffix(".tmp")
+            tmp.write_text(json.dumps(merged))
+            tmp.replace(PAIRS)
+            self.cache = merged
 
 
 def plan_workspace(ws: str, panes: list[dict], rows: dict, pairs: Pairs,
@@ -199,7 +175,7 @@ def plan_workspace(ws: str, panes: list[dict], rows: dict, pairs: Pairs,
     for p in panes:
         members[p["tab_id"]].append(p["pane_id"])
     claude = [p for p in panes if p["pane_id"] in rows]
-    desc = {p["pane_id"]: describe(p, rows[p["pane_id"]], True) for p in claude}
+    desc = {p["pane_id"]: describe(p, rows[p["pane_id"]]) for p in claude}
     score = {}
     for p in claude:
         for q in claude:
@@ -282,15 +258,13 @@ def rank(pane_id: int, timeout: float, warm: bool = False):
     me = next((p for p in panes if p["pane_id"] == pane_id), None)
     if not me or pane_id not in rows:
         die(f"no Claude session in pane {pane_id}")
-    # no last request for this pane: it changes every prompt, and a stable description is
-    # what lets the pairs cc-watch warmed still be there when LEADER+H is pressed
-    mine = describe(me, rows[pane_id], False)
+    mine = describe(me, rows[pane_id])
     # this workspace first: when the budget runs out, the likeliest tabs are scored
     others = sorted((p for p in panes if p["pane_id"] in rows and p["tab_id"] != me["tab_id"]),
                     key=lambda p: p["workspace"] != me["workspace"])
     pairs, best = Pairs(), {}
     for q in others:
-        d = describe(q, rows[q["pane_id"]], True)
+        d = describe(q, rows[q["pane_id"]])
         s = pairs.get(mine, d)
         if s is None and time.time() < deadline - 0.2:
             try:

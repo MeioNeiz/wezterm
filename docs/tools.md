@@ -1,4 +1,4 @@
-# The tools: wz, cc-note, cc-handover, cc-spawn
+# The tools: wz, cc-note, cc-handover, cc-spawn, and Kev's three
 
 Pointed at from CLAUDE.md.
 
@@ -83,6 +83,18 @@ was make it cheap enough to reach for mid-task. The parts worth knowing:
   full-screen TUI repaints in place and its "new" lines are whatever the redraw touched.
   Fine for a shell or a log, useless pointed at another Claude pane.
 
+### notify, and cc-toast
+
+`wz notify` is the one way anything here reaches you off screen: the stop-asks and drift
+hooks, cc-watch and wezterm.lua all go through it. On macOS it raises **cc-toast**, a
+panel of its own, top right, for `--for` seconds (20 by default): a Notification Centre
+banner leaves after about five whatever it is told, and there is no API that changes that.
+Toasts stack by slot, hovering holds the countdown, and a click with `--pane` runs
+`wz go <pane>` and brings WezTerm forward. It plays the sound itself unless `--quiet`.
+cc-toast is Swift, built by setup.sh from `toast/cc-toast.swift` into the gitignored
+`bin/cc-toast`; without it notify falls back to osascript (Script Editor's banner), and on
+Linux to notify-send.
+
 Not built, and why: there is no `swap-pane` or `respawn-pane` because wezterm has no
 primitive for either. There is no status/notes store because nothing would render it; that
 wants a statusline change in this file, and it should wait until the tab bar work lands.
@@ -157,6 +169,17 @@ Two things that are not obvious and cost a while to find:
   changed what the work was. The brief carries everything queued since the last real
   prompt, in order.
 
+- **a cold session is never woken or resumed.** A resume, a paste or a message re-reads
+  its whole context; a fresh session reading the transcript costs a brief. So the brief
+  carries a `claude --resume` line only while the source's prompt cache is warm, and says
+  instead what a resume would re-read when it is cold; `--to` refuses an idle target whose
+  cache is cold, before writing anything, and points at `--new`. Cache state is the
+  statusLine's `prompt_cache` expiry and recache price, from `cache/context/<sid>`;
+  without them the last reply plus an hour and `used_pct x window`. It also goes to stderr
+  per source. Sessions do not talk to each other to hand over: the successor gets the
+  transcript, the output files its background tasks wrote (`<tmp>/tasks/<id>.output`,
+  from its tool results) and, while the pane is open, `wz read <pane> -n 200`.
+
 Also: the `last-prompt` record beside the transcript is Claude's own UI copy and arrives
 already truncated with an ellipsis, so the brief greps the whole file for the last real
 user turn instead. One grep over a 1.4MB transcript is 13ms; the tail is no good here
@@ -165,3 +188,35 @@ because a long turn pushes the prompt that started it well past 400KB back.
 `wezterm cli spawn -- <argv>` passes arguments straight to exec with no shell in between,
 so a multi-KB markdown brief with newlines, backticks and quotes in it arrives
 byte-identical. Checked, because the obvious assumption is that it would not.
+
+## Kev's three: cc-sort, cc-watch, cc-handovers
+
+Local Kev (kev-mcp) answers yes/no and choice questions in under a second for no Claude
+tokens. Three scripts here lean on it, and all three degrade to doing less, never to
+guessing, when it is down.
+
+**cc-sort** groups Claude panes by topic: one Kev "same project and topic?" per pair of
+sessions in a workspace (name, title, folder), a pane moving beside its best partner when
+p >= 0.7 and beats staying put by 0.15. Dry run by default, `--apply` joins. `--rank <pane>`
+is LEADER+H's tab ordering, cache plus whatever Kev answers inside a second. Pairs are
+cached a day in `~/.cache/kev/cc-sort-pairs.json`, merged under a lock so a `--warm` and a
+`--rank` running together keep both. A description carries no last request: that changes
+every prompt and no cached pair would survive one. Good at "wrong project" (AUROC 0.99),
+weak at splitting one project into topics (0.57), so it never breaks a tab up.
+
+**cc-watch** polls background shell panes every 10s and asks Kev whether new output
+matters (a run ended, failed, a server came up, it wants input); p >= 0.45 toasts. **It is
+off**, and stays off until the repaint fix has been watched for a while: its first version
+read any in-place redraw as forty new lines, and 1953 of its 1968 asks were nvim's clock.
+Now new lines are only what follows the last look's tail, read 200 lines into scrollback so
+a fast scroll still overlaps; an in-place change to the last two lines is not news; a
+screen with no anchor at all is a repaint or a clear and is rebased silently; and panes
+running a full-screen program are skipped. While Kev is down the baseline moves, so its
+return is not a flood. `cc-watch start | stop | status`, `test` for the examples.
+
+**cc-handovers** is the daily digest: every brief in `~/.claude/fleet/handover` for a day,
+who took it up (pasted, `--new`/`--to`, SendMessage, or fetched), how many prompts you sent
+it after, and Kev's verdict on the successor's last stop. Written at 08:30 by launchd
+(`cc-handovers --install`, setup.sh runs it) to `~/.claude/fleet/handover-days/`, which
+/weekly-review in the vault reads; `HANDOVER_DAYS` overrides. Without a kev-mcp checkout it
+still runs, with no verdicts. Linux has no launchd: `--install` prints the cron line.

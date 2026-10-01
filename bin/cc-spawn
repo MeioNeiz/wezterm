@@ -74,7 +74,7 @@ while (($#)); do
 	--window) where="window" ;;
 	--shell) shell=true ;;
 	--ask) ask=true ;;
-	--effort) shift; effort=${1:-} ;;
+	--effort) shift; effort=${1:-}; [[ -n $effort ]] || die "--effort needs a level" ;;
 	--model) shift; model=${1:-}; [[ -n $model ]] || die "--model needs a model" ;;
 	--worktree) worktree=true ;;
 	--worktree=*) worktree=true; wtname=${1#--worktree=} ;;
@@ -87,12 +87,12 @@ while (($#)); do
 	shift
 done
 
-$shell || (($#)) || die "need a prompt (or --shell)"
-$worktree && $shell && die "--worktree needs a Claude session, not --shell"
 case $effort in
 "" | low | medium | high | xhigh | max) ;;
-*) die "--effort is low, medium, high, xhigh or max" ;;
+*) die "--effort is low, medium, high, xhigh or max, not \"$effort\"" ;;
 esac
+$shell || (($#)) || die "need a prompt (or --shell)"
+$worktree && $shell && die "--worktree needs a Claude session, not --shell"
 
 pane=""
 if [[ -n $from ]]; then

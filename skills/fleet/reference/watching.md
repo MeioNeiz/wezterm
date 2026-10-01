@@ -28,10 +28,12 @@ stop-asks hook covers those) prints something worth an interruption: a build or 
 done, a crash, a server ready, a password prompt. Kev judges only new output, only while
 Kev is up. `cc-watch status`, `stop`, `test`.
 **Off since 2026-10-01; do not start it unless Jacob asks.** 1,939 asks in 5 days, 99%
-nvim redraws (the status-line clock), 3 toasts of which 0 useful.
+nvim redraws, 0 useful toasts. Repaints and full-screen programs are now ignored; it
+stays off until that has been watched.
 
-`wz notify 'title' 'body'` raises a desktop notification. It is fire and forget: no read
-state, no dismissal, and no way to jump to the pane it came from.
+`wz notify [--quiet] [--for S] [--pane N] 'title' 'body'` raises a toast that stays S
+seconds (20 by default; on macOS cc-toast, top right). With `--pane`, clicking it jumps
+there. No read state: what has been seen lives in the tab bar's unread mark, not here.
 
 ## Rearranging panes
 

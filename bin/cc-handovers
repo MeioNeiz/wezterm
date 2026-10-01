@@ -48,12 +48,38 @@ STAMP = re.compile(r"^(.+)-(\d{8})-(\d{6})\.md$")
 VERDICT = {"blocked": "left waiting on you", "offer": "done, offered more", "done": "done"}
 
 
-def load_stop_asks():
-    loader = importlib.machinery.SourceFileLoader("stop_asks", str(STOP_ASKS))
-    spec = importlib.util.spec_from_loader("stop_asks", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+_stop_asks: list = []
+
+
+def stop_asks():
+    """kev-mcp's stop-asks hook as a module, or None where there is no kev-mcp checkout:
+    then no verdicts, and the follow-up count falls back to human_prompt."""
+    if not _stop_asks:
+        mod = None
+        if STOP_ASKS.is_file():
+            try:
+                loader = importlib.machinery.SourceFileLoader("stop_asks", str(STOP_ASKS))
+                spec = importlib.util.spec_from_loader("stop_asks", loader)
+                mod = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+            except Exception as e:
+                print(f"cc-handovers: {STOP_ASKS} failed to load ({e}); no verdicts",
+                      file=sys.stderr)
+                mod = None
+        _stop_asks.append(mod)
+    return _stop_asks[0]
+
+
+def human_prompt(ev: dict) -> bool:
+    """stop-asks is_human, for when kev-mcp is not here."""
+    content = (ev.get("message") or {}).get("content")
+    if isinstance(content, list) and any(c.get("type") == "tool_result" for c in content):
+        return False
+    text = text_of(content)
+    return bool(text.strip()) and not (
+        "<task-notification>" in text or "<cross-session-message" in text
+        or (ev.get("origin") or {}).get("kind") == "peer" or ev.get("isMeta")
+        or text.startswith("<command-") or text.startswith("<local-command"))
 
 
 def clip(s: str, n: int) -> str:
@@ -120,7 +146,8 @@ def briefs_in(text: str) -> list[str]:
 
 def scan(transcript: Path) -> dict[str, dict]:
     """Every brief this session took, how, and how many prompts Jacob sent it after."""
-    sa = STOP
+    sa = stop_asks()
+    is_human = sa.is_human if sa else human_prompt
     title, given, humans = "", {}, []
     for i, line in enumerate(transcript.open(errors="replace")):
         if '"ai-title"' not in line and '"type":"user"' not in line:
@@ -137,7 +164,7 @@ def scan(transcript: Path) -> dict[str, dict]:
         content = (ev.get("message") or {}).get("content")
         results = [c for c in content if c.get("type") == "tool_result"] if isinstance(
             content, list) else []
-        if sa.is_human(ev):
+        if is_human(ev):
             humans.append(i)
         if "fleet/handover/" not in line:
             continue
@@ -189,7 +216,9 @@ def live_names() -> dict[str, str]:
 
 
 def verdict(info: dict) -> str:
-    sa = STOP
+    sa = stop_asks()
+    if not sa:
+        return ""
     state, uuid, _ = sa.read(Path(info["transcript"]))
     if not state:
         return ""
@@ -258,6 +287,10 @@ def render(day: date, rows: list[dict]) -> str:
 
 
 def install():
+    if sys.platform != "darwin":
+        print("cc-handovers: --install is launchd, macOS only; on Linux add a cron line:\n"
+              f"  30 8 * * * {HOME}/.claude/bin/cc-handovers --write --kev")
+        return
     exe = HOME / ".claude/bin/cc-handovers"
     PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -307,8 +340,6 @@ def main():
         out.write_text(text)
         print(f"\nwrote {out} ({time.time() - t0:.1f} s)", file=sys.stderr)
 
-
-STOP = load_stop_asks()
 
 if __name__ == "__main__":
     main()

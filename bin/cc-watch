@@ -11,13 +11,19 @@ pane per MIN_GAP s, does Kev get one choice (notify / ignore, rules in the optio
 help binary gates, jevlab round 3) on the pane's command, folder and new output. p >=
 THRESHOLD raises `wz notify` "<title>: <the line that matters>", quiet unless it reads as
 a failure, and never twice within QUIET s for one pane. Claude panes are left to the
-stop-asks hook, which already toasts when one is waiting on Jacob. When the focused pane
-changes to a Claude session, it runs `cc-sort --warm` on it in the background, so LEADER+H
-finds that pane's Kev tab ranking cached instead of waiting on it.
+stop-asks hook, which already toasts when one is waiting on Jacob; this only ever reads
+screens, and never types into or prompts any pane. When the focused pane changes to a
+Claude session, it runs `cc-sort --warm` on it in the background, so LEADER+H finds that
+pane's Kev tab ranking cached instead of waiting on it.
+
+New lines are what follows the last look's tail in the current capture; a screen with no
+such anchor was repainted in place (a clock, a progress bar), not written to, and is
+rebased silently. Full-screen programs (TUI) are skipped outright.
 
 Kev is asked only while it is up (it idles off after 20 min), so this costs nothing when
-Kev is down; KEV_WATCH_START=1 starts it. Every ask goes to asks.jsonl (the data for
-tuning THRESHOLD later). Zero Claude tokens."""
+Kev is down, and what arrives meanwhile is baseline, not news; KEV_WATCH_START=1 starts
+it. Every ask goes to asks.jsonl (the data for tuning THRESHOLD later). Zero Claude
+tokens."""
 from __future__ import annotations
 
 import hashlib
@@ -44,6 +50,13 @@ QUIET = 300
 # 8 held out 7/8 (a quiet rsync finish scored 0.13). Retune from asks.jsonl
 THRESHOLD = float(os.environ.get("KEV_WATCH_THRESHOLD", "0.45"))
 NEW_MAX = 900
+# scrollback read past the screen, so a fast scroll still overlaps the last look
+SCROLLBACK = 200
+ANCHOR = 5
+# a pane whose foreground is one of these redraws in place; its screen is never news.
+# 2026-09: 1953 of 1968 asks came from nvim's clock
+TUI = {"nvim", "vim", "vi", "less", "more", "man", "htop", "btop", "top", "watch", "tmux",
+       "lazygit", "k9s", "tig", "ranger", "yazi", "mc", "nano", "emacs", "claude"}
 WARM_EVERY = 600
 QUESTION = {"notable": {
     "type": "choice",
@@ -121,6 +134,24 @@ def claude_panes() -> set[int]:
     return live
 
 
+def foreground() -> dict[str, str]:
+    """tty -> the foreground command on it, from one ps."""
+    out = subprocess.run(["ps", "-A", "-o", "tty=,stat=,comm="], capture_output=True,
+                         text=True, timeout=5).stdout
+    fg = {}
+    for ln in out.splitlines():
+        parts = ln.split(None, 2)
+        if len(parts) == 3 and "+" in parts[1]:
+            fg[parts[0]] = Path(parts[2].lstrip("-")).name
+    return fg
+
+
+def is_tui(p: dict, fg: dict[str, str]) -> bool:
+    tty = (p.get("tty_name") or "").removeprefix("/dev/")
+    names = {fg.get(tty, ""), (p.get("title") or "").split(" ", 1)[0]}
+    return bool(names & TUI)
+
+
 def watched() -> list[dict]:
     panes = json.loads(cli("list", "--format", "json") or "[]")
     try:
@@ -130,23 +161,35 @@ def watched() -> list[dict]:
         focused = set()
     seen_tabs = {p["tab_id"] for p in panes if p["pane_id"] in focused}
     skip = claude_panes()
-    return ([p for p in panes if p["pane_id"] not in skip and p["tab_id"] not in seen_tabs],
-            {f for f in focused if f in skip})
+    fg = foreground()
+    return ([p for p in panes if p["pane_id"] not in skip and p["tab_id"] not in seen_tabs
+             and not is_tui(p, fg)], {f for f in focused if f in skip})
 
 
 def screen(pane: int) -> list[str]:
-    lines = [ln.rstrip() for ln in cli("get-text", "--pane-id", str(pane)).splitlines()]
+    lines = [ln.rstrip() for ln in cli("get-text", "--pane-id", str(pane), "--start-line",
+                                       str(-SCROLLBACK)).splitlines()]
     while lines and not lines[-1]:
         lines.pop()
-    return lines[-40:]
+    return lines
 
 
 def new_lines(old: list[str], cur: list[str]) -> list[str]:
-    """Lines past the longest overlap of old's tail with cur's head (the screen scrolled)."""
-    for k in range(min(len(old), len(cur)), 0, -1):
-        if old[-k:] == cur[:k]:
-            return cur[k:]
-    return cur if old != cur else []
+    """What follows old's tail in cur. The last `drop` lines of old may have been redrawn in
+    place (a progress line, a prompt), so the anchor tries without them and their redrawn
+    selves are not news. No anchor at all: a repaint or a clear, never news."""
+    if old == cur:
+        return []
+    for drop in range(0, 3):
+        base = old[:len(old) - drop] if drop else old
+        for k in range(min(ANCHOR, len(base)), 0, -1):
+            tail = base[-k:]
+            if not any(tail):
+                continue
+            for i in range(len(cur) - k, -1, -1):
+                if cur[i:i + k] == tail:
+                    return cur[i + k + drop:]
+    return []
 
 
 def headline(new: list[str]) -> str:
@@ -172,52 +215,74 @@ def run(once: bool, verbose: bool):
     warmed: dict[int, float] = {}
     if os.environ.get("KEV_WATCH_START") == "1" and not kev_up():
         subprocess.run([str(HOME / ".local/bin/kev"), "start"], capture_output=True)
-    while True:
-        now = time.time()
-        up = kev_up()
-        alive = set()
-        panes, focused_claude = watched()
-        for f in focused_claude:
-            if up and now - warmed.get(f, 0) > WARM_EVERY:
-                warmed[f] = now
-                subprocess.Popen([str(HOME / ".claude/bin/cc-sort"), "--warm", str(f)],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
-        for p in panes:
-            pid = p["pane_id"]
-            alive.add(pid)
-            cur = screen(pid)
-            if pid not in looked:
-                looked[pid] = cur  # first sight is the baseline, not news
-                continue
-            new = new_lines(looked[pid], cur)
-            if not new or not up or now - last_ask.get(pid, 0) < MIN_GAP:
-                continue
-            command = p.get("title") or "?"
-            folder = Path(p.get("cwd", "").removeprefix("file://").rstrip("/")).name
-            prob = ask(state_of(command, folder, "\n".join(new)))
-            if prob is None:
-                continue
-            (HOME / ".cache/kev/last-use").touch()
-            looked[pid], last_ask[pid] = cur, now
-            told = prob >= THRESHOLD and now - last_told.get(pid, 0) >= QUIET
-            line = headline(new)
-            log({"pane": pid, "command": command, "folder": folder, "p": round(prob, 3),
-                 "told": told, "new": "\n".join(new)[-NEW_MAX:]})
-            if verbose:
-                print(f"pane {pid} {command}: p {prob:.2f}{' TOLD' if told else ''} {line}",
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        while True:
+            try:
+                tick(looked, last_ask, last_told, warmed, verbose)
+            except Exception as e:  # a hung wezterm or a torn JSON must not end the watch
+                print(f"cc-watch: tick failed: {type(e).__name__}: {e}", file=sys.stderr,
                       flush=True)
-            if told:
-                last_told[pid] = now
-                loud = any(w in line.lower() for w in FAILURE_WORDS)
-                subprocess.run([str(WZ), "notify", *([] if loud else ["--quiet"]), "--",
-                                f"{command} ({folder})", line or "new output"],
-                               stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-        for gone in set(looked) - alive:
-            looked.pop(gone, None)
-        if once:
-            return
-        time.sleep(TICK)
+            if once:
+                return
+            time.sleep(TICK)
+    finally:
+        try:
+            if int(PID.read_text()) == os.getpid():
+                PID.unlink()
+        except (OSError, ValueError):
+            pass
+
+
+def tick(looked: dict, last_ask: dict, last_told: dict, warmed: dict, verbose: bool):
+    now = time.time()
+    up = kev_up()
+    alive = set()
+    panes, focused_claude = watched()
+    for f in focused_claude:
+        if up and now - warmed.get(f, 0) > WARM_EVERY:
+            warmed[f] = now
+            subprocess.Popen([str(HOME / ".claude/bin/cc-sort"), "--warm", str(f)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    for p in panes:
+        pid = p["pane_id"]
+        alive.add(pid)
+        cur = screen(pid)
+        if pid not in looked:
+            looked[pid] = cur  # first sight is the baseline, not news
+            continue
+        new = new_lines(looked[pid], cur)
+        if not new:
+            looked[pid] = cur  # a repaint moves the baseline; it must not pile up
+            continue
+        if not up:
+            looked[pid] = cur  # nobody to ask: baseline, so Kev's return is not a flood
+            continue
+        if now - last_ask.get(pid, 0) < MIN_GAP:
+            continue
+        command = p.get("title") or "?"
+        folder = Path(p.get("cwd", "").removeprefix("file://").rstrip("/")).name
+        prob = ask(state_of(command, folder, "\n".join(new[-40:])))
+        if prob is None:
+            continue
+        (HOME / ".cache/kev/last-use").touch()
+        looked[pid], last_ask[pid] = cur, now
+        told = prob >= THRESHOLD and now - last_told.get(pid, 0) >= QUIET
+        line = headline(new)
+        log({"pane": pid, "command": command, "folder": folder, "p": round(prob, 3),
+             "told": told, "new": "\n".join(new)[-NEW_MAX:]})
+        if verbose:
+            print(f"pane {pid} {command}: p {prob:.2f}{' TOLD' if told else ''} {line}",
+                  flush=True)
+        if told:
+            last_told[pid] = now
+            loud = any(w in line.lower() for w in FAILURE_WORDS)
+            subprocess.run([str(WZ), "notify", *([] if loud else ["--quiet"]), "--",
+                            f"{command} ({folder})", line or "new output"],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    for gone in set(looked) - alive:
+        looked.pop(gone, None)
 
 
 def running() -> int | None:

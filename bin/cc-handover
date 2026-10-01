@@ -18,6 +18,9 @@ readonly TRIVIAL_TEXT=160
 # a paste about as often as after it.
 readonly CLIP_MAX=1100
 readonly CLIP_HEAD=650
+readonly CTX_DIR="$HOME/.claude/cache/context"
+# Assumed when the statusLine has not recorded an expiry. Must match cc-board and cc-fleet
+readonly PROMPT_CACHE_TTL=3600
 
 usage() {
 	cat <<'USAGE'
@@ -27,7 +30,8 @@ cc-handover - hand a session's work to a fresh one
   cc-handover [T] --new [--right|--down|--tab|--window]
                                      open a fresh session, seeded with it
   cc-handover [T] --new --in <pane>  open it split from that pane, in that pane's tab
-  cc-handover [T] --to <pane>        paste the brief into a session already open
+  cc-handover [T] --to <pane>        paste the brief into a session already open; refused
+                                     when that one is idle and cold, since pasting wakes it
   cc-handover [T] --save             just write the file and print its path
   cc-handover [T] --new --dry-run    print the command it would run, and stop
 
@@ -149,7 +153,7 @@ LEAD_NAME=""
 
 render_session() {
 	local sid name cwd pane transcript title last_prompt last_prompt_at queued
-	local replies files branch dirty note tailfile
+	local replies files branch dirty note tailfile outputs
 
 	IFS=$'\x1f' read -r sid name cwd pane < <(
 		printf '%s\n' "$1" | awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s", $1, $2, $6, $5 }'
@@ -233,10 +237,15 @@ render_session() {
 	dirty=""
 	if [[ -d $cwd ]]; then
 		branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
-		[[ -n $branch ]] && dirty=$(git -C "$cwd" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+		# no optional locks: a session committing in that repo must not hit index.lock
+		[[ -n $branch ]] && dirty=$(git --no-optional-locks -C "$cwd" status --porcelain \
+			2>/dev/null | wc -l | tr -d ' ')
 	fi
 
 	note=$(cc-note show --for "$sid" --bare 2>/dev/null)
+	outputs=$(task_outputs "$transcript")
+	cache_note "$sid"
+	[[ -n $CACHE_NOTE ]] && printf '%s: %s\n' "$name" "$CACHE_NOTE" >&2
 
 	{
 		printf '## From %s' "$name"
@@ -258,10 +267,81 @@ render_session() {
 			printf '\n'
 		fi
 		printf '**Its transcript** (read this rather than guessing)\n\n    %s\n\n' "$transcript"
-		printf 'Reopen it with `claude --resume %s`.\n\n' "$sid"
+		if [[ -n $outputs ]]; then
+			printf '**What its background tasks wrote** '
+			printf '(a subagent'"'"'s is its JSONL transcript: tail it)\n\n'
+			printf '%s\n' "$outputs" |
+				awk -F'\t' '{ printf "- `%s` (%d KB)\n", $1, ($2 + 1023) / 1024 }'
+			printf '\n'
+		fi
+		if [[ $pane != "-" ]]; then
+			printf 'Its pane is still open: `wz read %s -n 200` gives the scrollback.\n\n' "$pane"
+		fi
+		# Never point a successor at resuming a cold session: that re-reads it all
+		if [[ $CACHE_WARM == warm ]]; then
+			printf 'Reopen it with `claude --resume %s` (%s).\n\n' "$sid" "$CACHE_NOTE"
+		elif [[ $CACHE_WARM == cold ]]; then
+			printf 'Do not resume it: its prompt cache is cold%s. This brief replaces that.\n\n' \
+				"${CACHE_COST:+ and a resume would re-read $CACHE_COST}"
+		else
+			printf 'This brief replaces resuming it.\n\n'
+		fi
 	} >>"$file"
 
 	rm -f "$tailfile" "$tailfile.users"
+}
+
+# Whether resuming a session would hit its prompt cache. A cold one is never woken or
+# resumed: a fresh session reading its transcript costs a brief, a resume re-reads the
+# whole context. The statusLine records the expiry and recache price (fields 4 and 6 of
+# cache/context/<sid>); without them the last reply plus PROMPT_CACHE_TTL. Sets CACHE_WARM
+# (warm, cold or empty for unknown), CACHE_COST ("~40k tokens" or empty) and CACHE_NOTE.
+cache_note() {
+	local sid=$1 now expires recache pct window at left
+	CACHE_NOTE=""
+	CACHE_WARM=""
+	CACHE_COST=""
+	now=$(date +%s)
+	IFS=$'\x1f' read -r pct window expires recache < <(awk -F'\t' 'NR == 1 {
+		printf "%s\x1f%s\x1f%s\x1f%s", $1, $2, $4, $6 }' "$CTX_DIR/$sid" 2>/dev/null)
+	case ${expires:-} in '' | - | *[!0-9]*) expires="" ;; esac
+	if [[ -z $expires ]]; then
+		at=$(jq -r --arg s "$sid" 'select(.sessionId == $s)
+			| ((.statusUpdatedAt // .updatedAt // 0) / 1000 | floor)' \
+			"$HOME"/.claude/sessions/*.json 2>/dev/null | head -1)
+		[[ $at =~ ^[0-9]+$ ]] && ((at > 0)) && expires=$((at + PROMPT_CACHE_TTL))
+	fi
+	case ${recache:-} in '' | - | *[!0-9]*) recache="" ;; esac
+	if [[ -z $recache && ${pct:-} =~ ^[0-9]+$ && ${window:-} =~ ^[0-9]+$ ]]; then
+		recache=$((pct * window / 100))
+	fi
+	[[ -n $recache ]] && CACHE_COST="~$(((recache + 500) / 1000))k tokens"
+	if [[ -n $expires ]] && ((expires > now)); then
+		CACHE_WARM=warm
+		left=$(((expires - now + 59) / 60))
+		CACHE_NOTE="prompt cache warm for ${left}m more: resuming is cheap"
+	elif [[ -n $expires ]]; then
+		CACHE_WARM=cold
+		CACHE_NOTE="prompt cache cold since $(date -r "$expires" '+%a %H:%M' 2>/dev/null ||
+			date -d "@$expires" '+%a %H:%M')"
+		CACHE_NOTE+="${CACHE_COST:+: a resume would re-read $CACHE_COST}; hand over instead"
+	elif [[ -n $CACHE_COST ]]; then
+		CACHE_NOTE="cache state unknown; a cold resume re-reads $CACHE_COST"
+	fi
+	return 0
+}
+
+# Output a background task of the session wrote to disk, newest last: the paths its tool
+# results name (`<tmp>/tasks/<id>.output`) that still exist. Whole transcript, since a task
+# can be started long before the tail.
+task_outputs() {
+	local transcript=$1 f size
+	grep -o '/[^" ]*/tasks/[A-Za-z0-9_-]*\.output' "$transcript" 2>/dev/null |
+		awk '!seen[$0]++' | tail -8 | while IFS= read -r f; do
+		[[ -f $f ]] || continue
+		size=$(wc -c <"$f" | tr -d ' ')
+		printf '%s\t%s\n' "$f" "$size"
+	done
 }
 
 # --- the brief ------------------------------------------------------------------------
@@ -290,6 +370,26 @@ for t in "${targets[@]}"; do
 	row=$(row_for "$t") || exit 1
 	rows+=("$row")
 done
+
+# --to: settle the target before writing anything. Pasting wakes it, and an idle one gone
+# cold pays its whole context to read the brief
+if [[ $action == to ]]; then
+	pane_to=$to
+	case $to in
+	*[!0-9]*) pane_to=$(cc-roster --pane "$to") ;;
+	esac
+	[[ -n $pane_to && $pane_to != "-" ]] || die "--to: no pane for \"$to\""
+	to_row=$(cc-roster 2>/dev/null | awk -F'\t' -v p="$pane_to" '$5 == p { print; exit }')
+	if [[ -n $to_row ]]; then
+		to_sid=$(printf '%s' "$to_row" | cut -f1)
+		to_status=$(printf '%s' "$to_row" | cut -f3)
+		cache_note "$to_sid"
+		if [[ $to_status == idle && $CACHE_WARM == cold ]]; then
+			die "--to: pane $pane_to is idle with a cold prompt cache${CACHE_COST:+ \
+($CACHE_COST to wake)}; use --new for a fresh session"
+		fi
+	fi
+fi
 
 mkdir -p "$OUT" 2>/dev/null
 stamp=$(date '+%Y%m%d-%H%M%S')
@@ -342,11 +442,6 @@ print)
 	printf '%s\n' "$(<"$file")"
 	;;
 to)
-	pane_to=$to
-	case $to in
-	*[!0-9]*) pane_to=$(cc-roster --pane "$to") ;;
-	esac
-	[[ -n $pane_to && $pane_to != "-" ]] || die "--to: no pane for \"$to\""
 	wezterm cli send-text --pane-id "$pane_to" -- "$brief"
 	echo "handover pasted into pane $pane_to (press enter there to send it)"
 	;;
