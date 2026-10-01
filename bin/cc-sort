@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""cc-sort - put panes about the same topic in the same tab, Kev deciding which.
+
+  cc-sort [-w <workspace> | -a] [--min P] [--json]   dry run: the moves it would make
+  cc-sort ... --apply                                make them (wz join)
+  cc-sort --rank <pane> [--timeout S]                tab_id<TAB>p for other tabs, best
+                                                     first: LEADER+H's ordering
+  cc-sort --warm <pane>                              ask the pairs --rank would, quietly
+                                                     (cc-watch, on a focus change)
+
+Kev answers one yes/no per pair of Claude sessions in a workspace: same project and topic?
+(name, title, folder, last request). A pane's affinity for a tab is its best pair there; it
+moves beside that partner when the affinity is >= --min (0.7) and beats staying put by
+MARGIN. A pane alone in its tab counts as ALONE for staying. Only Claude panes move;
+shells stay (the plan says when one is left behind). Pairs are cached a day in
+~/.cache/kev/cc-sort-pairs.json, so a rerun is instant and LEADER+H reuses them.
+
+Measured 2026-09-26 on 16 live sessions (120 pairs): telling workspaces apart AUROC 0.99,
+current tabmates against other tabs of the same workspace 0.57. So it is good at "this is
+in the wrong project" and weak at splitting one project into topics, which is why --min is
+high and it never breaks a tab up. Kev is started if down (~35 s), except for --rank,
+which uses cache plus what Kev answers within --timeout (1 s, counted after reading the
+fleet) and exits 2 if Kev is down.
+Plans and rankings are logged to ~/.cache/kev/cc-sort.jsonl."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+
+HOME = Path.home()
+PORT = int(os.environ.get("KEV_PORT", "8009"))
+LOG = HOME / ".cache/kev/cc-sort.jsonl"
+PAIRS = HOME / ".cache/kev/cc-sort-pairs.json"
+PAIR_TTL = 86400
+WZ = HOME / ".claude/bin/wz"
+MARGIN = 0.15
+ALONE = 0.5
+PAIR_QUESTION = ("Are these two agent sessions working on the same project and topic, so "
+                 "they belong side by side in one tab?")
+
+
+def die(msg: str, code: int = 1):
+    print(f"cc-sort: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def clip(s: str, n: int) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    return " ".join(c.get("text", "") for c in content or [] if c.get("type") == "text")
+
+
+def last_request(sid: str, cwd: str) -> str:
+    path = HOME / ".claude/projects" / "".join(c if c.isalnum() else "-" for c in cwd) / (
+        sid + ".jsonl")
+    if not path.is_file():
+        found = sorted(HOME.glob(f".claude/projects/*/{sid}.jsonl"),
+                       key=lambda p: p.stat().st_mtime)
+        if not found:
+            return ""
+        path = found[-1]
+    with path.open("rb") as f:
+        f.seek(max(0, path.stat().st_size - 400_000))
+        lines = f.read().decode(errors="replace").splitlines()[1:]
+    for line in reversed(lines):
+        if '"type":"user"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        content = (ev.get("message") or {}).get("content")
+        if isinstance(content, list) and any(c.get("type") == "tool_result" for c in content):
+            continue
+        text = text_of(content).strip()
+        if text and not text.startswith("<") and not ev.get("isMeta"):
+            return text
+    return ""
+
+
+def snapshot() -> tuple[list[dict], dict[int, dict]]:
+    """-> (wezterm panes, pane id -> fleet row)."""
+    panes = json.loads(subprocess.run(["wezterm", "cli", "list", "--format", "json"],
+                                      capture_output=True, text=True, check=True).stdout)
+    out = subprocess.run([str(HOME / ".claude/bin/cc-fleet"), "--tsv"],
+                         capture_output=True, text=True).stdout
+    rows = {}
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) >= 12 and f[3].isdigit():
+            rows[int(f[3])] = {"name": f[4], "state": f[5], "dir": f[9], "title": f[10],
+                               "sid": f[11]}
+    return panes, rows
+
+
+def cwd_of(p: dict) -> str:
+    return p.get("cwd", "").removeprefix("file://").rstrip("/") or "?"
+
+
+def describe(p: dict, row: dict | None, with_request: bool) -> str:
+    folder = Path(cwd_of(p)).name
+    if not row:
+        return f"a shell in {folder}"
+    s = f"{row['name']} in {folder}: {row['title']}"
+    if with_request:
+        req = last_request(row["sid"], cwd_of(p))
+        if req:
+            s += f" (last asked: {clip(req, 90)})"
+    return s
+
+
+def kev_up() -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", PORT)) == 0
+
+
+def ensure_kev():
+    if kev_up():
+        return
+    print("cc-sort: starting Kev (~35 s)", file=sys.stderr)
+    subprocess.run(["kev", "start"], stdout=subprocess.DEVNULL)
+    if not kev_up():
+        die("Kev did not start: kev status, ~/.cache/kev/serve-8009.log", 2)
+
+
+def log(entry: dict):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    (HOME / ".cache/kev/last-use").touch()
+    with LOG.open("a") as f:
+        f.write(json.dumps({"ts": int(time.time()), **entry}) + "\n")
+
+
+def pair_key(a: str, b: str) -> str:
+    return hashlib.sha1("\0".join(sorted((a, b))).encode()).hexdigest()[:16]
+
+
+class Pairs:
+    """p(same topic) per pair of session descriptions, cached for a day: reruns and LEADER+H
+    reuse what an earlier sort already asked."""
+
+    def __init__(self):
+        try:
+            self.cache = json.loads(PAIRS.read_text())
+        except (OSError, json.JSONDecodeError):
+            self.cache = {}
+        now = time.time()
+        self.cache = {k: v for k, v in self.cache.items() if now - v[1] < PAIR_TTL}
+        self.asked = 0
+
+    def get(self, a: str, b: str) -> float | None:
+        hit = self.cache.get(pair_key(a, b))
+        return hit[0] if hit else None
+
+    def ask(self, a: str, b: str, timeout: float = 30) -> float:
+        hit = self.get(a, b)
+        if hit is not None:
+            return hit
+        body = json.dumps({"state": f"Session A: {a}\nSession B: {b}", "model": "kev-latest",
+                           "questions": {"same": {"type": "noul",
+                                                  "instructions": PAIR_QUESTION}}}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/systemone", body,
+                                     {"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            p = float(json.load(r)["answers"]["same"]["noul"])
+        self.cache[pair_key(a, b)] = [round(p, 4), int(time.time())]
+        self.asked += 1
+        return p
+
+    def save(self):
+        PAIRS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PAIRS.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.cache))
+        tmp.replace(PAIRS)
+
+
+def plan_workspace(ws: str, panes: list[dict], rows: dict, pairs: Pairs,
+                   min_p: float) -> list[dict]:
+    tab_of = {p["pane_id"]: p["tab_id"] for p in panes}
+    # tab_id is not what the tab bar shows: position in its window, ascending tab_id
+    windows = defaultdict(set)
+    for p in panes:
+        windows[p["window_id"]].add(p["tab_id"])
+    tab_no = {t: i for tabs in windows.values() for i, t in enumerate(sorted(tabs), 1)}
+    members = defaultdict(list)
+    for p in panes:
+        members[p["tab_id"]].append(p["pane_id"])
+    claude = [p for p in panes if p["pane_id"] in rows]
+    desc = {p["pane_id"]: describe(p, rows[p["pane_id"]], True) for p in claude}
+    score = {}
+    for p in claude:
+        for q in claude:
+            if p["pane_id"] < q["pane_id"]:
+                try:
+                    s = pairs.ask(desc[p["pane_id"]], desc[q["pane_id"]])
+                except Exception as e:
+                    pairs.save()
+                    die(f"Kev failed: {e}", 2)
+                score[p["pane_id"], q["pane_id"]] = score[q["pane_id"], p["pane_id"]] = s
+
+    candidates = []
+    for p in claude:
+        me = p["pane_id"]
+        aff = defaultdict(lambda: (0.0, None))
+        for q in claude:
+            if q["pane_id"] != me and score[me, q["pane_id"]] > aff[q["tab_id"]][0]:
+                aff[q["tab_id"]] = (score[me, q["pane_id"]], q["pane_id"])
+        stay = aff[p["tab_id"]][0] if p["tab_id"] in aff else ALONE
+        others = {t: v for t, v in aff.items() if t != p["tab_id"] and v[1] is not None}
+        if not others:
+            continue
+        best = max(others, key=lambda t: others[t][0])
+        p_best, anchor = others[best]
+        if p_best >= min_p and p_best - stay >= MARGIN:
+            candidates.append({"ws": ws, "pane": me, "name": rows[me]["name"],
+                               "from_tab": p["tab_id"], "to_tab": best,
+                               "to_no": tab_no[best], "anchor": anchor,
+                               "anchor_name": rows[anchor]["name"], "p": round(p_best, 2),
+                               "p_stay": round(stay, 2), "move": True,
+                               "shells_left": [x for x in members[p["tab_id"]]
+                                               if x != me and x not in rows]})
+    # greedy, surest first: a pane that anchors a move stays, and a pane that moved cannot
+    # anchor, so swaps and chains resolve to one direction
+    moved, anchors = set(), set()
+    for c in sorted(candidates, key=lambda c: -c["p"]):
+        if c["pane"] in anchors or c["anchor"] in moved or tab_of[c["anchor"]] != c["to_tab"]:
+            c["move"], c["skip"] = False, "its partner is moving"
+            continue
+        moved.add(c["pane"])
+        anchors.add(c["anchor"])
+    return candidates
+
+
+def print_plans(plans: list[dict], workspaces: list[str]):
+    for ws in workspaces:
+        ws_plans = [pl for pl in plans if pl["ws"] == ws]
+        n = sum(pl["move"] for pl in ws_plans)
+        if not ws_plans:
+            continue
+        print(f"{ws}: {n} move{'s' * (n != 1)}")
+        for pl in ws_plans:
+            if pl["move"]:
+                left = (f", leaves shell pane {', '.join(map(str, pl['shells_left']))}"
+                        if pl["shells_left"] else "")
+                print(f"  {pl['name']} (pane {pl['pane']}) beside {pl['anchor_name']} "
+                      f"in tab {pl['to_no']}: p {pl['p']:.2f} vs {pl['p_stay']:.2f} "
+                      f"where it is{left}")
+            else:
+                print(f"  skip {pl['name']}: {pl['skip']}")
+    if not plans:
+        print(f"no moves in {len(workspaces)} workspace{'s' * (len(workspaces) != 1)}")
+    if any(pl["move"] for pl in plans):
+        print("\ncc-sort --apply makes these moves; conversations are untouched")
+
+
+def apply(plans: list[dict]):
+    for pl in plans:
+        if pl["move"]:
+            r = subprocess.run([str(WZ), "join", str(pl["pane"]), str(pl["anchor"]), "--right"],
+                               capture_output=True, text=True)
+            print(f"{pl['name']}: {(r.stdout or r.stderr).strip()}")
+
+
+def rank(pane_id: int, timeout: float, warm: bool = False):
+    if not kev_up():
+        die("Kev is down; not starting it for a ranking", 2)
+    panes, rows = snapshot()
+    deadline = time.time() + timeout
+    me = next((p for p in panes if p["pane_id"] == pane_id), None)
+    if not me or pane_id not in rows:
+        die(f"no Claude session in pane {pane_id}")
+    # no last request for this pane: it changes every prompt, and a stable description is
+    # what lets the pairs cc-watch warmed still be there when LEADER+H is pressed
+    mine = describe(me, rows[pane_id], False)
+    # this workspace first: when the budget runs out, the likeliest tabs are scored
+    others = sorted((p for p in panes if p["pane_id"] in rows and p["tab_id"] != me["tab_id"]),
+                    key=lambda p: p["workspace"] != me["workspace"])
+    pairs, best = Pairs(), {}
+    for q in others:
+        d = describe(q, rows[q["pane_id"]], True)
+        s = pairs.get(mine, d)
+        if s is None and time.time() < deadline - 0.2:
+            try:
+                s = pairs.ask(mine, d, timeout=max(0.2, deadline - time.time()))
+            except Exception:
+                s = None
+        if s is not None and s > best.get(q["tab_id"], -1):
+            best[q["tab_id"]] = s
+    pairs.save()
+    if warm:
+        return
+    ranked = sorted(best, key=best.get, reverse=True)
+    log({"rank": pane_id, "name": rows[pane_id]["name"], "asked": pairs.asked,
+         "scored": len(best), "of": len({q["tab_id"] for q in others}),
+         "tabs": [[t, round(best[t], 3)] for t in ranked]})
+    for t in ranked:
+        print(f"{t}\t{best[t]:.3f}")
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return
+    ws_filter, every, do_apply, as_json, min_p, timeout = None, False, False, False, 0.7, 1.0
+    rank_pane, warm = None, False
+    while args:
+        a = args.pop(0)
+        if a == "-a":
+            every = True
+        elif a == "-w" and args:
+            ws_filter = args.pop(0)
+        elif a == "--apply":
+            do_apply = True
+        elif a == "--json":
+            as_json = True
+        elif a == "--min" and args:
+            min_p = float(args.pop(0))
+        elif a in ("--rank", "--warm") and args:
+            rank_pane, warm = int(args.pop(0)), a == "--warm"
+            timeout = 60 if warm else timeout
+        elif a == "--timeout" and args:
+            timeout = float(args.pop(0))
+        else:
+            die(f"unknown argument {a}; cc-sort --help")
+    if rank_pane is not None:
+        return rank(rank_pane, timeout, warm)
+
+    panes, rows = snapshot()
+    if not every and ws_filter is None:
+        here = os.environ.get("WEZTERM_PANE", "")
+        ws_filter = next((p["workspace"] for p in panes if str(p["pane_id"]) == here), None)
+        if ws_filter is None:
+            die("not in a wezterm pane: pass -w <workspace> or -a")
+    workspaces = [ws for ws in dict.fromkeys(p["workspace"] for p in panes)
+                  if every or ws == ws_filter]
+    if not workspaces:
+        die(f"no workspace {ws_filter}")
+    ensure_kev()
+    pairs, plans = Pairs(), []
+    for ws in workspaces:
+        plans += plan_workspace(ws, [p for p in panes if p["workspace"] == ws], rows, pairs,
+                                min_p)
+    pairs.save()
+    log({"plan": [{k: pl[k] for k in ("ws", "name", "from_tab", "to_tab", "anchor_name", "p",
+                                      "p_stay", "move")} for pl in plans],
+         "asked": pairs.asked, "apply": do_apply})
+    if as_json:
+        print(json.dumps(plans, indent=1))
+    else:
+        print_plans(plans, workspaces)
+    if do_apply:
+        apply(plans)
+
+
+if __name__ == "__main__":
+    main()

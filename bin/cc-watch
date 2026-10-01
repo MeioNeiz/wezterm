@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""cc-watch - tell Jacob when a background shell pane does something he'd want to know now.
+
+  cc-watch start | stop | status     the poller, detached; log in ~/.cache/kev/cc-watch/
+  cc-watch run [--once] [-v]         in the foreground
+  cc-watch test                      Kev on the built-in examples, no panes read
+
+Every TICK s it reads the screen of each non-Claude pane that is not in the tab Jacob is
+looking at. Only when a pane has new lines since Kev last looked, and at most once per
+pane per MIN_GAP s, does Kev get one choice (notify / ignore, rules in the options: they
+help binary gates, jevlab round 3) on the pane's command, folder and new output. p >=
+THRESHOLD raises `wz notify` "<title>: <the line that matters>", quiet unless it reads as
+a failure, and never twice within QUIET s for one pane. Claude panes are left to the
+stop-asks hook, which already toasts when one is waiting on Jacob. When the focused pane
+changes to a Claude session, it runs `cc-sort --warm` on it in the background, so LEADER+H
+finds that pane's Kev tab ranking cached instead of waiting on it.
+
+Kev is asked only while it is up (it idles off after 20 min), so this costs nothing when
+Kev is down; KEV_WATCH_START=1 starts it. Every ask goes to asks.jsonl (the data for
+tuning THRESHOLD later). Zero Claude tokens."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+PORT = int(os.environ.get("KEV_PORT", "8009"))
+DIR = HOME / ".cache/kev/cc-watch"
+PID = DIR / "pid"
+LOG = DIR / "asks.jsonl"
+WZ = HOME / ".claude/bin/wz"
+TICK = 10
+MIN_GAP = 20
+QUIET = 300
+# kev 4B, 2026-09-26: 10 made-up examples 10/10 at 0.45 (notify >= 0.48, ignore <= 0.31);
+# 8 held out 7/8 (a quiet rsync finish scored 0.13). Retune from asks.jsonl
+THRESHOLD = float(os.environ.get("KEV_WATCH_THRESHOLD", "0.45"))
+NEW_MAX = 900
+WARM_EVERY = 600
+QUESTION = {"notable": {
+    "type": "choice",
+    "instructions": "This terminal pane runs in the background while the user works "
+                    "elsewhere. Should the user be told about its new output right now?",
+    "criteria": {
+        "notify": "a command or run has ended (passed or failed), crashed, printed an error, "
+                  "traceback or FAILED, a server became ready, or it waits for input",
+        "ignore": "still running with routine progress or logs, or nothing new that matters"}}}
+FAILURE_WORDS = ("error", "fail", "exception", "traceback", "panic", "fatal", "denied",
+                 "refused", "killed")
+EXAMPLES = [  # (want, command, new output)
+    (True, "npm run build", "vite v5 building for production...\n✓ 1532 modules transformed.\n"
+                            "dist/index.html 0.46 kB\n✓ built in 8.31s\n$ "),
+    (True, "pytest", "tests/test_api.py::test_login FAILED\n===== 1 failed, 41 passed in "
+                     "12.3s =====\n$ "),
+    (True, "npm run dev", "  VITE v5.0.0  ready in 412 ms\n  ➜  Local:   http://localhost:5173/"),
+    (True, "python train.py", "Traceback (most recent call last):\n  File \"train.py\", line "
+                              "88\nRuntimeError: CUDA out of memory\n$ "),
+    (True, "ssh gpu-box", "Password: "),
+    (False, "tail -f app.log", "INFO GET /health 200 2ms\nINFO GET /health 200 1ms\nINFO GET "
+                               "/api/items 200 14ms"),
+    (False, "npm install", "added 12 packages, and audited 400 packages in 3s\n⠙ reify: timing"),
+    (False, "python train.py", "epoch 3 step 1200/5000 loss 0.412\nepoch 3 step 1300/5000 loss "
+                               "0.405"),
+    (False, "zsh", "$ ls\nREADME.md src tests\n$ "),
+    (False, "docker compose up", "db-1 | LOG: checkpoint starting: time\ndb-1 | LOG: checkpoint "
+                                 "complete: wrote 3 buffers"),
+]
+
+
+def kev_up() -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", PORT)) == 0
+
+
+def ask(state: str) -> float | None:
+    body = json.dumps({"state": state, "model": "kev-latest", "questions": QUESTION}).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/systemone", body,
+                                 {"content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)["answers"]["notable"]["probabilities"]["notify"]
+    except Exception:
+        return None
+
+
+def state_of(command: str, folder: str, new: str) -> str:
+    return (f"Pane running: {command}\nFolder: {folder}\nNew output since the last look:\n"
+            f"{new[-NEW_MAX:]}")
+
+
+def cli(*args: str) -> str:
+    # a dead socket must fail, not start a stray wezterm-mux-server
+    return subprocess.run(["wezterm", "cli", "--no-auto-start", *args],
+                          capture_output=True, text=True,
+                          timeout=5).stdout
+
+
+def claude_panes() -> set[int]:
+    panes = set()
+    for f in (HOME / ".claude/wezterm-sessions").glob("*"):
+        if f.name.isdigit():
+            panes.add(int(f.name))
+    # a map outlives its session; the state file says whether one still lives there
+    live = set()
+    for p in panes:
+        try:
+            state = (HOME / ".claude/wezterm-state" / str(p)).read_text().split("\t", 1)[0]
+        except OSError:
+            state = ""
+        if state != "ended":
+            live.add(p)
+    return live
+
+
+def watched() -> list[dict]:
+    panes = json.loads(cli("list", "--format", "json") or "[]")
+    try:
+        focused = {c.get("focused_pane_id") for c in json.loads(
+            cli("list-clients", "--format", "json") or "[]")}
+    except json.JSONDecodeError:
+        focused = set()
+    seen_tabs = {p["tab_id"] for p in panes if p["pane_id"] in focused}
+    skip = claude_panes()
+    return ([p for p in panes if p["pane_id"] not in skip and p["tab_id"] not in seen_tabs],
+            {f for f in focused if f in skip})
+
+
+def screen(pane: int) -> list[str]:
+    lines = [ln.rstrip() for ln in cli("get-text", "--pane-id", str(pane)).splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines[-40:]
+
+
+def new_lines(old: list[str], cur: list[str]) -> list[str]:
+    """Lines past the longest overlap of old's tail with cur's head (the screen scrolled)."""
+    for k in range(min(len(old), len(cur)), 0, -1):
+        if old[-k:] == cur[:k]:
+            return cur[k:]
+    return cur if old != cur else []
+
+
+def headline(new: list[str]) -> str:
+    lines = [ln.strip() for ln in new if ln.strip() and ln.strip() not in ("$", "%", ">")]
+    hits = [ln for ln in lines if any(w in ln.lower() for w in FAILURE_WORDS)]
+    return (hits or lines or [""])[-1][:160]
+
+
+def log(entry: dict):
+    DIR.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(json.dumps({"ts": int(time.time()), **entry}) + "\n")
+
+
+def run(once: bool, verbose: bool):
+    DIR.mkdir(parents=True, exist_ok=True)
+    # This outlives the GUI it was started from; pinned to that GUI's socket it goes blind
+    # after a GUI restart. Unset, wezterm cli finds whichever GUI is running now
+    os.environ.pop("WEZTERM_UNIX_SOCKET", None)
+    looked: dict[int, list[str]] = {}
+    last_ask: dict[int, float] = {}
+    last_told: dict[int, float] = {}
+    warmed: dict[int, float] = {}
+    if os.environ.get("KEV_WATCH_START") == "1" and not kev_up():
+        subprocess.run([str(HOME / ".local/bin/kev"), "start"], capture_output=True)
+    while True:
+        now = time.time()
+        up = kev_up()
+        alive = set()
+        panes, focused_claude = watched()
+        for f in focused_claude:
+            if up and now - warmed.get(f, 0) > WARM_EVERY:
+                warmed[f] = now
+                subprocess.Popen([str(HOME / ".claude/bin/cc-sort"), "--warm", str(f)],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        for p in panes:
+            pid = p["pane_id"]
+            alive.add(pid)
+            cur = screen(pid)
+            if pid not in looked:
+                looked[pid] = cur  # first sight is the baseline, not news
+                continue
+            new = new_lines(looked[pid], cur)
+            if not new or not up or now - last_ask.get(pid, 0) < MIN_GAP:
+                continue
+            command = p.get("title") or "?"
+            folder = Path(p.get("cwd", "").removeprefix("file://").rstrip("/")).name
+            prob = ask(state_of(command, folder, "\n".join(new)))
+            if prob is None:
+                continue
+            (HOME / ".cache/kev/last-use").touch()
+            looked[pid], last_ask[pid] = cur, now
+            told = prob >= THRESHOLD and now - last_told.get(pid, 0) >= QUIET
+            line = headline(new)
+            log({"pane": pid, "command": command, "folder": folder, "p": round(prob, 3),
+                 "told": told, "new": "\n".join(new)[-NEW_MAX:]})
+            if verbose:
+                print(f"pane {pid} {command}: p {prob:.2f}{' TOLD' if told else ''} {line}",
+                      flush=True)
+            if told:
+                last_told[pid] = now
+                loud = any(w in line.lower() for w in FAILURE_WORDS)
+                subprocess.run([str(WZ), "notify", *([] if loud else ["--quiet"]), "--",
+                                f"{command} ({folder})", line or "new output"],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        for gone in set(looked) - alive:
+            looked.pop(gone, None)
+        if once:
+            return
+        time.sleep(TICK)
+
+
+def running() -> int | None:
+    try:
+        pid = int(PID.read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def test():
+    if not kev_up():
+        sys.exit("cc-watch: Kev is down (kev start)")
+    right = 0
+    for want, command, new in EXAMPLES:
+        t0 = time.time()
+        p = ask(state_of(command, "project", new))
+        ok = p is not None and (p >= THRESHOLD) == want
+        right += ok
+        print(f"{'ok ' if ok else 'BAD'} p {p if p is None else round(p, 2)} want "
+              f"{'notify' if want else 'ignore'}  {command}  {time.time() - t0:.1f}s")
+    print(f"{right}/{len(EXAMPLES)} at threshold {THRESHOLD}")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    elif cmd == "run":
+        run("--once" in sys.argv, "-v" in sys.argv)
+    elif cmd == "test":
+        test()
+    elif cmd == "start":
+        if running():
+            print(f"cc-watch: running (pid {running()})")
+            return
+        DIR.mkdir(parents=True, exist_ok=True)
+        with open(DIR / "run.log", "ab") as out:
+            proc = subprocess.Popen([sys.executable, __file__, "run", "-v"],
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                                    start_new_session=True)
+        PID.write_text(str(proc.pid))
+        print(f"cc-watch: started (pid {proc.pid}); asks Kev only while it is up")
+    elif cmd == "stop":
+        pid = running()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+        PID.unlink(missing_ok=True)
+        print("cc-watch: stopped" if pid else "cc-watch: not running")
+    elif cmd == "status":
+        pid = running()
+        asks = LOG.read_text().splitlines() if LOG.exists() else []
+        told = sum('"told": true' in a for a in asks)
+        print(f"cc-watch: {'running, pid ' + str(pid) if pid else 'stopped'} | Kev "
+              f"{'up' if kev_up() else 'down'} | {len(asks)} asks, {told} told")
+    else:
+        sys.exit(f"cc-watch: unknown command {cmd}; cc-watch --help")
+
+
+if __name__ == "__main__":
+    main()

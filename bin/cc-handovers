@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""cc-handovers - what was handed over on a day, why, and whether anyone carried it on.
+
+  cc-handovers [DATE | -d N]    print the day's list (default yesterday; -d 0 is today)
+  cc-handovers ... --write      also write it to DAYS/handovers DATE.md
+  cc-handovers ... --kev        start Kev if a verdict needs it (~35 s, idles off in 20 min)
+  cc-handovers --install        daily at 08:30 for yesterday, via launchd
+
+One row per brief in ~/.claude/fleet/handover. Its successor is the session that was given
+it (a prompt carrying or naming it: pasted, cc-handover --new/--to, SendMessage) or that
+fetched it (ran cc-handover on the donor and got the whole brief back). A session that
+fetched ARCHIVE_BATCH or more, or only ever saw a bare path (--save), was clearing up:
+"saved as a session was closed". Per brief its last "This brief is saved at" line counts,
+since a merged brief quotes older ones. A fetch counts only within FETCH_WITHIN of the
+brief. After the handover: Jacob's follow-up prompts, and the successor's last stop judged
+by Kev's stop-asks question (kev-mcp hooks/stop-asks.py, AUROC 0.94 on 95 real stops): the
+verdict that hook cached if it describes the last reply, else a fresh ask if Kev is up (or
+--kev). Without Kev a verdict is missing, never guessed. Zero Claude tokens."""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+HOME = Path.home()
+BRIEFS = HOME / ".claude/fleet/handover"
+PROJECTS = HOME / ".claude/projects"
+SESSIONS = HOME / ".claude/sessions"
+ASKS = HOME / ".cache/kev/asks"
+DAYS = Path(os.environ.get("HANDOVER_DAYS", HOME / ".claude/fleet/handover-days"))
+STOP_ASKS = HOME / "personal/kev-mcp/hooks/stop-asks.py"
+PLIST = HOME / "Library/LaunchAgents/net.jacob.cc-handovers.plist"
+SAVED_AT = re.compile(r"This brief is saved at `([^`]+)`")
+BRIEF_PATH = re.compile(r"fleet/handover/([\w.-]+\.md)")
+ARCHIVE_BATCH = 3
+# 96 of 107 fetches came within 3 min of the brief and the rest at 4-20 min or 2.5 h+
+# (sessions reading old briefs); a prompt carrying the brief counts whenever it lands
+FETCH_WITHIN = 3600
+RANK = {"pushed": 0, "pulled": 1, "archived": 2, "saved": 3}
+STAMP = re.compile(r"^(.+)-(\d{8})-(\d{6})\.md$")
+VERDICT = {"blocked": "left waiting on you", "offer": "done, offered more", "done": "done"}
+
+
+def load_stop_asks():
+    loader = importlib.machinery.SourceFileLoader("stop_asks", str(STOP_ASKS))
+    spec = importlib.util.spec_from_loader("stop_asks", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def clip(s: str, n: int) -> str:
+    s = " ".join(s.split()).replace("|", "/")
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def brief_facts(path: Path) -> dict:
+    text = path.read_text(errors="replace")
+    m = STAMP.match(path.name)
+    why = re.search(r"It was handed over(?:: (.+?))?\.?\n", text)
+    frm = re.findall(r"^## From (\S+) - (.+)$", text, re.M)
+    asked = re.search(r"\*\*Last asked\*\*\n\n(.+?)\n\n", text, re.S)
+    sids = set(re.findall(r"/([0-9a-f-]{36})\.jsonl", text))
+    return {"path": str(path), "donor": m.group(1),
+            "at": datetime.strptime(m.group(2) + m.group(3), "%Y%m%d%H%M%S"),
+            "why": (why.group(1) or "").strip() if why else "",
+            "what": "; ".join(t for _, t in frm) or "",
+            "donors": [n for n, _ in frm] or [m.group(1)],
+            "asked": asked.group(1).strip() if asked else "", "sids": sids}
+
+
+def text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(c.get("text", "") for c in content or [] if c.get("type") == "text")
+
+
+def successors(since: float) -> dict[str, list[dict]]:
+    """brief path -> every session that took it, from transcripts touched since then, best
+    first: a prompt carrying or naming the brief (pasted, cc-handover --new/--to,
+    SendMessage) beats a session that ran cc-handover and read it; then earliest."""
+    files = [f for f in PROJECTS.glob("*/*.jsonl") if f.stat().st_mtime >= since]
+    if not files:
+        return {}
+    out = subprocess.run(["grep", "-l", "-F", "fleet/handover/", "--", *map(str, files)],
+                         capture_output=True, text=True).stdout.split("\n")
+    found = {}
+    for f in filter(None, out):
+        given = scan(Path(f))
+        pulled = [b for b, i in given.items() if i["kind"] == "pulled"]
+        if len(pulled) >= ARCHIVE_BATCH:  # a clear-out reading every brief it saved
+            for b in pulled:
+                given[b]["kind"] = "archived"
+        for brief, info in given.items():
+            found.setdefault(brief, []).append(info)
+    for infos in found.values():
+        infos.sort(key=lambda i: (RANK[i["kind"]], i["at"]))
+    return found
+
+
+def briefs_in(text: str) -> list[str]:
+    """The briefs whose whole text is here: per "# Handover" section, its last saved-at
+    line (a merged brief quotes the older ones earlier in the section)."""
+    out = []
+    for section in re.split(r"(?:^|\n)# Handover\n", text)[1:]:
+        paths = SAVED_AT.findall(section)
+        if paths:
+            out.append(paths[-1])
+    if not out:  # a Read of the file: line-number prefixes hide the heading
+        out = SAVED_AT.findall(text)[-1:]
+    return out
+
+
+def scan(transcript: Path) -> dict[str, dict]:
+    """Every brief this session took, how, and how many prompts Jacob sent it after."""
+    sa = STOP
+    title, given, humans = "", {}, []
+    for i, line in enumerate(transcript.open(errors="replace")):
+        if '"ai-title"' not in line and '"type":"user"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "ai-title":
+            title = ev.get("aiTitle") or title
+            continue
+        if ev.get("type") != "user" or ev.get("isMeta"):
+            continue
+        content = (ev.get("message") or {}).get("content")
+        results = [c for c in content if c.get("type") == "tool_result"] if isinstance(
+            content, list) else []
+        if sa.is_human(ev):
+            humans.append(i)
+        if "fleet/handover/" not in line:
+            continue
+        if results:
+            for r in results:
+                text = text_of(r.get("content"))
+                paths = briefs_in(text)
+                # the whole brief in its output means it was read; a bare path, --save
+                named = [(b, "pulled") for b in paths] if paths else [
+                    (m, "saved") for m in BRIEF_PATH.findall(text)]
+                for path, kind in named:
+                    path = str(BRIEFS / Path(path).name)
+                    if path not in given or RANK[kind] < RANK[given[path]["kind"]]:
+                        given[path] = {"idx": i, "at": ev.get("timestamp", ""), "kind": kind}
+            continue
+        text = text_of(content)
+        named = briefs_in(text) or BRIEF_PATH.findall(text)
+        for path in named:
+            path = str(BRIEFS / Path(path).name)
+            if path not in given or given[path]["kind"] != "pushed":
+                given[path] = {"idx": i, "at": ev.get("timestamp", ""), "kind": "pushed"}
+    sid = transcript.stem
+    for path, info in list(given.items()):
+        given[str(BRIEFS / Path(path).name)] = given.pop(path)
+        info.update(sid=sid, transcript=str(transcript), title=title,
+                    followups=sum(1 for h in humans if h > info["idx"]))
+    return given
+
+
+def taken_in_time(written: datetime, info: dict) -> bool:
+    try:
+        taken = datetime.fromisoformat(info["at"].replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+    gap = taken - written.timestamp()
+    return gap >= -300 and (info["kind"] == "pushed" or gap <= FETCH_WITHIN)
+
+
+def live_names() -> dict[str, str]:
+    names = {}
+    for f in SESSIONS.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if d.get("sessionId"):
+            names[d["sessionId"]] = d.get("name") or ""
+    return names
+
+
+def verdict(info: dict) -> str:
+    sa = STOP
+    state, uuid, _ = sa.read(Path(info["transcript"]))
+    if not state:
+        return ""
+    try:
+        v, _, _, cached_uuid = (ASKS / info["sid"]).read_text().strip().split("\t")[:4]
+        if cached_uuid == uuid:
+            return v
+    except (OSError, ValueError):
+        pass
+    p = sa.ask(state)  # returns None at once when Kev is down
+    return max(p, key=p.get) if p else ""
+
+
+def day_rows(day: date, start_kev: bool) -> list[dict]:
+    briefs = [brief_facts(b) for b in BRIEFS.glob(f"*-{day:%Y%m%d}-*.md")]
+    if not briefs:
+        return []
+    briefs.sort(key=lambda f: f["at"])
+    found = successors(datetime.combine(day, datetime.min.time()).timestamp())
+    live = live_names()
+    rows = []
+    for facts in briefs:
+        # a donor reading its own brief is not its successor, nor is a session that fetched
+        # it hours later (reviewing old briefs, as this script's own debugging did)
+        info = next((i for i in found.get(facts["path"], []) if i["sid"] not in facts["sids"]
+                     and taken_in_time(facts["at"], i)), None)
+        if info and start_kev and info["kind"] in ("pushed", "pulled"):
+            subprocess.run([str(HOME / ".local/bin/kev"), "start"], capture_output=True)
+            start_kev = False
+        if info:
+            info["name"] = live.get(info["sid"]) or clip(info["title"], 40) or info["sid"][:8]
+            info["live"] = info["sid"] in live
+            info["verdict"] = verdict(info)
+        rows.append({**facts, "succ": info})
+    return rows
+
+
+def render(day: date, rows: list[dict]) -> str:
+    kinds = [r["succ"]["kind"] if r["succ"] else "none" for r in rows]
+    taken = sum(k in ("pushed", "pulled") for k in kinds)
+    shelved = sum(k in ("archived", "saved") for k in kinds)
+    waiting = sum(1 for r in rows if r["succ"] and r["succ"]["kind"] in ("pushed", "pulled")
+                  and r["succ"]["verdict"] == "blocked")
+    head = (f"{len(rows)} brief{'s' * (len(rows) != 1)} on {day:%a %d %b}: {taken} handed "
+            f"over, {shelved} saved as a session was closed, {kinds.count('none')} never "
+            f"opened. {waiting} successor{'s' * (waiting != 1)} left waiting on you.")
+    lines = [head, "", "| time | from | what | why / last asked | successor | after |",
+             "|---|---|---|---|---|---|"]
+    for r in rows:
+        s = r["succ"]
+        if s and s["kind"] in ("pushed", "pulled"):
+            state = VERDICT.get(s["verdict"], "no verdict")
+            after = (f"{state}, {s['followups']} follow-up{'s' * (s['followups'] != 1)}"
+                     + (", still open" if s["live"] else ""))
+            how = "given it" if s["kind"] == "pushed" else "fetched it"
+            succ = f"{s['name']} {how} (`claude --resume {s['sid']}`)"
+        elif s:
+            succ, after = f"saved by {s['name']}", "not handed over"
+        else:
+            succ, after = "none", "never opened"
+        why = r["why"] or ("last asked: " + clip(r["asked"], 120) if r["asked"] else "")
+        lines.append(f"| {r['at']:%H:%M} | {', '.join(r['donors'])} | {clip(r['what'], 70)} "
+                     f"| {clip(why, 140)} | {succ} | {after} |")
+    lines += ["", f"Briefs: `{BRIEFS}`. Written by cc-handovers (Kev verdicts, no Claude)."]
+    return "\n".join(lines) + "\n"
+
+
+def install():
+    exe = HOME / ".claude/bin/cc-handovers"
+    PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>Label</key><string>{PLIST.stem}</string>
+ <key>ProgramArguments</key><array>
+  <string>/usr/bin/python3</string><string>{exe}</string><string>--write</string><string>--kev</string>
+ </array>
+ <key>StartCalendarInterval</key><dict>
+  <key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer>
+ </dict>
+ <key>EnvironmentVariables</key><dict>
+  <key>PATH</key><string>{HOME}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+ </dict>
+ <key>StandardErrorPath</key><string>{HOME}/.cache/kev/cc-handovers.log</string>
+</dict></plist>
+""")
+    subprocess.run(["launchctl", "unload", str(PLIST)], capture_output=True)
+    subprocess.run(["launchctl", "load", str(PLIST)], check=True)
+    print(f"installed {PLIST}: daily 08:30, yesterday's list to {DAYS}")
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return
+    if args == ["--install"]:
+        return install()
+    write, start_kev = "--write" in args, "--kev" in args
+    args = [a for a in args if a not in ("--write", "--kev")]
+    day = date.today() - timedelta(days=1)
+    if args[:1] == ["-d"] and len(args) == 2:
+        day = date.today() - timedelta(days=int(args[1]))
+    elif len(args) == 1:
+        day = date.fromisoformat(args[0])
+    elif args:
+        sys.exit("cc-handovers: usage: cc-handovers [DATE | -d N] [--write]")
+    t0 = time.time()
+    rows = day_rows(day, start_kev)
+    text = render(day, rows) if rows else f"No handovers on {day:%a %d %b}.\n"
+    print(text, end="")
+    if write and rows:
+        DAYS.mkdir(parents=True, exist_ok=True)
+        out = DAYS / f"handovers {day}.md"
+        out.write_text(text)
+        print(f"\nwrote {out} ({time.time() - t0:.1f} s)", file=sys.stderr)
+
+
+STOP = load_stop_asks()
+
+if __name__ == "__main__":
+    main()
