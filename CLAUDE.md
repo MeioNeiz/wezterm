@@ -16,6 +16,8 @@ Everything here is symlinked into place, so edit the file in this repo, not the 
     bin/cc-sort   <- ~/.claude/bin/cc-sort     Kev groups panes by topic; LEADER+H ranking
     bin/cc-handovers <- ~/.claude/bin/cc-handovers  daily digest of handovers, launchd
     bin/cc-watch  <- ~/.claude/bin/cc-watch    Kev toasts on notable background output
+    bin/cc-toast  <- ~/.claude/bin/cc-toast    the 20s toast inside WezTerm; built by setup.sh
+                                               from toast/cc-toast.swift, gitignored
     skills/fleet  <- ~/.claude/skills/fleet    the skill Claude reads to drive all of it
     statusline.sh <- ~/.claude/statusline.sh   the line at the bottom of every pane
     hooks/wezterm-pane-state.sh   <- ~/.claude/hooks/  what a pane is doing, five events
@@ -55,14 +57,18 @@ State the scripts read, none of it theirs:
   Rewriting it on each turn means the resident session takes it back
 - `~/.claude/wezterm-state/<pane>`     `state\tepoch\tdetail\tsid`, five hooks now. States:
   `working` (UserPromptSubmit), `done` and `parked` (Stop, told apart by whether the
-  payload carries a non-empty `background_tasks`), `asking` (PermissionRequest, and
+  payload carries a `background_tasks` entry still running), `asking` (PermissionRequest, and
   Notification as the slower backstop), `errored` (StopFailure), `ended` (SessionEnd).
   `parked` means the turn is over but the session is waiting on its own background work,
   which since fork mode and background subagents became defaults is the difference
   between finished and not. Nothing writes when that background work ends without a new
-  turn, so **every reader expires parked**: 1h for a `monitor` (the most a Monitor can
-  live), 4h otherwise, constants in wezterm.lua, cc-roster and cc-board. `errored` exists because **Stop does not fire when a turn
-  dies on an API error**, so before it a rate-limited pane held its last state for ever.
+  turn, so **every reader expires parked**: 30m for a `monitor`, 2h for a `shell` (the
+  most either can live since 2.1.271 and 2.1.285), 4h otherwise, constants in wezterm.lua,
+  cc-roster and cc-board. The registry's own `shell` status (turn over, a background shell
+  still running) is level-triggered, so it reads as parked with no expiry. `errored`
+  exists because **Stop does not fire when a turn dies on an API error**, so before it a
+  rate-limited pane held its last state for ever. A hook `asking` record is dropped once
+  the registry has moved on past it: Esc on a dialog ends the turn with no Stop.
   `detail` is the tool for asking, the error kind for errored, the task type for parked,
   and empty otherwise, so **never read this with `IFS=$'\t' read`**: tab is IFS whitespace
   and the empty field folds, handing the sid to `detail`. awk -F'\t' and Lua are fine.
@@ -79,6 +85,8 @@ State the scripts read, none of it theirs:
   looks off task: "drifting?" on a working frame. Both via `read`/`-e`, no fork
 - `~/.claude/cache/fleet-rows`      cc-fleet's row cache, 8s
 - `~/.claude/session-colours`       hand-pinned hues, `<session-id>\t<hue>`, cc-colour
+- `~/.claude/jobs/<id>/state.json`  background sessions, which have no registry file.
+  `needs` is what one wants from me; cc-fleet `--jobs`, `--job <id>`, and its --brief
 
 State these scripts write themselves, all of it theirs:
 - `~/.claude/cache/wz-events.jsonl` wz's event log, and `wz-events.pid` beside it
@@ -86,11 +94,18 @@ State these scripts write themselves, all of it theirs:
   new session would have reused the colour of the one it replaced. Hand pins win
 - `~/.claude/cache/cc-tint-painted/<pane>`  `<session-id>\t<hue>`, what cc-tint last painted
   onto that pane. There is no reading a pane's colour back, so this is the only record
-- `~/.claude/cache/context/<sid>`   `used_pct\twindow_size\tepoch`, written by the
-  statusLine on every render. Claude hands that number to the statusLine and nowhere
-  else: the registry does not carry it, and a transcript gives the tokens in play on the
-  last turn without the window size to divide by. cc-board gets the same figure by
-  scraping the pane's visible statusLine, which needs the pane to exist and be on screen
+- `~/.claude/cache/context/<sid>`   `used_pct\twindow_size\tepoch\texpires_at\tttl_s\t`
+  `recache_tokens\thit_pct`, `-` when absent, written by the statusLine on every render.
+  Claude hands these to the statusLine and nowhere else: the registry does not carry them,
+  and a transcript gives the tokens in play on the last turn without the window size to
+  divide by. cc-board gets the same percentage by scraping the pane's visible statusLine,
+  which needs the pane to exist and be on screen. Readers: cc-board, cc-fleet, cc-handover,
+  wz, wezterm.lua and kev-mcp's stop-asks (field 1). Old files have three fields
+- `~/.claude/cache/rate-limits`     `epoch\t5h_pct\t5h_resets\t7d_pct\t7d_resets\tspend`,
+  per account so one file, written by any pane's statusLine at most every 5s. The right
+  status shows `5h N% HH:MM`, hidden once 10 minutes old or past its reset. `▲ out <when>`
+  once a window is 10 points ahead of an even burn (not in its first tenth), red when
+  that is under a quarter of the window away; the 7d figure shows only then or past 75%
 - `~/.claude/cache/titles/<sid>`    `mtime\x1fchecked_at\x1ftitle`, cc-peers' title memo
 - `~/.claude/cache/fleet-digest`    `#<epoch>`, then `pane\tsid\tstatus\twaitingFor\tseen_ms`
   for every pane holding a live session. `cc-roster --digest` writes it whole and renames
@@ -112,11 +127,22 @@ State these scripts write themselves, all of it theirs:
 - `~/.claude/fleet/handover/<name>-<stamp>.md`  the briefs cc-handover writes
 - `~/.cache/kev/cc-sort-pairs.json`  cc-sort's Kev p(same topic) per pair of session
   descriptions, a day; `cc-sort.jsonl` its plans and rankings. `~/.cache/kev/cc-watch/`
-  cc-watch's pid, run.log and asks.jsonl. cc-handovers writes only to the vault
+  cc-watch's pid, run.log and asks.jsonl. cc-handovers writes
+  `~/.claude/fleet/handover-days/` (`HANDOVER_DAYS` overrides), read by /weekly-review
+- `~/.claude/fleet/actions.d/`      the shell -> Lua queue, one file per action, written
+  aside and renamed in; Lua drains it by name. The old single `actions` file still drains
+- `~/.claude/cache/jobs-seen/<id>`, `job-rows`  which background jobs have been read
+- `~/.claude/cache/reap-stamp`      `cc-roster --digest` reaps at most hourly: state and
+  map files for panes wezterm no longer has, maps naming an unknown session after a day,
+  titles and context a week after their session is gone. Skipped if wezterm gives nothing
 
-`statusUpdatedAt` in the registry is when a session's last request finished, so it is the
-clock the prompt cache runs on (`CACHE_TTL`, an hour, in wezterm.lua, cc-board and
-cc-fleet). Past it a stopped session is cold, and cold is what greys it everywhere: the
+When a session's prompt cache expires is `expires_at` in the context file, which drops
+to 5m in overage. Without it, `statusUpdatedAt` (when its last request finished) plus
+`CACHE_TTL`, an hour, in wezterm.lua, cc-board, cc-fleet, cc-handover and wz. **A cold
+session is never woken or resumed**: `wz send`/`key` and `cc-handover --to` refuse an
+idle cold one (`--force` is mine), resume hints appear only while warm, and a cold pane
+restores armed with a handover rather than `--resume`. The successor reads the transcript
+and output from disk; sessions do not brief each other. Past it a stopped session is cold, and cold is what greys it everywhere: the
 tab bar, the board, the LEADER+; picker and the cc-fleet dashboard. `cc-fleet --stale`
 and `--reap` stay on hours since your last prompt, because closing a pane is a different
 question from what resuming it costs. A transcript's mtime looks like the
