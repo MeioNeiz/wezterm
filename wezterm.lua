@@ -2425,6 +2425,11 @@ local NOTIFY_STEP_SECONDS = 8 -- LEADER+T pressed again within this walks furthe
 ---@return table toasts with a live pane, newest first: { at, pane, rank, title }
 local function recent_toasts()
 	local out, now = {}, os.time()
+	-- get_pane raises for a pane that has closed, rather than returning nil
+	local function alive(id)
+		local ok, p = pcall(wezterm.mux.get_pane, id)
+		return ok and p ~= nil
+	end
 	local file = io.open(NOTIFY_LOG, "r")
 	if not file then
 		return out
@@ -2435,8 +2440,12 @@ local function recent_toasts()
 		at = tonumber(at)
 		-- a pane id outlives its session: one now holding another is not that toast's
 		local moved = at and sid ~= "" and sid ~= "-" and read_session_id(tonumber(pane)) ~= sid
-		local live = at and wezterm.mux.get_pane(tonumber(pane))
-		if live and now - at <= NOTIFY_RECENT and not moved then
+		if
+			at
+			and now - at <= NOTIFY_RECENT
+			and not moved
+			and alive(tonumber(pane))
+		then
 			table.insert(out, 1, {
 				at = at,
 				pane = tonumber(pane),
