@@ -2412,10 +2412,11 @@ fleet_key({
 	end),
 })
 
--- The toasts, after the fact: `wz notify` logs `epoch\tpane\trank\ttitle` per toast, rank
--- being Kev's 0-1 of how much it matters. LEADER+t goes to the one that matters most among
--- those whose pane you have not been on since; LEADER+T to the newest, and again within a
--- few seconds to the one before it. Either way the toast closes once you are on its pane
+-- The toasts, after the fact: `wz notify` logs `epoch\tpane\trank\ttitle\tsid\tbody` per
+-- toast (older lines stop at title), rank being Kev's 0-1 of how much it matters.
+-- LEADER+t goes to the one that matters most among those whose pane you have not been on
+-- since; LEADER+T to the newest, and again within a few seconds to the one before it.
+-- Either way the toast closes once you are on its pane
 local NOTIFY_LOG = wezterm.home_dir .. "/.claude/cache/notify-log"
 local NOTIFY_RECENT = 3 * 3600 -- older toasts are history, not news
 local NOTIFY_RANK_DEFAULT = 0.5 -- a toast raised without Kev's say
@@ -2429,9 +2430,13 @@ local function recent_toasts()
 		return out
 	end
 	for line in file:lines() do
-		local at, pane, rank, title = line:match("^(%d+)\t(%d+)\t([^\t]*)\t(.*)$")
+		local at, pane, rank, title, sid =
+			line:match("^(%d+)\t(%d+)\t([^\t]*)\t([^\t]*)\t?([^\t]*)")
 		at = tonumber(at)
-		if at and now - at <= NOTIFY_RECENT and wezterm.mux.get_pane(tonumber(pane)) then
+		-- a pane id outlives its session: one now holding another is not that toast's
+		local moved = at and sid ~= "" and sid ~= "-" and read_session_id(tonumber(pane)) ~= sid
+		local live = at and wezterm.mux.get_pane(tonumber(pane))
+		if live and now - at <= NOTIFY_RECENT and not moved then
 			table.insert(out, 1, {
 				at = at,
 				pane = tonumber(pane),

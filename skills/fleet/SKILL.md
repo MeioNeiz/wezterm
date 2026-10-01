@@ -22,6 +22,7 @@ only for a field it does not carry, and prefer `--tsv` to `--json` when you do.
 | every field, parseable | `cc-fleet --tsv` | ~920 |
 | ...as JSON | `cc-fleet --json` | ~1960 |
 | what a session last **said** | `wz last <name>` | **~60** |
+| what toasts went up, and seen or not | `wz toasts [<name>] [-n N]` | ~25 a toast |
 | the last few lines on screen | `wz read <name> --tail 5` | ~430 |
 | a whole pane's screen | `wz read <name>` | ~3600 |
 | what a session is *about* | `cc-peers` | ~660 |
@@ -208,8 +209,9 @@ Otherwise use `status` when you park work or are blocked on something off-machin
 - A `claude` run from a session's Bash tool inherits `WEZTERM_PANE`. The pane hooks and
   cc-tint see it has no controlling tty and stay out, so it never shows on the board or
   takes the pane's map; it is not a fleet member and no tool here will find it.
-- Duplicate session names happen. SendMessage reaches whichever is listed first - flag it
-  rather than guessing.
+- Duplicate session names happen. SendMessage reaches whichever is listed first; every
+  tool here refuses the name and lists the panes, and `cc-fleet --brief` flags it. Use
+  the pane id, and tell Jacob so he can `/rename` one.
 - **A name can move.** Claude renames a session on a collision, on `/rename`, and on a
   resume; background sessions get named after their task. Every tool here takes the old
   name too and says `cc-roster: "x" is now "y"` on stderr when you use one, so pass that

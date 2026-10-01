@@ -25,8 +25,10 @@ readonly ROSTER="$HOME/.claude/bin/cc-roster"
 readonly CTX_DIR="$HOME/.claude/cache/context"
 # Assumed when that record has no expiry. Must match wezterm.lua, cc-board and cc-fleet.
 readonly CACHE_TTL=3600
-# What LEADER+t and LEADER+T jump to: `epoch\tpane\trank\ttitle`, `-` when absent
+# What LEADER+t and LEADER+T jump to, and wz toasts lists:
+# `epoch\tpane\trank\ttitle\tsid\tbody`, `-` when absent; older lines stop at title
 readonly NOTIFY_LOG="$CACHE/notify-log"
+readonly PANE_READ="$CACHE/pane-read"
 readonly NOTIFY_KEEP=200
 
 usage() {
@@ -41,6 +43,8 @@ reading
   wz top [-a]                         cpu and memory per pane, busiest first
   wz last <target> [--json]           what a session last actually said, and whether
                                       it stopped to ask you something
+  wz toasts [<target>] [-n <l>]       the last <l> toasts (20), each marked seen once
+                                      you have been on its pane since
 
 watching
   wz events [--after N] [--cursor-file F] [--follow] [--name E] [--limit N]
@@ -546,11 +550,13 @@ pane_hue() {
 	return 0
 }
 
+# The session id as well as the pane: pane ids are reused, and restart at 0 with the GUI
 notify_log() {
-	local title=${3//[$'\t\n']/ }
+	local title=${3//[$'\t\n']/ } body=${4//[$'\t\n']/ } sid=""
+	[[ -n $1 ]] && { IFS= read -r sid <"$HOME/.claude/wezterm-sessions/$1"; } 2>/dev/null
 	mkdir -p "$CACHE" 2>/dev/null
-	printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "${1:--}" "${2:--}" "${title:--}" \
-		>>"$NOTIFY_LOG" 2>/dev/null || return 0
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${1:--}" "${2:--}" "${title:--}" \
+		"${sid:--}" "${body:--}" >>"$NOTIFY_LOG" 2>/dev/null || return 0
 	local n
 	n=$(wc -l <"$NOTIFY_LOG")
 	if ((n > 2 * NOTIFY_KEEP)); then
@@ -583,7 +589,7 @@ cmd_notify() {
 	shift
 	(($#)) && body=$*
 
-	notify_log "$pane" "$rank" "$title"
+	notify_log "$pane" "$rank" "$title" "$body"
 
 	local toast="$HOME/.claude/bin/cc-toast" args
 	if [[ $OSTYPE == darwin* && -x $toast ]]; then
@@ -614,6 +620,64 @@ cmd_notify() {
 	fi
 	wait 2>/dev/null
 	return 0
+}
+
+# Seen is wezterm.lua's pane-read: you left the pane after the toast, or are on it now.
+# A toast for the pane you were looking at was never raised, so it is not listed.
+cmd_toasts() {
+	local n=20 target="" sid="" pane=""
+	while (($#)); do
+		case $1 in
+		-n) n=${2:-}; shift 2 || shift
+			[[ $n =~ ^[0-9]+$ ]] || die "toasts: -n needs a number" ;;
+		-h | --help) usage; return ;;
+		-*) die "toasts: unknown option $1" ;;
+		*) target=$1; shift ;;
+		esac
+	done
+	[[ -r $NOTIFY_LOG ]] || { echo "no toasts logged"; return; }
+	if [[ -n $target ]]; then
+		case $target in
+		????????-????-????-????-????????????) sid=$target ;;
+		*) pane=$(resolve "$target") || exit 1
+			{ IFS= read -r sid <"$HOME/.claude/wezterm-sessions/$pane"; } 2>/dev/null ;;
+		esac
+	fi
+	local midnight tz
+	if [[ $OSTYPE == darwin* ]]; then
+		midnight=$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date +%Y-%m-%d) 00:00:00" +%s)
+	else
+		midnight=$(date -d 00:00 +%s)
+	fi
+	tz=$(date +%z)
+	awk -F'\t' -v readf="$PANE_READ" -v want_sid="$sid" -v want_pane="$pane" \
+		-v n="$n" -v midnight="$midnight" -v tz="$tz" '
+	BEGIN {
+		off = (substr(tz, 2, 2) * 3600 + substr(tz, 4, 2) * 60) * (substr(tz, 1, 1) == "-" ? -1 : 1)
+		while ((getline line < readf) > 0) {
+			split(line, f, "\t")
+			if (f[1] == "focus") { if (f[3] == 1) focus = f[2]; continue }
+			left[f[1]] = f[2]
+		}
+	}
+	{
+		sid = (NF >= 5) ? $5 : "-"
+		if (want_sid != "" && sid != want_sid && !(sid == "-" && $2 == want_pane)) next
+		if (want_sid == "" && want_pane != "" && $2 != want_pane) next
+		l[++k] = $0
+	}
+	END {
+		for (i = (k > n ? k - n + 1 : 1); i <= k; i++) {
+			split(l[i], f, "\t")
+			t = f[1] + off
+			when = sprintf("%02d:%02d", int(t % 86400 / 3600), int(t % 3600 / 60))
+			if (f[1] < midnight) when = int((midnight - f[1]) / 86400) + 1 "d " when
+			seen = (f[2] == "-") ? "-" : \
+				((left[f[2]] >= f[1] || f[2] == focus) ? "seen" : "unseen")
+			body = (f[6] != "" && f[6] != "-") ? ": " f[6] : ""
+			printf "%s  %4s  %4s  %-6s  %s%s\n", when, f[2], f[3], seen, f[4], body
+		}
+	}' "$NOTIFY_LOG"
 }
 
 # --- events -----------------------------------------------------------------------
@@ -888,6 +952,7 @@ read) shift; cmd_read "$@" ;;
 grep) shift; cmd_grep "$@" ;;
 top) shift; cmd_top "$@" ;;
 last) shift; cmd_last "$@" ;;
+toasts) shift; cmd_toasts "$@" ;;
 send) shift; cmd_send "$@" ;;
 key) shift; cmd_key "$@" ;;
 go) shift; cmd_go "$@" ;;

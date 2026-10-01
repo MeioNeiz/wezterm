@@ -22,6 +22,11 @@ The name does move, though, in four ways, and `nameSource` says which:
 | `auto` | background and forked sessions, named after the task they were given |
 | `user` / `hook` | `/rename`, or `--name` at launch |
 
+The collision check does not always run: on 2026-10-01 `7c8722c7` and `e90da9f8`, both
+`derived`, were live as `d5-lca-90` at once (two hex is 256 names a directory, and d5-lca
+holds twenty sessions). cc-roster refuses a name two live sessions share, saying which
+panes, and `cc-fleet --brief` prints `same name, <name> is panes <a> <b>: /rename one`.
+
 Adoption means a resume, a remote attach or a spare claim, and the binary is explicit
 that `/clear`, a fork and a `cd` are not on that list: those keep the name. `auto` is how
 `743537e5` came to be called `bash command execution`. A `user` name is the only one that
@@ -103,19 +108,23 @@ sticky when the verdict is blocked at p >= 0.6, the rank is >= 0.75, or Kev is d
 reply ends on a question. The stack holds five: past that the oldest non-sticky one goes
 first, and a toast whose pane has closed dismisses itself within about 10s.
 
-Every notify is logged to `~/.claude/cache/notify-log` with its pane and `--rank`, so the
-toasts can be followed after they have gone. **LEADER+t** is Kev's pick: the unseen toast
-Kev ranked highest (three hours back), else the live session that scores best from what is
-on disk, with no Kev call on the keypress: asking 1.0, errored 0.8, Kev's blocked verdict
-0.55 + 0.4p, otherwise finished at 0.3 if unread or 0.05 if read, plus 0.4 times Kev's rank
-of the reply. A day halves a score and a cold cache takes 15% off; ties go to the newer.
-Working and parked sessions are left out. Pressed again within 8s it walks down the same
-list, and the right status says `t 2/9 <name>: <why>` for 4s. To see the list without
-moving, queue `pick` (`wz` action) and read `~/.claude/cache/kev-pick`. **LEADER+T** goes to
-the newest toast, and pressed again within 8s to the one before it, pane by pane.
-cc-toast is Swift, built by setup.sh from `toast/cc-toast.swift` into the gitignored
-`bin/cc-toast`; without it notify falls back to osascript (Script Editor's banner), and on
-Linux to notify-send.
+Every notify is logged to `~/.claude/cache/notify-log` with its pane, session, `--rank`
+and body, so the toasts can be followed after they have gone: `wz toasts [<target>] [-n
+N]` lists them with the time and whether you have been on the pane since. A stop on the
+pane you are looking at raises no toast, so it is not there either. stop-asks' body is the
+reply's labelled caveat ("One thing to know:", "Not tested yet:") if it has one, else its
+first sentence of six words or more; the toast shows about 90 characters of it.
+**LEADER+t** is Kev's pick: the unseen toast Kev ranked highest (three hours back), else
+the live session that scores best from what is on disk, with no Kev call on the keypress:
+asking 1.0, errored 0.8, Kev's blocked verdict 0.55 + 0.4p, otherwise finished at 0.3 if
+unread or 0.05 if read, plus 0.4 times Kev's rank of the reply. A day halves a score and a
+cold cache takes 15% off; ties go to the newer. Working and parked sessions are left out.
+Pressed again within 8s it walks down the same list, and the right status says `t 2/9
+<name>: <why>` for 4s. To see the list without moving, queue `pick` (`wz` action) and read
+`~/.claude/cache/kev-pick`. **LEADER+T** goes to the newest toast, and pressed again
+within 8s to the one before it, pane by pane. cc-toast is Swift, built by setup.sh from
+`toast/cc-toast.swift` into the gitignored `bin/cc-toast`; without it notify falls back to
+osascript (Script Editor's banner), and on Linux to notify-send.
 
 Not built, and why: there is no `swap-pane` or `respawn-pane` because wezterm has no
 primitive for either. There is no status/notes store because nothing would render it; that

@@ -583,9 +583,12 @@ if [[ $mode == brief ]]; then
 
 	# One pass for the rest: unread, what resuming the cold ones would write back into the
 	# cache, and what is near full. Each extra pass over the rows was a few ms.
-	n_cold=0 cold_sum=0 full=""
+	n_cold=0 cold_sum=0 full="" nn_keys=""
 	while IFS="$US" read -r rk _ _ _ u_pane nm kind _ _ _ _ _ sid _; do
 		[[ -n ${sid:-} ]] || continue
+		key="nn_${nm//[^A-Za-z0-9]/_}"
+		[[ -z ${!key:-} ]] && nn_keys="$nn_keys $key" && printf -v "n$key" '%s' "$nm"
+		printf -v "$key" '%s' "${!key:-}${!key:+ }$u_pane"
 		key="cx_${sid//-/_}"
 		pct=${!key:-}
 		[[ -n $pct ]] && ((pct >= CTX_WARN)) && full="$full  $nm $pct%"$'\n'
@@ -620,6 +623,13 @@ if [[ $mode == brief ]]; then
 	done <<<"$rows"
 
 	[[ -n $unread ]] && printf 'unread: %s\n' "$unread"
+	# Claude can derive one name for two sessions, and then no name-taking tool can tell
+	# them apart: cc-roster refuses it, SendMessage takes the first listed.
+	for key in $nn_keys; do
+		[[ ${!key} == *" "* ]] || continue
+		nm="n$key"
+		printf 'same name, %s is panes %s: /rename one\n' "${!nm}" "${!key}"
+	done
 	line="$n_rest idle"
 	((n_busy > 0)) && line="$n_busy working, $line"
 	((n_old > 0)) && line="$line, $n_old stale"

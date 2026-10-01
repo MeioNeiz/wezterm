@@ -69,8 +69,9 @@ esac
 # Mirrors Claude's resolver, which SendMessage uses too: names are keyed trimmed,
 # lowercased, whitespace folded to hyphens, and a former name (only those from the
 # conversation the session is still in; the jq cuts to those) resolves when nothing
-# current does. A current name beats a former one; a former name two live sessions
-# share resolves to neither, because picking one silently briefs the wrong pane.
+# current does. A current name beats a former one; a name two live sessions share,
+# current or former, resolves to neither, because picking one silently briefs the wrong
+# pane. Claude does hand out the same derived name twice.
 match_name() {
 	awk -F'\t' -v want="$1" -v out="$2" -v us="$US" '
 	function norm(s) {
@@ -82,13 +83,18 @@ match_name() {
 	}
 	BEGIN { w = norm(want) }
 	{
-		if (hit == "" && norm($2) == w) hit = pick()
+		if (norm($2) == w) { if (hit == "") hit = pick(); nhit++; panes = panes " " $5 }
 		if ($10 == "") next
 		n = split($10, a, us)
 		for (i = 1; i <= n; i++)
 			if (norm(a[i]) == w) { alias = pick(); who = $2; nalias++; break }
 	}
 	END {
+		if (nhit > 1) {
+			printf "cc-roster: \"%s\" names %d live sessions (panes%s); say which pane\n", \
+				want, nhit, panes > "/dev/stderr"
+			exit 1
+		}
 		if (hit != "") { print hit; exit 0 }
 		if (nalias == 1) {
 			printf "cc-roster: \"%s\" is now \"%s\"\n", want, who > "/dev/stderr"

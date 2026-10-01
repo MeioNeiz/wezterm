@@ -74,8 +74,10 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
   (`READ_DWELL`): passing through is not reading
 - **`cache/kev-pick`** `#<epoch>\tfrom <pane>`, then `n, pane, score, why, name`: LEADER+t's
   list, written by the `pick` action (dry run, no jump)
-- **`cache/notify-log`** `epoch, pane, rank, title` per `wz notify`, trimmed to 200: what
-  LEADER+t (Kev's top unseen) and LEADER+T (newest) jump to
+- **`cache/notify-log`** `epoch, pane, rank, title, sid, body` per `wz notify`, `-` when
+  absent, trimmed to 200; lines before 2026-10-01 stop at title. What LEADER+t (Kev's top
+  unseen) and LEADER+T (newest) jump to, skipping a pane that now holds another session,
+  and what `wz toasts` lists
 - **`cache/cc-toast/<slot>`** `<pid> <height> <sticky 0|1> <started_ms>`, space-separated:
   which toast holds which place, and which the cap of five may not evict
 - **`fleet/actions.d/`** the shell -> Lua queue, one file per action, written aside and
