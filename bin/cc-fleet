@@ -7,6 +7,8 @@
 # empty field and shift the rest of the row left.
 
 set -u
+# The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
+PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
 if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
@@ -21,11 +23,24 @@ readonly CACHE="$HOME/.claude/cache/fleet-rows"
 readonly CACHE_TTL=8
 readonly NOTES="$HOME/.claude/fleet/notes.tsv"
 readonly CTX_DIR="$HOME/.claude/cache/context"
+readonly PANE_STATE="$HOME/.claude/wezterm-state"
+# What you have read, kept by wezterm.lua: see "unread" there.
+readonly PANE_READ="$HOME/.claude/cache/pane-read"
 # Past this handing a session over is a live option; past FULL it is overdue.
 readonly CTX_WARN=60
 readonly CTX_FULL=80
-# The prompt cache's life, from statusUpdatedAt. Must match cc-board and wezterm.lua.
+# The prompt cache's life, from statusUpdatedAt, when the statusLine has not recorded the
+# real expiry (it drops to 5m in overage). Must match cc-board and wezterm.lua.
 readonly PROMPT_CACHE_TTL=3600
+# Background sessions (claude --bg) have no registry file and no pane: only this.
+readonly JOBS="$HOME/.claude/jobs"
+# `<short id>` -> the updatedAt epoch you have read with --job. Past JOB_DAYS a finished
+# job stops asking.
+readonly JOB_SEEN="$HOME/.claude/cache/jobs-seen"
+readonly JOB_DAYS=3
+readonly JOB_CACHE="$HOME/.claude/cache/job-rows"
+# A cold session below this costs too little to resume to be worth a line in --brief.
+readonly COLD_WORTH=100000
 
 # shellcheck source=bin/cc-colour
 source "$HOME/.claude/bin/cc-colour" --lib
@@ -62,10 +77,14 @@ cc-fleet - every live Claude session, grouped by wezterm workspace
                            the fleet from a session
   cc-fleet --tab           only the sessions sharing this pane's tab. A modifier, not a
                            mode: --tab --brief, --tab --tsv, --tab on its own
+  cc-fleet --jobs [--json] background sessions (claude --bg): state, what they need
+  cc-fleet --job <id>      one job's result and what it needs, and mark it read
 
 Age is time since *your* last prompt, not since the session last did anything: an agent
 chattering to itself for an hour does not make the work live. Closing a pane loses no
-conversation - every one comes back with `claude --resume <id>`.
+conversation. While its prompt cache is warm `claude --resume <id>` brings it back; once
+it is cold, never wake it: `cc-handover <id> --new` starts a successor that reads it
+from disk.
 
 In wezterm: LEADER+; fuzzy-jumps to any session in any workspace, LEADER+@ types another
 session's address into the prompt.
@@ -78,6 +97,8 @@ confirm=false
 fresh=false
 stale_ok=false
 tab_only=false
+want_jobs=false
+job_id=""
 
 while (($#)); do
 	case $1 in
@@ -90,6 +111,15 @@ while (($#)); do
 	--fresh) fresh=true ;;
 	--stale-ok) stale_ok=true ;;
 	--tab) tab_only=true ;;
+	--jobs) want_jobs=true ;;
+	--job)
+		shift
+		job_id=${1:-}
+		[[ -n $job_id ]] || {
+			echo "cc-fleet: --job needs an id (cc-fleet --jobs)" >&2
+			exit 2
+		}
+		;;
 	-h | --help)
 		usage
 		exit 0
@@ -108,6 +138,142 @@ done
 
 now=$(date +%s)
 stale_secs=$((stale_hours * 3600))
+
+# Into TOK, fork-free: 470k, 1.7M.
+TOK=""
+fmt_tok() {
+	local n=$1
+	if ((n >= 1000000)); then
+		TOK="$((n / 1000000)).$((n % 1000000 / 100000))M"
+	elif ((n >= 1000)); then
+		TOK="$((n / 1000))k"
+	else
+		TOK=$n
+	fi
+}
+
+# One jq over every job: short, state, epoch of its last change, name, needs, result,
+# session id. A placeholder in every field, since tab-like folding would shift them.
+# Cached against the state files' mtimes (-nt is a builtin): the jq was most of what
+# --brief gained from knowing about jobs.
+job_rows() {
+	local f n=0 stale=false head line
+	for f in "$JOBS"/*/state.json; do
+		[[ -e $f ]] || continue
+		n=$((n + 1))
+		# Not strictly newer: a same-second write would otherwise hide a change for good
+		[[ $JOB_CACHE -nt $f ]] || stale=true
+	done
+	if ! $stale && [[ -r $JOB_CACHE ]]; then
+		{
+			IFS= read -r head
+			if [[ $head == "#$n" ]]; then
+				while IFS= read -r line; do printf '%s\n' "$line"; done
+				return 0
+			fi
+		} <"$JOB_CACHE"
+	fi
+	mkdir -p "${JOB_CACHE%/*}" 2>/dev/null
+	{ printf '#%s\n' "$n"; job_rows_jq; } >"$JOB_CACHE.$$" &&
+		mv -f "$JOB_CACHE.$$" "$JOB_CACHE"
+	{ IFS= read -r head; while IFS= read -r line; do printf '%s\n' "$line"; done; } \
+		<"$JOB_CACHE"
+}
+
+job_rows_jq() {
+	((n > 0)) || return 0
+	jq -r --arg us "$US" '
+		def ep: (. // "") | sub("\\.[0-9]+Z$"; "Z") | (fromdateiso8601? // 0);
+		def one: (. // "" | tostring | gsub("[\t\n\u001f]+"; " ")) as $s
+			| if $s == "" then "-" else $s end;
+		select(.daemonShort or .sessionId)
+		| [ (.daemonShort // .sessionId[0:8]), (.state | one),
+		    ((.lastTerminalAt // .updatedAt) | ep | tostring), (.name | one),
+		    (.needs | one), ((.output.result // .detail) | one), (.sessionId | one) ]
+		| join($us)' "$JOBS"/*/state.json 2>/dev/null
+}
+
+# Read with --job since it last changed.
+job_seen() {
+	local short=$1 at=$2 seen=""
+	[[ -r $JOB_SEEN/$short ]] && read -r seen <"$JOB_SEEN/$short"
+	[[ $seen == "$at" ]]
+}
+
+# Stopped on a question for you (state.json's needs) and not read since: it wants you,
+# however old. Finished without one, it is unread for JOB_DAYS.
+job_wants() {
+	[[ $3 != "-" ]] && ! job_seen "$1" "$2"
+}
+job_unread() {
+	local short=$1 at=$2
+	((now - at < JOB_DAYS * 86400)) || return 1
+	! job_seen "$short" "$at"
+}
+
+job_running() {
+	case $1 in running | working | starting | busy | queued) return 0 ;; esac
+	return 1
+}
+
+if [[ -n $job_id ]]; then
+	hit=""
+	while IFS="$US" read -r j_short j_state j_at j_name j_needs j_result j_sid; do
+		[[ $j_short == "$job_id"* || $j_sid == "$job_id"* ]] || continue
+		hit=$j_short
+		printf '%s  %s (%s)\n' "$j_short" "$j_name" "$j_state"
+		[[ $j_needs != "-" ]] && printf 'needs   %s\n' "$j_needs"
+		[[ $j_result != "-" ]] && printf 'result  %s\n' "$j_result"
+		# Never wake a cold one: its successor reads it from disk instead.
+		j_exp=""
+		[[ -r $CTX_DIR/$j_sid ]] && IFS=$'\t' read -r _ _ _ j_exp _ <"$CTX_DIR/$j_sid"
+		[[ $j_exp =~ ^[0-9]+$ ]] || j_exp=$((j_at + PROMPT_CACHE_TTL))
+		if ((now < j_exp)); then
+			printf 'resume  claude --resume %s\n' "$j_sid"
+		else
+			printf 'cold    cc-handover %s --new\n' "$j_sid"
+		fi
+		mkdir -p "$JOB_SEEN" 2>/dev/null && printf '%s\n' "$j_at" >"$JOB_SEEN/$j_short"
+		break
+	done < <(job_rows)
+	[[ -n $hit ]] || { echo "cc-fleet: no background job $job_id" >&2; exit 1; }
+	exit 0
+fi
+
+if $want_jobs; then
+	if [[ $mode == json ]]; then
+		while IFS="$US" read -r j_short j_state j_at j_name j_needs j_rest; do
+			u=0
+			job_running "$j_state" || ! job_unread "$j_short" "$j_at" || u=1
+			job_running "$j_state" || ! job_wants "$j_short" "$j_at" "$j_needs" || u=2
+			printf '%s\n' "$j_short$US$j_state$US$j_at$US$j_name$US$j_needs$US$j_rest$US$u"
+		done < <(job_rows) | jq -c -Rs --arg us "$US" '
+			def u: if . == "-" then null else . end;
+			split("\n") | map(select(length > 0) | split($us)
+				| { id: .[0], state: .[1], changed_at: (.[2] | tonumber), name: .[3],
+				    needs: (.[4] | u), result: (.[5] | u), session_id: .[6],
+				    unread: (.[7] != "0"), wants_you: (.[7] == "2") })'
+		exit 0
+	fi
+	any=false
+	while IFS="$US" read -r j_short j_state j_at j_name j_needs j_result _; do
+		any=true
+		mark=" "
+		if ! job_running "$j_state"; then
+			job_unread "$j_short" "$j_at" && mark="*"
+			job_wants "$j_short" "$j_at" "$j_needs" && mark="?"
+		fi
+		age=$((now - j_at))
+		if ((age < 5400)); then age="$((age / 60))m"
+		elif ((age < 172800)); then age="$((age / 3600))h"
+		else age="$((age / 86400))d"; fi
+		printf '%s %s  %-8s %4s  %s\n' "$mark" "$j_short" "$j_state" "$age" "${j_name:0:60}"
+		[[ $j_needs != "-" ]] && printf '      needs: %s\n' "${j_needs:0:100}"
+	done < <(job_rows | sort -t"$US" -k3,3nr)
+	$any || echo "No background jobs."
+	$any && echo "? wants you, * unread; cc-fleet --job <id> reads one"
+	exit 0
+fi
 
 # pane id -> workspace, window, tab, cwd.
 pane_table() {
@@ -142,8 +308,9 @@ BEGIN {
 	}
 	# errored first: asking and waiting resume the moment you answer, a dead turn never.
 	need["errored"] = 6
-	need["asking"] = 5; need["waiting"] = 5; need["busy"] = 4
-	need["shell"] = 2; need["idle"] = 1
+	# shell: the turn is over and a background shell of its own still runs
+	need["asking"] = 5; need["waiting"] = 5; need["busy"] = 4; need["shell"] = 4
+	need["idle"] = 1
 }
 {
 	name = $1; id = $2; state = $3; pane = $4; dir = $5; title = $6
@@ -230,13 +397,68 @@ if [[ $mode == tsv ]]; then
 	exit 0
 fi
 
+# Written by the statusLine: used_pct, window, epoch, then expires_at, ttl, recache tokens
+# and hit ratio, `-` where it had none (older files stop at three). Live sessions only,
+# and a read builtin rather than an awk: the directory holds every session that ever ran.
+# No field is ever empty, so IFS=tab is safe here.
+while IFS="$US" read -r _ _ _ _ _ _ _ _ _ _ _ _ c_sid _; do
+	[[ -n ${c_sid:-} && -r $CTX_DIR/$c_sid ]] || continue
+	c_pct="" c_win="" c_exp="" c_re=""
+	IFS=$'\t' read -r c_pct c_win _ c_exp _ c_re _ <"$CTX_DIR/$c_sid" 2>/dev/null
+	c_key=${c_sid//-/_}
+	printf -v "cx_$c_key" '%s' "${c_pct:-}"
+	printf -v "cw_$c_key" '%s' "${c_win:-}"
+	printf -v "ce_$c_key" '%s' "${c_exp:-}"
+	printf -v "cr_$c_key" '%s' "${c_re:-}"
+done <<<"$rows"
+
+# Last reply per session, for whether its prompt cache is still warm. One jq, 5ms.
+while IFS='=' read -r k_sid k_at; do
+	[[ -n $k_sid && -n $k_at ]] || continue
+	printf -v "ck_${k_sid//-/_}" '%s' "$k_at"
+done < <(jq -r 'select(.sessionId != null)
+	| "\(.sessionId)=\(((.statusUpdatedAt // .updatedAt // 0) / 1000) | floor)"' \
+	"$HOME"/.claude/sessions/*.json 2>/dev/null)
+
+# Is this session's prompt cache warm? The statusLine's expires_at when it recorded one,
+# else the last reply plus the assumed TTL, else rank 3 (prompted inside the stale window).
+is_warm() {
+	local key=${1//-/_} rank=$2 k
+	k="ce_$key"
+	[[ ${!k:-} =~ ^[0-9]+$ ]] && { ((now < ${!k})); return; }
+	k="ck_$key"
+	[[ ${!k:-0} =~ ^[1-9][0-9]*$ ]] && { ((now - ${!k} < PROMPT_CACHE_TTL)); return; }
+	((rank >= 3))
+}
+
+# Into COST: tokens a cold resume writes back. The statusLine's own figure when it gave
+# one, else used_pct of the window; empty when neither is known.
+COST=""
+resume_cost() {
+	local key=${1//-/_} k p w
+	COST=""
+	k="cr_$key"
+	[[ ${!k:-} =~ ^[0-9]+$ ]] && { COST=${!k}; return; }
+	k="cx_$key"; p=${!k:-}
+	k="cw_$key"; w=${!k:-}
+	[[ $p =~ ^[0-9]+$ && $w =~ ^[0-9]+$ ]] && COST=$((p * w / 100))
+}
+
 if [[ $mode == json ]]; then
 	# idle_seconds is -1 when you have never prompted it, which is not zero.
-	printf '%s\n' "$rows" | cut -d"$US" -f2-13 |
+	while IFS="$US" read -r j_rank j_rest; do
+		j_sid=${j_rest#*"$US"*"$US"*"$US"*"$US"*"$US"*"$US"*"$US"*"$US"*"$US"*"$US"*"$US"}
+		j_sid=${j_sid%%"$US"*}
+		w=0
+		is_warm "$j_sid" "$j_rank" && w=1
+		resume_cost "$j_sid"
+		printf '%s\n' "$j_rank$US$j_rest$US$w$US${COST:--}"
+	done <<<"$rows" | cut -d"$US" -f2-13,15- |
 		jq -c -Rs --arg us "$US" 'split("\n") | map(select(length > 0) | split($us))
 			| map({ workspace: .[0], window: .[1], tab_id: .[2], pane: .[3], name: .[4],
 			        state: .[5], blocked_on: .[6], idle_seconds: (.[7] | tonumber?),
-			        your_turns: (.[8] | tonumber?), dir: .[9], title: .[10], id: .[11] })'
+			        your_turns: (.[8] | tonumber?), dir: .[9], title: .[10], id: .[11],
+			        cache_warm: (.[12] == "1"), resume_tokens: (.[13] | tonumber?) })'
 	exit 0
 fi
 
@@ -252,22 +474,6 @@ if [[ -r $NOTES ]]; then
 	done <"$NOTES"
 fi
 
-# Context fullness, written by the statusLine. Live sessions only, and a read builtin
-# rather than an awk: the directory holds every session that ever ran.
-while IFS="$US" read -r _ _ _ _ _ _ _ _ _ _ _ _ c_sid _; do
-	[[ -n ${c_sid:-} && -r $CTX_DIR/$c_sid ]] || continue
-	c_pct=""
-	IFS=$'\t' read -r c_pct _ <"$CTX_DIR/$c_sid" 2>/dev/null
-	printf -v "cx_${c_sid//-/_}" '%s' "${c_pct:-}"
-done <<<"$rows"
-
-# Last reply per session, for whether its prompt cache is still warm. One jq, 5ms.
-while IFS='=' read -r k_sid k_at; do
-	[[ -n $k_sid && -n $k_at ]] || continue
-	printf -v "ck_${k_sid//-/_}" '%s' "$k_at"
-done < <(jq -r 'select(.sessionId != null)
-	| "\(.sessionId)=\(((.statusUpdatedAt // .updatedAt // 0) / 1000) | floor)"' \
-	"$HOME"/.claude/sessions/*.json 2>/dev/null)
 
 if [[ $mode == brief ]]; then
 	# What has asked for you by name comes first: it wants something done away from here.
@@ -282,26 +488,44 @@ if [[ $mode == brief ]]; then
 	done <<<"$rows"
 	[[ -n $needs ]] && printf 'needs you:\n%s' "$needs"
 
-	printf '%s\n' "$rows" | awk -F"$US" -v cut="$stale_secs" '
+	# Background jobs stopped on a question for you join the list; finished ones get a line.
+	jobs_want="" jobs_done=""
+	while IFS="$US" read -r j_short j_state j_at j_name j_needs j_result _; do
+		job_running "$j_state" && continue
+		if job_wants "$j_short" "$j_at" "$j_needs"; then
+			jobs_want="$jobs_want$j_short$US$((now - j_at))$US${j_name:0:30}$US"
+			jobs_want="$jobs_want${j_needs:0:50}"$'\n'
+		elif job_unread "$j_short" "$j_at"; then
+			jobs_done="$jobs_done  $j_short ${j_name:0:40}"
+			[[ $j_result != "-" ]] && jobs_done="$jobs_done: ${j_result:0:60}"
+			jobs_done="$jobs_done"$'\n'
+		fi
+	done < <(job_rows)
+
+	# Busy and parked are not asking anything of you: counted, never listed. The last line
+	# is the counts, for the shell to finish.
+	brief=$(printf '%s\n' "$rows" | JOBS_WANT=$jobs_want awk -F"$US" -v cut="$stale_secs" '
 		# Two buckets rather than a sort: rows arrive in start order, and an errored
-		# session must not sit among busy ones.
-		$7 == "errored" {
-			urgent[++u] = $7 "\t" $9 "\t" $6 "\t" $8 "\t" $2
-			w++
-			next
-		}
-		$7 == "asking" || $7 == "waiting" || $7 == "busy" {
+		# session must not sit among the asking ones.
+		$7 == "errored" { urgent[++u] = $7 "\t" $9 "\t" $6 "\t" $8 "\t" $2; next }
+		$7 == "asking" || $7 == "waiting" {
 			want[++k] = $7 "\t" $9 "\t" $6 "\t" $8 "\t" $2
-			w++
 			next
 		}
+		$7 == "busy" || $7 == "shell" { busy++; next }
 		{ rest++ }
-		($7 == "idle" || $7 == "shell") && ($9 < 0 || $9 >= cut) { old++ }
+		$7 == "idle" && ($9 < 0 || $9 >= cut) { old++ }
 		END {
+			nj = split(ENVIRON["JOBS_WANT"], jl, "\n") - 1
+			for (i = 1; i <= nj; i++) {
+				split(jl[i], f, "\037")
+				want[++k] = "job\t" f[2] "\t" f[1] "\t" f[4] "\t" f[3]
+			}
+			w = u + k
 			if (w == 0) print "nothing wants you"
 			else {
 				printf "%d want%s you\n", w, (w == 1 ? "s" : "")
-				for (i = 1; i <= u + k; i++) {
+				for (i = 1; i <= w; i++) {
 					n = split((i <= u ? urgent[i] : want[i - u]), f, "\t")
 					age = (f[2] < 0) ? "never" : \
 						(f[2] < 5400 ? int(f[2] / 60) "m" : \
@@ -310,18 +534,79 @@ if [[ $mode == brief ]]; then
 						(f[4] == "" ? "" : "  (" f[4] ")")
 				}
 			}
-			printf "%d idle", rest + 0
-			if (old > 0) printf ", %d stale", old
-			printf "\n"
-		}'
-	full=""
-	while IFS="$US" read -r _ _ _ _ _ nm _ _ _ _ _ _ sid _; do
+			printf "#%d %d %d\n", busy + 0, rest + 0, old + 0
+		}')
+	counts=${brief##*$'\n'}
+	[[ $brief == *$'\n'* ]] && printf '%s\n' "${brief%$'\n'*}"
+	read -r n_busy n_rest n_old <<<"${counts#\#}"
+
+	# Finished since you last left the pane: wezterm.lua's pane-read mirror against each
+	# pane's hook record (cc-board's is_unread). The pane you are looking at is read.
+	unread="" r_focus="" READ_OK=false
+	if [[ -r $PANE_READ ]]; then
+		READ_OK=true
+		# No empty field in this file, so IFS=tab is safe here.
+		while IFS=$'\t' read -r r_p r_at r_mk; do
+			if [[ $r_p == focus ]]; then
+				[[ $r_mk == 1 ]] && r_focus=$r_at
+				continue
+			fi
+			[[ $r_p =~ ^[0-9]+$ ]] || continue
+			printf -v "ra_$r_p" '%s' "$r_at"
+			printf -v "rm_$r_p" '%s' "$r_mk"
+		done <"$PANE_READ"
+	fi
+
+	# One pass for the rest: unread, what resuming the cold ones would write back into the
+	# cache, and what is near full. Each extra pass over the rows was a few ms.
+	n_cold=0 cold_sum=0 full=""
+	while IFS="$US" read -r rk _ _ _ u_pane nm kind _ _ _ _ _ sid _; do
 		[[ -n ${sid:-} ]] || continue
 		key="cx_${sid//-/_}"
 		pct=${!key:-}
-		[[ -n $pct ]] || continue
-		((pct >= CTX_WARN)) && full="$full  $nm $pct%"$'\n'
+		[[ -n $pct ]] && ((pct >= CTX_WARN)) && full="$full  $nm $pct%"$'\n'
+		[[ $kind == idle ]] || continue
+		if ! is_warm "$sid" "$rk"; then
+			resume_cost "$sid"
+			if [[ -n $COST ]] && ((COST >= COLD_WORTH)); then
+				n_cold=$((n_cold + 1))
+				cold_sum=$((cold_sum + COST))
+			fi
+		fi
+		# Finished since you last left the pane: cc-board's is_unread, over wezterm.lua's
+		# pane-read mirror and the pane's hook record. The pane you are looking at is read.
+		$READ_OK || continue
+		[[ $u_pane =~ ^[0-9]+$ && $u_pane != "$r_focus" ]] || continue
+		k="rm_$u_pane"
+		if [[ ${!k:-} != 1 ]]; then
+			[[ -r $PANE_STATE/$u_pane ]] || continue
+			IFS= read -r line <"$PANE_STATE/$u_pane" || continue
+			u_st=${line%%$'\t'*}
+			line=${line#*$'\t'}
+			u_at=${line%%$'\t'*}
+			u_sid=""
+			[[ $line == *$'\t'*$'\t'* ]] && u_sid=${line##*$'\t'}
+			[[ $u_st == done || $u_st == parked ]] || continue
+			[[ -z $u_sid || $u_sid == "$sid" ]] || continue
+			k="ra_$u_pane"
+			[[ ${!k:-} =~ ^[0-9]+$ && $u_at =~ ^[0-9]+$ ]] || continue
+			((u_at > ${!k})) || continue
+		fi
+		unread="$unread${unread:+, }$nm"
 	done <<<"$rows"
+
+	[[ -n $unread ]] && printf 'unread: %s\n' "$unread"
+	line="$n_rest idle"
+	((n_busy > 0)) && line="$n_busy working, $line"
+	((n_old > 0)) && line="$line, $n_old stale"
+	printf '%s\n' "$line"
+	if ((n_cold > 0)); then
+		fmt_tok "$cold_sum"
+		printf '%d cold hold ~%s tokens to resume; hand over or close (--stale)\n' \
+			"$n_cold" "$TOK"
+	fi
+	[[ -n $jobs_done ]] && printf 'background, finished unread (cc-fleet --job <id>):\n%s' \
+		"$jobs_done"
 	if [[ -n $full ]]; then
 		printf 'near full (cc-handover --new):\n'
 		# Two leading spaces make the name field 3 and the percentage field 4.
@@ -341,9 +626,10 @@ fmt_age() {
 	else AGE="$((s / 86400))d"; fi
 }
 
-# Not doing anything, and not spoken to in stale_hours. busy and asking never qualify.
+# Not doing anything, and not spoken to in stale_hours. busy, shell (its own background
+# shell still runs) and asking never qualify.
 reapable=$(printf '%s\n' "$rows" | awk -F"$US" -v cut="$stale_secs" '
-	($7 == "idle" || $7 == "shell") && ($9 < 0 || $9 >= cut)' | sort -t"$US" -k9,9nr)
+	$7 == "idle" && ($9 < 0 || $9 >= cut)' | sort -t"$US" -k9,9nr)
 
 if [[ $mode == stale || $mode == reap ]]; then
 	if [[ -z $reapable ]]; then
@@ -353,11 +639,17 @@ if [[ $mode == stale || $mode == reap ]]; then
 	count=$(printf '%s\n' "$reapable" | wc -l | tr -d ' ')
 	printf '%s%s chats with no prompt from you in over %sh%s\n\n' \
 		"$BOLD" "$count" "$stale_hours" "$RESET"
-	while IFS="$US" read -r _ ws _ _ pane name _ _ idle turns _ title _ _; do
+	while IFS="$US" read -r rk ws _ _ pane name _ _ idle turns _ title sid _; do
 		fmt_age "$idle"
-		printf '  %s%5s%s  %s%-18s%s %s%-13s %3st%s  %s\n' \
+		# Resuming a cold one writes its context back: what handing over would save.
+		TOK="-"
+		if ! is_warm "$sid" "$rk"; then
+			resume_cost "$sid"
+			[[ -n $COST ]] && fmt_tok "$COST"
+		fi
+		printf '  %s%5s%s  %s%-18s%s %s%-13s %3st %6s%s  %s\n' \
 			"$DIM" "$AGE" "$RESET" "$YELLOW" "$name" "$RESET" \
-			"$DIM" "${ws:0:13}" "$turns" "$RESET" "${title:0:56}"
+			"$DIM" "${ws:0:13}" "$turns" "$TOK" "$RESET" "${title:0:50}"
 	done <<<"$reapable"
 
 	if [[ $mode == stale ]]; then
@@ -367,7 +659,10 @@ if [[ $mode == stale || $mode == reap ]]; then
 
 	printf '\n%sClosing these frees %s panes; every conversation survives.%s\n' \
 		"$DIM" "$count" "$RESET"
-	printf '%s  claude --resume <id>   brings any of them back, in any pane.%s\n' "$DIM" "$RESET"
+	# Stale is hours since your prompt, so nearly all of these are cold, and a cold one is
+	# never woken: its successor reads it from disk.
+	printf '%s  cc-handover <name> --new   picks any of them up in a fresh session.%s\n' \
+		"$DIM" "$RESET"
 	if ! $confirm; then
 		printf '\n%sDry run. Add --yes to close them.%s\n' "$YELLOW" "$RESET"
 		exit 0
@@ -391,8 +686,9 @@ ordered=$(printf '%s\n' "$rows" | awk -F"$US" -v OFS="$US" -v cut="$stale_secs" 
 		if (!(w in rank) || $1 > rank[w]) rank[w] = $1
 		if (!(w in recent) || idle < recent[w]) recent[w] = idle
 		n[w]++
-		if ($7 == "errored" || $7 == "asking" || $7 == "waiting" || $7 == "busy") wants[w]++
-		if (($7 == "idle" || $7 == "shell") && ($9 < 0 || $9 >= cut)) old[w]++
+		# Working is not wanting: only what has stopped for you counts.
+		if ($7 == "errored" || $7 == "asking" || $7 == "waiting") wants[w]++
+		if ($7 == "idle" && ($9 < 0 || $9 >= cut)) old[w]++
 	}
 	END {
 		for (i = 1; i <= NR; i++) {
@@ -405,6 +701,8 @@ ordered=$(printf '%s\n' "$rows" | awk -F"$US" -v OFS="$US" -v cut="$stale_secs" 
 total=0
 needy=0
 nws=0
+cold_n=0
+cold_total=0
 cur_ws=""
 started=false
 while IFS="$US" read -r _ _ ws n wants old rank _ _ _ pane name kind detail idle turns _ \
@@ -420,7 +718,8 @@ while IFS="$US" read -r _ _ ws n wants old rank _ _ _ pane name kind detail idle
 		if [[ -n $repo && -d $repo ]]; then
 			branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
 			if [[ -n $branch ]]; then
-				dirty=$(git -C "$repo" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+				dirty=$(git --no-optional-locks -C "$repo" status --porcelain 2>/dev/null |
+					wc -l | tr -d ' ')
 				gitbit="  ${branch}"
 				((dirty > 0)) && gitbit="${gitbit} ✎${dirty}"
 			fi
@@ -442,19 +741,13 @@ while IFS="$US" read -r _ _ ws n wants old rank _ _ _ pane name kind detail idle
 		glyph="⚠"
 		colour=$MAUVE
 		;;
-	busy)
+	busy | shell)
 		glyph="◐"
 		colour=$GREEN
 		;;
-	shell)
-		glyph="›"
-		colour=$DIM
-		;;
 	*)
 		# Grey once its prompt cache has gone cold: picking it up pays for the context.
-		kkey="ck_${id//-/_}"
-		kat=${!kkey:-0}
-		if ((kat > 0 ? now - kat < PROMPT_CACHE_TTL : rank >= 3)); then
+		if is_warm "$id" "$rank"; then
 			glyph="✳"
 			colour=$YELLOW
 		else
@@ -465,6 +758,16 @@ while IFS="$US" read -r _ _ ws n wants old rank _ _ _ pane name kind detail idle
 	esac
 	label=$kind
 	[[ -n $detail ]] && label="$kind $detail"
+	# What picking a cold one up writes back, where that is worth knowing.
+	if [[ $glyph == "·" ]]; then
+		resume_cost "$id"
+		if [[ -n $COST ]] && ((COST >= COLD_WORTH)); then
+			fmt_tok "$COST"
+			label="cold ~$TOK"
+			cold_n=$((cold_n + 1))
+			cold_total=$((cold_total + COST))
+		fi
+	fi
 	body=""
 	[[ $glyph == "·" ]] && body=$DIM
 
@@ -502,4 +805,33 @@ stale_count=0
 printf '\n%s%s chats%s %s· %s workspaces' "$BOLD" "$total" "$RESET" "$DIM" "$nws"
 ((needy > 0)) && printf '%s · %s wants you%s' "$MAUVE" "$needy" "$DIM"
 ((stale_count > 0)) && printf ' · %s idle >%sh - cc-fleet --stale' "$stale_count" "$stale_hours"
+if ((cold_n > 0)); then
+	fmt_tok "$cold_total"
+	printf ' · %s cold hold ~%s to resume' "$cold_n" "$TOK"
+fi
 printf '%s\n' "$RESET"
+
+# Background sessions: no pane, so no workspace to sit under.
+bg=""
+while IFS="$US" read -r j_short j_state j_at j_name j_needs _; do
+	if job_running "$j_state"; then
+		glyph="◐" colour=$GREEN
+	elif job_wants "$j_short" "$j_at" "$j_needs"; then
+		glyph="⚠" colour=$MAUVE
+	elif job_unread "$j_short" "$j_at"; then
+		glyph="✓" colour=$YELLOW
+	elif ((now - j_at < JOB_DAYS * 86400)); then
+		glyph="·" colour=$DIM
+	else
+		continue
+	fi
+	fmt_age "$((now - j_at))"
+	note=""
+	[[ $j_needs != "-" ]] && note=": ${j_needs:0:40}"
+	bg="$bg$(printf '  %s%s %-8s %-8s %5s%s  %s%s' "$colour" "$glyph" "$j_short" \
+		"${j_state:0:8}" "$AGE" "$RESET" "${j_name:0:32}" "$note")"$'\n'
+done < <(job_rows | sort -t"$US" -k3,3nr)
+if [[ -n $bg ]]; then
+	printf '\n%sbackground%s %s(cc-fleet --job <id>)%s\n%s' "$BOLD$BLUE" "$RESET" "$DIM" \
+		"$RESET" "$bg"
+fi

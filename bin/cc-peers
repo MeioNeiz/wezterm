@@ -3,6 +3,8 @@
 # against the transcript's mtime.
 
 set -u
+# The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
+PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
 if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
@@ -129,7 +131,7 @@ while IFS=$'\x1f' read -r sid name status detail pane cwd pid seen started; do
 	[[ -n $detail ]] && state="$status $detail"
 	cached_title "$sid" "$cwd" "$now"
 	rows="$rows$name	$sid	$state	$pane	${cwd##*/}	$TITLE"$'\n'
-done < <(cc-roster 2>/dev/null | tr '\t' '\037')
+done < <("$HOME/.claude/bin/cc-roster" 2>/dev/null | tr '\t' '\037')
 
 if [[ -z $rows ]]; then
 	$tsv || echo "No live Claude sessions." >&2

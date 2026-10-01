@@ -15,6 +15,8 @@
 # Silent on stdout on purpose: a SessionStart hook's stdout is injected into the session.
 
 set -u
+# The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
+PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # shellcheck source=bin/cc-colour
 source "$HOME/.claude/bin/cc-colour" --lib
 
@@ -146,6 +148,11 @@ case ${1-} in
 	sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F-]*\)".*/\1/p')
 	[[ -n $sid ]] || sid=$(cat "$MAP/$WEZTERM_PANE" 2>/dev/null)
 	[[ -n $sid ]] || exit 0
+	# Nested (a claude run from a session's Bash tool): not this pane's session, so it
+	# neither paints nor takes a pin. Checked first, or it would pin a colour it never
+	# shows.
+	tty=$(claude_tty)
+	[[ $tty == none ]] && exit 0
 
 	# A new session in a pane that had one lands at least ID_MIN_RING hues from the colour
 	# it replaces. Not on resume or compact, which fire SessionStart with the same id.
@@ -157,8 +164,6 @@ case ${1-} in
 		hue=$(id_rehue "$sid" "$prev_hue") && [[ -n $hue ]] && id_autopin "$sid" "$hue"
 	fi
 
-	tty=$(claude_tty)
-	[[ $tty == none ]] && exit 0
 	[[ -n $tty ]] || tty=$(pane_tty "$WEZTERM_PANE")
 	[[ -n $tty ]] && paint "$tty" "$sid" "$WEZTERM_PANE"
 	;;

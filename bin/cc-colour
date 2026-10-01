@@ -215,28 +215,35 @@ live_sessions() {
 		pid=${file##*/}
 		pid=${pid%.json}
 		kill -0 "$pid" 2>/dev/null || continue
+		# "?" for no name: an empty field before a tab folds, handing the id to name.
 		IFS=$'\t' read -r name id < <(
 			jq -r '[((.name // "") | ascii_downcase | sub("^\\s+"; "")
-				| sub("\\s+$"; "") | gsub("\\s+"; "-")),
+				| sub("\\s+$"; "") | gsub("\\s+"; "-") | if . == "" then "?" else . end),
 			        (.sessionId // "")] | @tsv' "$file" 2>/dev/null
 		)
-		[[ -n $id ]] && printf '%s\t%s\n' "${name:-?}" "$id"
+		[[ -n $id ]] && printf '%s\t%s\n' "$name" "$id"
 	done
 }
 
-# Name to session id. Registry names are not unique, so refuse an ambiguous one.
+# Name to session id. Registry names are not unique, so refuse an ambiguous one. A name
+# with hyphens is not an id: background sessions are named after their task.
 resolve_id() {
-	[[ $1 == *-*-*-*-* ]] && {
+	case $1 in
+	????????-????-????-????-????????????)
 		printf '%s' "$1"
 		return
-	}
+		;;
+	esac
 	local matches
 	# Both sides folded, so the name that is on screen is the name that resolves.
 	matches=$(live_sessions | awk -F'\t' -v n="$1" '
 		function norm(s) {
-			gsub(/^ +| +$/, "", s); s = tolower(s); gsub(/ +/, "-", s); return s
+			gsub(/^[ \t]+|[ \t]+$/, "", s); s = tolower(s); gsub(/[ \t]+/, "-", s)
+			return s
 		}
 		norm($1) == norm(n) { print $2 }')
+	# No current name: a former one, which cc-roster resolves (and says so on stderr).
+	[[ -n $matches ]] || matches=$("$HOME/.claude/bin/cc-roster" --sid "$1")
 	case $(printf '%s' "$matches" | grep -c .) in
 	0) die "no live session named $1 (try the session id, or cc-colour --all)" ;;
 	1) printf '%s' "$matches" ;;

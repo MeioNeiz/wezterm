@@ -5,6 +5,8 @@
 # pane is "-" when no wezterm pane holds the session; detail is empty unless blocked.
 
 set -u
+# The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
+PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 readonly REGISTRY="$HOME/.claude/sessions"
 # Between former names inside one field: tab is taken and a name can hold a space.
@@ -12,6 +14,12 @@ readonly US=$'\x1f'
 readonly PANE_MAP="$HOME/.claude/wezterm-sessions"
 readonly PANE_STATE="$HOME/.claude/wezterm-state"
 readonly DIGEST="$HOME/.claude/cache/fleet-digest"
+# Nothing else ever deletes these. Per-session caches go a week after their session.
+readonly REAP_STAMP="$HOME/.claude/cache/reap-stamp"
+readonly REAP_EVERY=3600
+readonly REAP_CACHES="$HOME/.claude/cache/titles $HOME/.claude/cache/context"
+# file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
+if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
 usage() {
 	cat <<'USAGE'
@@ -66,7 +74,7 @@ esac
 match_name() {
 	awk -F'\t' -v want="$1" -v out="$2" -v us="$US" '
 	function norm(s) {
-		gsub(/^ +| +$/, "", s); s = tolower(s); gsub(/ +/, "-", s); return s
+		gsub(/^[ \t]+|[ \t]+$/, "", s); s = tolower(s); gsub(/[ \t]+/, "-", s); return s
 	}
 	function pick() {
 		if (out > 0) return $out
@@ -156,6 +164,9 @@ esac
 # is answered. An idle registry never overrules errored or parked, since idle is what
 # both look like from outside. Hook stamps seconds, registry ms: +1 so a same-second
 # hook wins the tie. parked reports as busy: the turn is over, its background work is not.
+# The registry's shell (turn over, a background shell running) is level-triggered and
+# passes through: it is the better word for what parked guesses at. asking is only ever
+# honoured while newer, so an Esc on a dialog, which fires no Stop, cannot strand it.
 awk -F'\t' -v OFS='\t' -v panefile="$work/panes" \
 	-v statefile="$work/states" -v pidfile="$work/pids" -v aliases="$aliases" '
 BEGIN {
@@ -169,8 +180,10 @@ BEGIN {
 		n = split(line, f, "\t")
 		if (n < 3) continue
 		hook_state[f[1]] = f[2]; hook_at[f[1]] = f[3]; hook_detail[f[1]] = f[4]
-		# parked has no writer when the background work ends, so it expires (CLAUDE.md)
-		if (f[2] == "parked" && now - f[3] > (f[4] == "monitor" ? 3600 : 14400))
+		# parked has no writer when the background work ends, so it expires (CLAUDE.md):
+		# the most each kind can live. Must match PARKED_* in wezterm.lua and cc-board.
+		cap = (f[4] == "monitor") ? 1800 : (f[4] == "shell" ? 7200 : 14400)
+		if (f[2] == "parked" && now - f[3] > cap)
 			hook_state[f[1]] = "done"
 		# No sid on records older than the stamp: trusted rather than dropped.
 		hook_sid[f[1]] = (n >= 5) ? f[5] : ""
@@ -184,10 +197,11 @@ BEGIN {
 	if (pn != "-" && (pn in hook_state) && (hook_sid[pn] == "" || hook_sid[pn] == sid)) {
 		hs = hook_state[pn]
 		newer = (hook_at[pn] + 1) * 1000 > seen
-		if ((hs == "asking" && newer) || (hs == "errored" && (newer || status == "idle"))) {
+		quiet = (status == "idle" || status == "shell")
+		if ((hs == "asking" && newer) || (hs == "errored" && (newer || quiet))) {
 			status = hs
 			if (hook_detail[pn] != "") detail = hook_detail[pn]
-		} else if (hs == "parked" && (newer || status == "idle")) {
+		} else if (hs == "parked" && status != "shell" && (newer || status == "idle")) {
 			status = "busy"
 		}
 	}
@@ -210,3 +224,50 @@ BEGIN {
 		;;
 	*) cat ;;
 	esac
+rc=$?
+
+# Hourly, from the digest: state and map files for panes wezterm no longer has, and the
+# same for live panes still naming a session the registry has never heard of a day on
+# (pane ids restart at 0 with the GUI, so an old pair can sit on a new pane). Per-session
+# caches a week after the session is gone. Never the registry or notes.tsv.
+reap() {
+	local now at live f p sid k
+	now=$(date +%s)
+	if [[ -f $REAP_STAMP ]]; then
+		at=$(stat "${MTIME[@]}" "$REAP_STAMP" 2>/dev/null || echo 0)
+		((now - at < REAP_EVERY)) && return 0
+	fi
+	mkdir -p "${REAP_STAMP%/*}" 2>/dev/null
+	touch "$REAP_STAMP"
+	# No answer from wezterm is not "no panes": skip rather than reap the lot.
+	live=$(wezterm cli list --format json 2>/dev/null | jq -r '.[].pane_id' 2>/dev/null)
+	[[ -n $live ]] || return 0
+	for p in $live; do printf -v "lp_$p" 1; done
+	while IFS=$'\t' read -r sid _; do
+		[[ -n $sid ]] && printf -v "rs_${sid//-/_}" 1
+	done <"$work/registry"
+	for f in "$PANE_STATE"/* "$PANE_MAP"/*; do
+		p=${f##*/}
+		[[ $p =~ ^[0-9]+$ ]] || continue
+		k="lp_$p"
+		if [[ -z ${!k:-} ]]; then
+			rm -f "$PANE_STATE/$p" "$PANE_MAP/$p"
+			continue
+		fi
+		[[ $f == "$PANE_MAP/$p" ]] || continue
+		IFS= read -r sid <"$f" || continue
+		k="rs_${sid//-/_}"
+		[[ -n ${!k:-} || ! $sid =~ ^[0-9a-f-]+$ ]] && continue
+		at=$(stat "${MTIME[@]}" "$f" 2>/dev/null || echo "$now")
+		((now - at > 86400)) && rm -f "$PANE_STATE/$p" "$PANE_MAP/$p"
+	done
+	for f in $(find $REAP_CACHES -type f -mtime +7 2>/dev/null); do
+		sid=${f##*/}
+		k="rs_${sid//-/_}"
+		[[ -n ${!k:-} ]] || rm -f "$f"
+	done
+	return 0
+}
+
+[[ $mode == digest ]] && reap
+exit "$rc"

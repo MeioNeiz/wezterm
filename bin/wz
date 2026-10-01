@@ -3,6 +3,8 @@
 # resolve through cc-roster, so the address SendMessage takes works here too.
 
 set -u
+# The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
+PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
 if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
@@ -15,10 +17,14 @@ readonly EVENT_LOG="$CACHE/wz-events.jsonl"
 readonly EVENT_PID="$CACHE/wz-events.pid"
 readonly EVENT_KEEP=5000
 # Drained by wezterm.lua on the status tick, for what `wezterm cli` cannot do: switching
-# workspace, a toast.
-readonly ACTIONS="$HOME/.claude/fleet/actions"
+# workspace, a toast. One file per action, so no append can land after the drain read it.
+readonly ACTIONS_DIR="$HOME/.claude/fleet/actions.d"
 # By full path: cron and the GUI need not have ~/.local/bin on PATH.
 readonly ROSTER="$HOME/.claude/bin/cc-roster"
+# The statusLine's record per session; field 4 is when its prompt cache expires.
+readonly CTX_DIR="$HOME/.claude/cache/context"
+# Assumed when that record has no expiry. Must match wezterm.lua, cc-board and cc-fleet.
+readonly CACHE_TTL=3600
 
 usage() {
 	cat <<'USAGE'
@@ -44,11 +50,14 @@ watching
 driving
   wz send [--enter] <target> <text>   type text into a pane
   wz key <target> <key>...            enter esc tab up down ctrl-c ...
+                                      both refuse an idle session whose prompt cache is
+                                      cold (cc-handover <name> --new); --force types anyway
   wz go <target>                      focus a pane, switching tab and workspace
   wz join <src> <target> [--right|--left|--top|--bottom]
   wz break <target>                   move a pane out to its own tab
-  wz notify [--say] [--quiet] <title> [body]
-                                      a sound and a toast; --say speaks it
+  wz notify [--say] [--quiet] [--for S] [--pane N] <title> [body]
+                                      a sound and a toast for S seconds (20); a click
+                                      on it goes to pane N; --say speaks it
 
 <target> is a wezterm pane id, a session name, a session id, or "." for this pane.
 A name it used to have works too, and cc-roster says so on stderr when one is used.
@@ -138,8 +147,11 @@ rows_in_scope() {
 		{
 			n = ($4 in name) ? name[$4] : "-"
 			if (conly == "true" && n == "-") next
+			# A placeholder in every field the readers split with IFS=tab, which would
+			# fold an empty tty or title and hand the pane id to the wrong name.
 			print $1 "\t" $2 "\t" $3 "\t" $4 $5 "\t" ($6 == "" ? "-" : $6) "\t" \
-				n "\t" (($4 in state) ? state[$4] : "-") "\t" $7 "\t" $8 "\t" $4
+				n "\t" (($4 in state) ? state[$4] : "-") "\t" ($7 == "" ? "-" : $7) \
+				"\t" ($8 == "" ? "-" : $8) "\t" $4
 		}
 	' <(session_tsv) <(printf '%s\n' "$PANES")
 }
@@ -385,11 +397,36 @@ key_bytes() {
 	esac
 }
 
+# A cold session is never woken: one keystroke into it writes its whole context back into
+# the cache. Its successor reads it from disk instead. A session on a dialog or asking
+# mid-turn is live, and a shell pane has no session, so both pass.
+refuse_cold() {
+	local pane=$1 row sid name status seen exp="" now
+	row=$(session_tsv | awk -F'\t' -v p="$pane" -v us=$'\x1f' '
+		$5 == p { print $1 us $2 us $3 us $8; exit }')
+	[[ -n $row ]] || return 0
+	IFS=$'\x1f' read -r sid name status seen <<<"$row"
+	case $status in idle | errored) ;; *) return 0 ;; esac
+	now=$(date +%s)
+	# No field is ever empty in that file, so IFS=tab is safe here.
+	[[ -r $CTX_DIR/$sid ]] && IFS=$'\t' read -r _ _ _ exp _ <"$CTX_DIR/$sid"
+	if [[ $exp =~ ^[0-9]+$ ]]; then
+		((now < exp)) && return 0
+	elif [[ $seen =~ ^[0-9]+$ ]] && ((seen > 0)); then
+		((now < seen / 1000 + CACHE_TTL)) && return 0
+	else
+		return 0
+	fi
+	die "$name is $status and its prompt cache is cold: waking it rewrites its whole" \
+		"context. Hand it over instead: cc-handover $name --new (--force types anyway)"
+}
+
 cmd_send() {
-	local enter=false
+	local enter=false force=false
 	while (($#)); do
 		case ${1:-} in
 		--enter) enter=true; shift ;;
+		--force) force=true; shift ;;
 		-h | --help) usage; return ;;
 		--) shift; break ;;
 		-*) die "send: unknown option $1" ;;
@@ -401,6 +438,7 @@ cmd_send() {
 	shift
 	(($#)) || die "send: need something to type"
 	pane=$(resolve "$target") || exit 1
+	$force || refuse_cold "$pane" || exit 1
 	wezterm cli send-text --pane-id "$pane" -- "$*"
 	if $enter; then
 		printf '\r' | wezterm cli send-text --pane-id "$pane" --no-paste
@@ -408,21 +446,31 @@ cmd_send() {
 }
 
 cmd_key() {
+	local force=false
+	[[ ${1:-} == --force ]] && { force=true; shift; }
 	(($#)) || die "key: need a target"
 	local target=$1 pane k bytes
 	shift
 	(($#)) || die "key: need at least one key"
 	pane=$(resolve "$target") || exit 1
+	$force || refuse_cold "$pane" || exit 1
 	for k in "$@"; do
 		bytes=$(key_bytes "$k") || exit 1
 		printf '%s' "$bytes" | wezterm cli send-text --pane-id "$pane" --no-paste
 	done
 }
 
-# Appended so two callers a second apart keep both lines; the Lua claims it by rename.
+# Written beside the dir and renamed in, so the drain never reads half a file. A tab or a
+# newline inside a field would be read as a field or a verb of its own.
 queue_action() {
-	mkdir -p "${ACTIONS%/*}" 2>/dev/null
-	printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" >>"$ACTIONS"
+	local a=${1:-} b=${2:-} c=${3:-} tmp
+	a=${a//[$'\t\n\r']/ }
+	b=${b//[$'\t\n\r']/ }
+	c=${c//[$'\t\n\r']/ }
+	mkdir -p "$ACTIONS_DIR" 2>/dev/null
+	tmp="${ACTIONS_DIR%/*}/.action.$$.$RANDOM"
+	printf '%s\t%s\t%s\n' "$a" "$b" "$c" >"$tmp" &&
+		mv -f "$tmp" "$ACTIONS_DIR/$(date +%s)-$$-$RANDOM" || rm -f "$tmp"
 }
 
 # activate-pane leaves the GUI on its current workspace and the CLI has no verb to
@@ -480,14 +528,19 @@ osa_quote() {
 }
 
 # WezTerm is not registered with Notification Centre, so its toasts show nothing and a
-# script cannot tell. On macOS osascript is the route that shows (as Script Editor;
-# Jacob confirmed 2026-09-26); the wezterm toast is for elsewhere.
+# script cannot tell. On macOS cc-toast is a panel of our own that stays for --for seconds
+# and jumps to --pane on a click; a Notification Centre banner leaves after about five,
+# whatever it is told. osascript (shown as Script Editor) is the fallback.
 cmd_notify() {
-	local sound=true speak=false
+	local sound=true speak=false secs=20 pane=""
 	while (($#)); do
 		case ${1:-} in
 		--quiet) sound=false; shift ;;
 		--say) speak=true; shift ;;
+		--for) secs=${2:-}; shift 2 || shift
+			[[ $secs =~ ^[0-9]+$ ]] || die "notify: --for needs whole seconds" ;;
+		--pane) pane=${2:-}; shift 2 || shift
+			[[ $pane =~ ^[0-9]+$ ]] || die "notify: --pane needs a pane id" ;;
 		-h | --help) usage; return ;;
 		--) shift; break ;;
 		-*) die "notify: unknown option $1" ;;
@@ -499,7 +552,15 @@ cmd_notify() {
 	shift
 	(($#)) && body=$*
 
-	if [[ $OSTYPE == darwin* ]]; then
+	local toast="$HOME/.claude/bin/cc-toast" args
+	if [[ $OSTYPE == darwin* && -x $toast ]]; then
+		# It plays the sound itself. A subshell, so the wait below is not on its --for
+		args=(--title "$title" --body "$body" --seconds "$secs")
+		[[ -n $pane ]] && args+=(--pane "$pane")
+		$sound || args+=(--quiet)
+		(nohup "$toast" "${args[@]}" </dev/null >/dev/null 2>&1 &)
+		sound=false
+	elif [[ $OSTYPE == darwin* ]]; then
 		osascript -e "display notification \"$(osa_quote "$body")\" \
 			with title \"$(osa_quote "$title")\"" 2>/dev/null
 	elif wezterm cli list --format json >/dev/null 2>&1; then
@@ -611,8 +672,30 @@ events_status() {
 	echo "events: not running ($(last_seq) events in the log)"
 }
 
+# A reader of a log nobody is writing waits for ever: the daemon lives in no launchd job, so
+# a reboot or a GUI restart ends it silently. Whoever needs it starts it.
+ensure_daemon() {
+	local pid tries=0
+	if [[ -s $EVENT_PID ]]; then
+		pid=$(<"$EVENT_PID")
+		kill -0 "$pid" 2>/dev/null && return 0
+	fi
+	wezterm cli list --format json >/dev/null 2>&1 ||
+		die "events: the daemon is not running and there is no wezterm mux to start it on"
+	mkdir -p "$CACHE"
+	nohup "$HOME/.claude/bin/wz" events --daemon </dev/null >/dev/null 2>&1 &
+	disown 2>/dev/null
+	while ((tries++ < 20)); do
+		[[ -s $EVENT_PID ]] && kill -0 "$(<"$EVENT_PID")" 2>/dev/null && break
+		sleep 0.1
+	done
+	echo "events: daemon was not running; started it" >&2
+	touch "$EVENT_LOG"
+}
+
 events_read() {
 	local after=$1 cursor=$2 follow=$3 name=$4 limit=$5 out seen
+	$follow && ensure_daemon
 	[[ -f $EVENT_LOG ]] || die "events: no log yet (wz events --daemon &)"
 	if [[ -n $cursor && -s $cursor ]]; then
 		after=$(<"$cursor")
@@ -667,7 +750,7 @@ cmd_events() {
 
 wait_event() {
 	local event=$1 pane=$2 timeout=$3 waited=0 from hit
-	[[ -f $EVENT_LOG ]] || die "wait: no event log (wz events --daemon &)"
+	ensure_daemon
 	from=$(last_seq)
 	while ((waited < timeout)); do
 		hit=$(jq -c --argjson after "$from" --arg n "$event" --arg p "$pane" \

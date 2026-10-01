@@ -7,6 +7,8 @@
 # field would fold into its neighbour.
 
 set -u
+# The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
+PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
 if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
@@ -25,8 +27,10 @@ readonly STALE_SECS=$((8 * 3600))
 # Must match FRESH_SECONDS in wezterm.lua, or the two ✓ age out apart.
 readonly FRESH_SECS=90
 readonly REFRESH_SECS=6
-# Must match PARKED_* in wezterm.lua and cc-roster. A Monitor cannot outlive an hour.
-readonly PARKED_MONITOR_MAX=3600
+# Must match PARKED_* in wezterm.lua and cc-roster: the most each kind of background task
+# can live. A Monitor 30m (2.1.271), a background shell 2h (2.1.285), the rest 4h.
+readonly PARKED_MONITOR_MAX=1800
+readonly PARKED_SHELL_MAX=7200
 readonly PARKED_MAX=14400
 # Must match CACHE_TTL in wezterm.lua and cc-fleet.
 readonly CACHE_TTL=${CC_CACHE_TTL:-3600}
@@ -340,6 +344,7 @@ scan_hook_maps() {
 		if [[ $st == parked && $at =~ ^[0-9]+$ ]] && ((NOW > 0)); then
 			lim=$PARKED_MAX
 			[[ $dt == monitor ]] && lim=$PARKED_MONITOR_MAX
+			[[ $dt == shell ]] && lim=$PARKED_SHELL_MAX
 			((NOW - at > lim)) && st=done
 		fi
 		# No comma can appear in a detail (error kind or tool name).
@@ -388,11 +393,17 @@ sid_of_pane() {
 }
 
 # statusUpdatedAt per session, the clock the prompt cache runs on (CLAUDE.md). One jq.
+# The statusLine's expires_at beats it where recorded: the TTL is 5m in overage, not 1h.
 scan_registry() {
-	local id at
+	local id at exp
 	while IFS='=' read -r id at; do
 		[[ -n $id && -n $at ]] || continue
 		map_set "ck_${id//-/_}" "$at"
+		exp=""
+		# No field is ever empty in that file, so IFS=tab is safe here.
+		[[ -r $CTX_DIR/$id ]] && IFS=$'\t' read -r _ _ _ exp _ <"$CTX_DIR/$id"
+		[[ $exp =~ ^[0-9]+$ ]] || exp=""
+		map_set "ce_${id//-/_}" "$exp"
 	done < <(jq -r '
 		select(.sessionId != null)
 		| [ .sessionId, ((((.statusUpdatedAt // .updatedAt // 0) / 1000) | floor | tostring)) ]
@@ -405,6 +416,12 @@ cache_left_of() {
 	local k at
 	CACHE_LEFT=-1
 	[[ -n $1 ]] || return
+	k="ce_${1//-/_}"
+	if [[ -n ${!k:-} ]]; then
+		CACHE_LEFT=$((${!k} - NOW))
+		((CACHE_LEFT < 0)) && CACHE_LEFT=0
+		return
+	fi
 	k="ck_${1//-/_}"
 	at=${!k:-}
 	[[ $at =~ ^[0-9]+$ ]] || return
@@ -624,8 +641,10 @@ merge_roster() {
 	fi
 	while IFS="$US" read -r ws _ tab pane name kind detail idle turns _ title id; do
 		[[ -n $name ]] || continue
-		# The registry says waiting when a session has stopped to ask you something.
+		# The registry says waiting when a session has stopped to ask you something, and
+		# shell when its turn is over but a background shell of its own still runs.
 		[[ $kind == waiting ]] && kind=asking
+		[[ $kind == shell ]] && kind=busy
 		ix_key "$pane" "${id:-$name}"
 		i=${!IXKEY:--1}
 		if ((i < 0)); then
@@ -657,7 +676,7 @@ merge_roster() {
 		hk=${E_HKIND[i]:-}
 		if [[ -z $hk ]] || ((${E_SINCE[i]:-0} <= ROSTER_AT)); then
 			case $hk in
-			errored | parked) [[ $kind == idle || $kind == shell ]] || E_KIND[i]=$kind ;;
+			errored | parked) [[ $kind == idle ]] || E_KIND[i]=$kind ;;
 			*) E_KIND[i]=$kind ;;
 			esac
 		fi
@@ -781,7 +800,8 @@ refresh_git() {
 	[[ -n $cwd && -d $cwd ]] || return
 	BRANCH=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
 	[[ -n $BRANCH ]] &&
-		DIRTY=$(git -C "$cwd" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+		DIRTY=$(git --no-optional-locks -C "$cwd" status --porcelain 2>/dev/null |
+			wc -l | tr -d ' ')
 }
 
 # When the roster in hand was assembled: the cache file's mtime, which --stale-ok can leave
@@ -1903,10 +1923,10 @@ HELPKEYS=(
 HELPNOTES=(
 	"! errored · ? waiting on you · ✓ unread: focus reads it, LEADER+U marks it again"
 	"hand over? big (30%+) and finished: LEADER+H hands it to a fresh session"
-	"● green working, amber stopped, grey cold: an hour since its last reply"
+	"● green working, amber stopped, grey cold: its prompt cache has expired"
 	"the bar is context used, amber past half, red past 80%"
 	"• its prompt cache is still warm, so picking it up costs nothing"
-	"x closes a pane; the chat survives, claude --resume brings it back"
+	"x closes a pane; the chat survives: claude --resume if warm, cc-handover --new if cold"
 )
 
 showhelp=false
@@ -2348,7 +2368,11 @@ while :; do
 			MESSAGE="${E_NAME[i]:-that session} has no pane to close"
 			continue
 		fi
-		build_frame "close ${E_NAME[i]:-pane ${E_PANE[i]}}? the chat survives, claude --resume brings it back.  y/n"
+		# A cold session is never woken: its successor reads it from disk.
+		cache_left_of "${E_ID[i]}"
+		back="claude --resume brings it back"
+		((CACHE_LEFT == 0)) && back="cold, so cc-handover --new picks it up"
+		build_frame "close ${E_NAME[i]:-pane ${E_PANE[i]}}? the chat survives, $back.  y/n"
 		printf '%s' "$FRAME"
 		painted=$FRAME
 		read_key ""
