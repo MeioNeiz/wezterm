@@ -2327,9 +2327,9 @@ fleet_key({
 	end),
 })
 
--- LEADER+G: gather this tab. Every session on the tab handed into one: this session (when
--- warm: pasting wakes it, cold pays its whole context) or a fresh one. cc-handover then
--- types `!ccx` there unsent, and Enter on it closes the sources once the brief has landed
+-- LEADER+G: gather this tab. Every session on the tab, this one included, handed into a
+-- fresh session beside this pane: no picker. cc-handover then types `!ccx` there unsent,
+-- and Enter on it closes the sources once the brief has landed
 do
 	local function run_gather(window, here, args)
 		local cmd = string.format(
@@ -2368,35 +2368,7 @@ do
 				notify(window, "wezterm", "Nothing to gather: one session on this tab")
 				return
 			end
-			local all = me and (here .. " .tab") or ".tab"
-			local n = #others + (me and 1 or 0)
-			local choices = {}
-			local cold = me and me.kind == "idle" and me.cache_left == 0
-			if me and not cold then
-				table.insert(choices, { id = "here",
-					label = string.format("Into this session (%s) · %s", me.name,
-						table.concat(others, ", ")) })
-			end
-			table.insert(choices, { id = "new",
-				label = string.format("Into a new session beside this pane · all %d", n) })
-			table.insert(choices, { id = "tab",
-				label = string.format("Into a new tab · all %d", n) })
-			window:perform_action(
-				act.InputSelector({
-					title = "Gather this tab" .. (cold and " (this session is cold)" or ""),
-					choices = choices,
-					action = wezterm.action_callback(function(win, _, id)
-						if id == "here" then
-							run_gather(win, here, ".tab --to " .. here)
-						elseif id == "new" then
-							run_gather(win, here, all .. " --new --right")
-						elseif id == "tab" then
-							run_gather(win, here, all .. " --new --tab")
-						end
-					end),
-				}),
-				pane
-			)
+			run_gather(window, here, (me and (here .. " .tab") or ".tab") .. " --new --right")
 		end),
 	})
 end

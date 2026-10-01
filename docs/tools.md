@@ -213,10 +213,9 @@ byte-identical. Checked, because the obvious assumption is that it would not.
 
 ### gathering a tab: LEADER+G and ccx
 
-LEADER+G hands every session on the tab into one: **into this session** (offered only while
-it is warm, since the brief wakes it), or into a fresh one beside it or on a new tab, which
-takes this session too. It runs `cc-handover .tab --to <here>` or `cc-handover <here> .tab
---new`. Any `.tab` or multi-source handover is a gather: cc-handover sends the brief (a
+LEADER+G hands every session on the tab, this one included, into a fresh session beside
+this pane, with no picker: `cc-handover <here> .tab --new --right`. Gathering into a
+session already open is still there by hand, `cc-handover .tab --to <pane>` (warm only). Any `.tab` or multi-source handover is a gather: cc-handover sends the brief (a
 plain `--to` only pastes it), records the sources in `fleet/gathered/<receiver>`, and once
 the receiver is busy on the brief types `!ccx` into its prompt, unsent, with
 `send-text --no-paste` so the `!` switches it to bash mode as a typed key does. A fresh
