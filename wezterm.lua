@@ -755,6 +755,9 @@ local chime_overdue
 -- see "unread", after pane_status
 local unread_tick
 
+-- see "the two jobs a person waits on", after unread
+local fast_tick_start
+
 ---Shell -> Lua action queue: the CLI cannot switch workspace (activate-pane leaves the GUI
 ---where it was) and SetUserVar is dead on this build (CLAUDE.md). One file per action in
 ---ACTION_DIR, each one tab-separated line, written whole and renamed in by `wz`; claimed by
@@ -762,6 +765,10 @@ local unread_tick
 ---still drained: a line appended to it after the claim could be lost, which is why it went.
 local ACTION_FILE = "/.claude/fleet/actions"
 local ACTION_DIR = "/.claude/fleet/actions.d"
+
+-- fleet_jump, assigned once it is defined: `jump` is a toast click, and it wants the same
+-- in-process move LEADER+t makes rather than wz go's CLI round trips
+local jump_to
 
 local function perform_action_line(window, pane, verb, a, b)
 	if verb == "workspace" and a and a ~= "" then
@@ -786,6 +793,10 @@ local function perform_action_line(window, pane, verb, a, b)
 					end
 				end
 			end)
+		end
+	elseif verb == "jump" and tonumber(a) then
+		if jump_to then
+			jump_to(window, pane, tonumber(a))
 		end
 	elseif verb == "toast" then
 		-- wz queues this only off macOS, where wezterm's own toast is seen
@@ -911,6 +922,9 @@ local function rate_parts()
 end
 
 wezterm.on("update-right-status", function(window, pane)
+	if fast_tick_start then
+		fast_tick_start()
+	end
 	drain_actions(window, pane)
 	digest_refresh()
 	if unread_tick then
@@ -1370,6 +1384,44 @@ unread_tick = function(window)
 		looking = false
 		unread_save()
 	end
+end
+
+-- The two jobs a person waits on, off the 1s status tick: a queued `wz go` (a toast click)
+-- and pane-read (a toast closes once you are on its pane). Both are a read_dir or a pane id
+-- compare. Started from the status handler, not at load: a reload evaluates the config
+-- twice and only the state that gets events is live, so a loop started at load can be the
+-- dead one. GLOBAL names the live loop's owner and any older loop stops on seeing another
+local FAST_TICK = 0.1
+local fast_owner = tostring({})
+local fast_started = false
+
+local function fast_tick()
+	if wezterm.GLOBAL.fast_owner ~= fast_owner then
+		return
+	end
+	wezterm.time.call_after(FAST_TICK, fast_tick)
+	pcall(function()
+		local windows = wezterm.gui.gui_windows()
+		local drainer = windows[1]
+		for _, w in ipairs(windows) do
+			if w:is_focused() then
+				drainer = w
+			end
+			pcall(unread_tick, w)
+		end
+		if drainer then
+			drain_actions(drainer, drainer:active_pane())
+		end
+	end)
+end
+
+fast_tick_start = function()
+	if fast_started or not wezterm.gui then
+		return
+	end
+	fast_started = true
+	wezterm.GLOBAL.fast_owner = fast_owner
+	wezterm.time.call_after(FAST_TICK, fast_tick)
 end
 
 ---@return boolean true when the pane has a finished turn you have not looked at
@@ -2080,6 +2132,7 @@ local function fleet_jump(window, pane, pane_id)
 		window:perform_action(act.SwitchToWorkspace({ name = workspace }), pane)
 	end
 end
+jump_to = fleet_jump
 
 -- Hand this pane's work over, choosing where it lands: beside this pane, a new tab, a new
 -- pane in any other tab (the work often moves to the tab where that topic lives), or pasted

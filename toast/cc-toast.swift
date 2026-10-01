@@ -4,10 +4,11 @@
 // an app in front covers it, stacked by slot. No WezTerm window on screen: top right of
 // the main screen. The countdown waits while WezTerm is not frontmost.
 //
-//   cc-toast --title T --body B [--seconds 20] [--pane P] [--quiet]
+//   cc-toast --title T --body B [--seconds 20 | --sticky] [--pane P] [--colour #hex] [--quiet]
 //
 // Click: `wz go <pane>`, then WezTerm to the front. Hover holds the countdown and shows
-// the close button. Build: swiftc -O toast/cc-toast.swift -o bin/cc-toast (setup.sh)
+// the close button. --colour tints the glass with the session's identity hue; --sticky has
+// no countdown, and goes only once you are on its pane, click it, or its pane closes. Build: swiftc -O toast/cc-toast.swift -o bin/cc-toast (setup.sh)
 
 import AppKit
 
@@ -17,6 +18,16 @@ struct Options {
 	var seconds = 20.0
 	var pane = ""
 	var quiet = false
+	var sticky = false
+	var colour: NSColor?
+}
+
+func hexColour(_ text: String) -> NSColor? {
+	let hex = text.hasPrefix("#") ? String(text.dropFirst()) : text
+	guard hex.count == 6, let v = UInt32(hex, radix: 16) else { return nil }
+	return NSColor(
+		srgbRed: CGFloat((v >> 16) & 0xff) / 255, green: CGFloat((v >> 8) & 0xff) / 255,
+		blue: CGFloat(v & 0xff) / 255, alpha: 1)
 }
 
 func parse() -> Options {
@@ -29,9 +40,12 @@ func parse() -> Options {
 		case "--seconds": o.seconds = Double(args.next() ?? "") ?? o.seconds
 		case "--pane": o.pane = args.next() ?? ""
 		case "--quiet": o.quiet = true
+		case "--sticky": o.sticky = true
+		case "--colour": o.colour = hexColour(args.next() ?? "")
 		default:
 			FileHandle.standardError.write(
-				"usage: cc-toast --title T --body B [--seconds S] [--pane P] [--quiet]\n"
+				("usage: cc-toast --title T --body B [--seconds S | --sticky] [--pane P] "
+					+ "[--colour #hex] [--quiet]\n")
 					.data(using: .utf8)!)
 			exit(2)
 		}
@@ -56,12 +70,17 @@ let WEZTERM = "com.github.wez.wezterm"
 // room round the banner for the close button, which overhangs its top-left corner
 let BLEED: CGFloat = 10
 let MAX_SLOTS = 8
+// past this many on screen the oldest that is not sticky gives way
+let MAX_SHOWN = 5
+// how often a toast checks its pane still exists, so a sticky one cannot outlive it
+let PANE_CHECK_SECONDS = 10.0
 
 let titleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
 let bodyFont = NSFont.systemFont(ofSize: 13, weight: .regular)
 
-// One file per slot, "<pid> <height>"; O_EXCL claims it, a dead pid frees it. Every
-// toast places itself below the live slots above it, so a closed one closes the gap
+// One file per slot, "<pid> <height> <sticky 0|1> <started>"; O_EXCL claims it, a dead pid
+// frees it. Every toast places itself below the live slots above it, so a closed one
+// closes the gap
 let slotDir = NSString(string: "~/.claude/cache/cc-toast").expandingTildeInPath
 var slot = -1
 
@@ -70,10 +89,10 @@ func alive(_ text: String) -> Bool {
 	return kill(pid, 0) == 0 || errno != ESRCH
 }
 
-func claimSlot(height: CGFloat) -> Int {
+func claimSlot(height: CGFloat, sticky: Bool) -> Int {
 	try? FileManager.default.createDirectory(
 		atPath: slotDir, withIntermediateDirectories: true)
-	let me = "\(getpid()) \(Int(height))"
+	let me = "\(getpid()) \(Int(height)) \(sticky ? 1 : 0) \(Int(Date().timeIntervalSince1970 * 1000))"
 	for _ in 0..<2 {
 		for n in 0..<MAX_SLOTS {
 			let path = "\(slotDir)/\(n)"
@@ -111,6 +130,53 @@ func offsetAbove() -> CGFloat {
 		y += CGFloat(h) + GAP
 	}
 	return y
+}
+
+/// Whether this toast is the oldest one that is not sticky while too many are showing
+func shouldGiveWay() -> Bool {
+	var live: [(pid: String, sticky: Bool, started: Int)] = []
+	for n in 0..<MAX_SLOTS {
+		guard let text = try? String(contentsOfFile: "\(slotDir)/\(n)", encoding: .utf8),
+			alive(text)
+		else { continue }
+		let f = text.split(separator: " ").map(String.init)
+		live.append((f[0], f.count > 2 && f[2] == "1", f.count > 3 ? Int(f[3]) ?? 0 : 0))
+	}
+	guard live.count > MAX_SHOWN,
+		let oldest = live.filter({ !$0.sticky }).min(by: { $0.started < $1.started })
+	else { return false }
+	return oldest.pid == "\(getpid())"
+}
+
+func weztermBinary() -> String? {
+	if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: WEZTERM) {
+		let inApp = url.appendingPathComponent("Contents/MacOS/wezterm").path
+		if FileManager.default.isExecutableFile(atPath: inApp) { return inApp }
+	}
+	for p in ["/opt/homebrew/bin/wezterm", "/usr/local/bin/wezterm"]
+	where FileManager.default.isExecutableFile(atPath: p) {
+		return p
+	}
+	return nil
+}
+
+/// false only when wezterm answers and the pane is not in its list; any doubt keeps it
+func paneExists(_ pane: String) -> Bool {
+	guard !pane.isEmpty, let bin = weztermBinary() else { return true }
+	let p = Process()
+	let out = Pipe()
+	p.executableURL = URL(fileURLWithPath: bin)
+	p.arguments = ["cli", "--no-auto-start", "list", "--format", "json"]
+	p.standardOutput = out
+	p.standardError = FileHandle.nullDevice
+	guard (try? p.run()) != nil else { return true }
+	let data = out.fileHandleForReading.readDataToEndOfFile()
+	p.waitUntilExit()
+	guard p.terminationStatus == 0,
+		let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+		!list.isEmpty
+	else { return true }
+	return list.contains { "\($0["pane_id"] ?? "")" == pane }
 }
 
 // wezterm.lua's mirror of where you are: `focus\t<pane|->\t<looking 0|1>` on line one.
@@ -160,6 +226,18 @@ func orderedAbove(_ mine: Int, _ host: Int) -> Bool {
 		if seenMine && (w[kCGWindowOwnerName as String] as? String) != "cc-toast" { return false }
 	}
 	return false
+}
+
+/// Written aside and renamed in, as wz queue_action does, so Lua never reads half a line
+func queueJump(_ pane: String) -> Bool {
+	let dir = NSString(string: "~/.claude/fleet/actions.d").expandingTildeInPath
+	try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+	let name = "\(Int(Date().timeIntervalSince1970))-\(getpid())-\(Int.random(in: 0..<32768))"
+	let tmp = "\(dir)/\(name).tmp"
+	guard (try? "jump\t\(pane)\t\n".write(toFile: tmp, atomically: false, encoding: .utf8))
+		!= nil
+	else { return false }
+	return rename(tmp, "\(dir)/\(name)") == 0
 }
 
 func appIcon() -> NSImage? {
@@ -255,6 +333,7 @@ final class Toast: NSObject {
 	var timer: Timer?
 	var seenTicks = 0
 	var placedAt: CGFloat = -1
+	var lastPaneCheck = Date()
 	var host: (number: Int, frame: NSRect)?
 	var ticks = 0
 
@@ -266,6 +345,11 @@ final class Toast: NSObject {
 
 		let textW = WIDTH - TEXT_X - PAD
 		let title = label(o.title, titleFont, 0.9, lines: 1)
+		if let c = o.colour {
+			// the hue, lifted a little toward white: Mocha's accents are pastel already, so this
+			// keeps the dark ones (mauve, blue) as readable as the pale ones on the glass
+			title.textColor = c.blended(withFraction: 0.18, of: .white) ?? c
+		}
 		let body = label(o.body, bodyFont, 0.85, lines: 2)
 		let titleH = ceil(title.cell!.cellSize(forBounds: NSRect(x: 0, y: 0, width: textW, height: 100)).height)
 		let bodyH =
@@ -273,7 +357,7 @@ final class Toast: NSObject {
 			? 0 : ceil(body.cell!.cellSize(forBounds: NSRect(x: 0, y: 0, width: textW, height: 100)).height)
 		let textH = titleH + (bodyH > 0 ? bodyH : 0)
 		height = max(56, textH + 2 * 11)
-		slot = claimSlot(height: height)
+		slot = claimSlot(height: height, sticky: o.sticky)
 
 		panel = Panel(
 			contentRect: NSRect(x: 0, y: 0, width: WIDTH + 2 * BLEED, height: height + 2 * BLEED),
@@ -310,13 +394,45 @@ final class Toast: NSObject {
 			top: RADIUS, left: RADIUS, bottom: RADIUS, right: RADIUS)
 		root.addSubview(glass)
 
+		// Tint over the blur, not instead of it: strongest at the leading edge and fading
+		// across, so the glass still reads as glass and the text sits on the quieter end
+		if let c = o.colour {
+			let wash = NSView(frame: banner)
+			wash.wantsLayer = true
+			wash.layer?.cornerRadius = RADIUS
+			wash.layer?.cornerCurve = .continuous
+			wash.layer?.masksToBounds = true
+			let g = CAGradientLayer()
+			g.frame = wash.bounds
+			g.startPoint = CGPoint(x: 0, y: 0.5)
+			g.endPoint = CGPoint(x: 1, y: 0.5)
+			g.colors = [c.withAlphaComponent(0.26).cgColor, c.withAlphaComponent(0.08).cgColor]
+			wash.layer?.addSublayer(g)
+			let edge = CALayer()
+			edge.frame = CGRect(x: 0, y: 0, width: 3, height: banner.height)
+			edge.backgroundColor = c.withAlphaComponent(0.85).cgColor
+			wash.layer?.addSublayer(edge)
+			root.addSubview(wash)
+		}
+
 		let rim = NSView(frame: banner)
 		rim.wantsLayer = true
 		rim.layer?.cornerRadius = RADIUS
 		rim.layer?.cornerCurve = .continuous
 		rim.layer?.borderWidth = 0.5
-		rim.layer?.borderColor = NSColor.white.withAlphaComponent(0.2).cgColor
+		rim.layer?.borderColor = (o.colour?.withAlphaComponent(0.35) ?? NSColor.white.withAlphaComponent(0.2)).cgColor
 		root.addSubview(rim)
+
+		// a sticky toast waits for you: a small pin of a dot, top right, says so
+		if o.sticky {
+			let d: CGFloat = 7
+			let dot = NSView(
+				frame: NSRect(x: BLEED + WIDTH - PAD - d, y: BLEED + height - PAD - d, width: d, height: d))
+			dot.wantsLayer = true
+			dot.layer?.cornerRadius = d / 2
+			dot.layer?.backgroundColor = (o.colour ?? NSColor.white.withAlphaComponent(0.7)).cgColor
+			root.addSubview(dot)
+		}
 
 		if let img = appIcon() {
 			let icon = NSImageView(
@@ -407,7 +523,7 @@ final class Toast: NSObject {
 		}
 		panel.invalidateShadow()
 		NSAnimationContext.runAnimationGroup {
-			$0.duration = 0.3
+			$0.duration = 0.2
 			$0.timingFunction = CAMediaTimingFunction(name: .easeOut)
 			panel.animator().setFrame(end, display: true)
 			panel.animator().alphaValue = 1
@@ -417,11 +533,21 @@ final class Toast: NSObject {
 			if self.closing { return }
 			self.place(animated: true)
 			self.seenTicks += 1
-			if self.seenTicks % 5 == 0 && lookingAt(self.o.pane) {
+			if lookingAt(self.o.pane) || (self.seenTicks % 5 == 0 && shouldGiveWay()) {
 				self.dismiss()
 				return
 			}
-			if self.hovering || self.unseen { return }
+			// a CLI round trip: off the main thread, or every toast hitches each check
+			if Date().timeIntervalSince(self.lastPaneCheck) >= PANE_CHECK_SECONDS {
+				self.lastPaneCheck = Date()
+				let pane = self.o.pane
+				DispatchQueue.global(qos: .utility).async {
+					if !paneExists(pane) {
+						DispatchQueue.main.async { self.dismiss() }
+					}
+				}
+			}
+			if self.o.sticky || self.hovering || self.unseen { return }
 			self.left -= 0.1
 			if self.left <= 0 { self.dismiss() }
 		}
@@ -432,8 +558,13 @@ final class Toast: NSObject {
 		close.isHidden = !on
 	}
 
+	// The jump is a `jump` line queued straight into actions.d, which wezterm.lua drains
+	// every 0.1s and runs in-process: no wz go, no CLI round trips. wz go only if that fails
 	func clicked() {
-		if !o.pane.isEmpty {
+		if !o.pane.isEmpty && queueJump(o.pane) {
+			NSRunningApplication.runningApplications(withBundleIdentifier: WEZTERM)
+				.first?.activate()
+		} else if !o.pane.isEmpty {
 			let wz = Process()
 			wz.executableURL = URL(
 				fileURLWithPath: NSString(string: "~/.claude/bin/wz").expandingTildeInPath)
@@ -441,8 +572,7 @@ final class Toast: NSObject {
 			wz.standardOutput = FileHandle.nullDevice
 			wz.standardError = FileHandle.nullDevice
 			try? wz.run()
-			wz.waitUntilExit()
-			NSRunningApplication.runningApplications(withBundleIdentifier: "com.github.wez.wezterm")
+			NSRunningApplication.runningApplications(withBundleIdentifier: WEZTERM)
 				.first?.activate()
 		}
 		dismiss()
@@ -454,7 +584,7 @@ final class Toast: NSObject {
 		timer?.invalidate()
 		NSAnimationContext.runAnimationGroup(
 			{
-				$0.duration = 0.3
+				$0.duration = 0.18
 				$0.timingFunction = CAMediaTimingFunction(name: .easeIn)
 				panel.animator().setFrame(panel.frame.offsetBy(dx: 24, dy: 0), display: true)
 				panel.animator().alphaValue = 0

@@ -58,10 +58,11 @@ driving
   wz go <target>                      focus a pane, switching tab and workspace
   wz join <src> <target> [--right|--left|--top|--bottom]
   wz break <target>                   move a pane out to its own tab
-  wz notify [--say] [--quiet] [--for S] [--pane N] [--rank R] <title> [body]
-                                      a sound and a toast for S seconds (20); a click
-                                      on it goes to pane N; R (0-1) is how much it
-                                      matters, for LEADER+t; --say speaks it
+  wz notify [--say] [--quiet] [--for S | --sticky] [--pane N] [--rank R] <title> [body]
+                                      a sound and a toast for S seconds (20), or until
+                                      you are on pane N with --sticky; a click goes to
+                                      pane N, and it wears that session's colour; R (0-1)
+                                      is how much it matters, for LEADER+t; --say speaks it
 
 <target> is a wezterm pane id, a session name, a session id, or "." for this pane.
 A name it used to have works too, and cc-roster says so on stderr when one is used.
@@ -535,6 +536,16 @@ osa_quote() {
 # script cannot tell. On macOS cc-toast is a panel of our own that stays for --for seconds
 # and jumps to --pane on a click; a Notification Centre banner leaves after about five,
 # whatever it is told. osascript (shown as Script Editor) is the fallback.
+# The identity hue of the session in a pane, so its toast wears the colour of its tab
+pane_hue() {
+	local sid=""
+	[[ -n ${1:-} ]] || return 0
+	{ IFS= read -r sid <"$HOME/.claude/wezterm-sessions/$1"; } 2>/dev/null || return 0
+	[[ -n $sid ]] || return 0
+	"$HOME/.claude/bin/cc-colour" "$sid" 2>/dev/null
+	return 0
+}
+
 notify_log() {
 	local title=${3//[$'\t\n']/ }
 	mkdir -p "$CACHE" 2>/dev/null
@@ -549,11 +560,12 @@ notify_log() {
 }
 
 cmd_notify() {
-	local sound=true speak=false secs=20 pane="" rank=""
+	local sound=true speak=false secs=20 pane="" rank="" sticky=false
 	while (($#)); do
 		case ${1:-} in
 		--quiet) sound=false; shift ;;
 		--say) speak=true; shift ;;
+		--sticky) sticky=true; shift ;;
 		--for) secs=${2:-}; shift 2 || shift
 			[[ $secs =~ ^[0-9]+$ ]] || die "notify: --for needs whole seconds" ;;
 		--pane) pane=${2:-}; shift 2 || shift
@@ -578,6 +590,10 @@ cmd_notify() {
 		# It plays the sound itself. A subshell, so the wait below is not on its --for
 		args=(--title "$title" --body "$body" --seconds "$secs")
 		[[ -n $pane ]] && args+=(--pane "$pane")
+		$sticky && args+=(--sticky)
+		local colour
+		colour=$(pane_hue "$pane")
+		[[ -n $colour ]] && args+=(--colour "$colour")
 		$sound || args+=(--quiet)
 		(nohup "$toast" "${args[@]}" </dev/null >/dev/null 2>&1 &)
 		sound=false
