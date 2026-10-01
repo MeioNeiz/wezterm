@@ -96,6 +96,11 @@ cached_title() {
 
 	if [[ -r $file ]]; then
 		IFS=$'\x1f' read -r cached_mtime cached_at cached_title <"$file"
+		# Written by the statusLine from Claude's own session_name: current by construction
+		if [[ ${cached_mtime:-} == sl && -n ${cached_title:-} ]]; then
+			TITLE=$cached_title
+			return
+		fi
 		if [[ -n ${cached_title:-} && $cached_title != untitled ]]; then
 			if ((now - ${cached_at:-0} < TITLE_TTL)); then
 				TITLE=$cached_title

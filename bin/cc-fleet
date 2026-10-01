@@ -41,6 +41,11 @@ readonly JOB_DAYS=3
 readonly JOB_CACHE="$HOME/.claude/cache/job-rows"
 # A cold session below this costs too little to resume to be worth a line in --brief.
 readonly COLD_WORTH=100000
+# What a cold resume costs per million tokens written back, in cents. The SessionStart hook
+# records what Claude Code itself priced the last resume at; until one has, Opus 5.5's 1h
+# cache write: 2x its $4 input
+readonly WRITE_PRICE_FILE="$HOME/.claude/cache/cache-write-price"
+readonly WRITE_CENTS_FALLBACK=800
 
 # shellcheck source=bin/cc-colour
 source "$HOME/.claude/bin/cc-colour" --lib
@@ -141,6 +146,25 @@ stale_secs=$((stale_hours * 3600))
 
 # Into TOK, fork-free: 470k, 1.7M.
 TOK=""
+write_cents=""
+# Into USD: "$3.70", or "$37" once the cents stop mattering
+fmt_usd() {
+	local c
+	if [[ -z $write_cents ]]; then
+		write_cents=$WRITE_CENTS_FALLBACK
+		local line=""
+		[[ -r $WRITE_PRICE_FILE ]] && IFS= read -r line <"$WRITE_PRICE_FILE"
+		line=${line%%$'\t'*}
+		[[ $line =~ ^[0-9]+$ ]] && ((line > 0)) && write_cents=$line
+	fi
+	c=$(($1 * write_cents / 1000000))
+	if ((c >= 1000)); then
+		USD="\$$((c / 100))"
+	else
+		printf -v USD '$%d.%02d' $((c / 100)) $((c % 100))
+	fi
+}
+
 fmt_tok() {
 	local n=$1
 	if ((n >= 1000000)); then
@@ -602,8 +626,9 @@ if [[ $mode == brief ]]; then
 	printf '%s\n' "$line"
 	if ((n_cold > 0)); then
 		fmt_tok "$cold_sum"
-		printf '%d cold hold ~%s tokens to resume; hand over or close (--stale)\n' \
-			"$n_cold" "$TOK"
+		fmt_usd "$cold_sum"
+		printf '%d cold hold ~%s tokens (~%s) to resume; hand over or close (--stale)\n' \
+			"$n_cold" "$TOK" "$USD"
 	fi
 	[[ -n $jobs_done ]] && printf 'background, finished unread (cc-fleet --job <id>):\n%s' \
 		"$jobs_done"
@@ -642,14 +667,14 @@ if [[ $mode == stale || $mode == reap ]]; then
 	while IFS="$US" read -r rk ws _ _ pane name _ _ idle turns _ title sid _; do
 		fmt_age "$idle"
 		# Resuming a cold one writes its context back: what handing over would save.
-		TOK="-"
+		TOK="-" USD=""
 		if ! is_warm "$sid" "$rk"; then
 			resume_cost "$sid"
-			[[ -n $COST ]] && fmt_tok "$COST"
+			[[ -n $COST ]] && { fmt_tok "$COST"; fmt_usd "$COST"; }
 		fi
-		printf '  %s%5s%s  %s%-18s%s %s%-13s %3st %6s%s  %s\n' \
+		printf '  %s%5s%s  %s%-18s%s %s%-13s %3st %6s %6s%s  %s\n' \
 			"$DIM" "$AGE" "$RESET" "$YELLOW" "$name" "$RESET" \
-			"$DIM" "${ws:0:13}" "$turns" "$TOK" "$RESET" "${title:0:50}"
+			"$DIM" "${ws:0:13}" "$turns" "$TOK" "$USD" "$RESET" "${title:0:50}"
 	done <<<"$reapable"
 
 	if [[ $mode == stale ]]; then
@@ -807,7 +832,8 @@ printf '\n%s%s chats%s %s· %s workspaces' "$BOLD" "$total" "$RESET" "$DIM" "$nw
 ((stale_count > 0)) && printf ' · %s idle >%sh - cc-fleet --stale' "$stale_count" "$stale_hours"
 if ((cold_n > 0)); then
 	fmt_tok "$cold_total"
-	printf ' · %s cold hold ~%s to resume' "$cold_n" "$TOK"
+	fmt_usd "$cold_total"
+	printf ' · %s cold hold ~%s (~%s) to resume' "$cold_n" "$TOK" "$USD"
 fi
 printf '%s\n' "$RESET"
 

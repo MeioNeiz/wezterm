@@ -41,9 +41,40 @@ field() {
 		head -1 | sed 's/^.*:[[:space:]]*"//; s/"$//'
 }
 
+# Toast a deliberate notification. Detached, name lookup and all, so the hook stays fast;
+# HUP ignored, since the hook can exit first
+ping() {
+	wz="$HOME/.claude/bin/wz"
+	[ -x "$wz" ] || return 0
+	(
+		trap '' HUP
+		ping_sid=$(field session_id '0-9a-fA-F-')
+		who=""
+		command -v jq >/dev/null 2>&1 && who=$(jq -r --arg s "$ping_sid" \
+			'select(.sessionId == $s) | .name // empty' "$HOME"/.claude/sessions/*.json \
+			2>/dev/null | head -1)
+		who=${who:-pane $WEZTERM_PANE}
+		case $1 in
+		push_notification) set -- 0.8 "$who" "$2" ;;
+		worker_permission_prompt) set -- 0.7 "$who: a worker wants approval" "$2" ;;
+		*) set -- 0.4 "$who: refused, fell back" "$2" --quiet ;;
+		esac
+		sticky=""
+		[ "$1" = 0.8 ] && "$wz" help 2>&1 | grep -q -- '--sticky' && sticky=--sticky
+		"$wz" notify --pane "$WEZTERM_PANE" --rank "$1" $sticky ${4:-} -- "$2" "$3"
+	) </dev/null >/dev/null 2>&1 &
+}
+
 case $state in
 notify)
 	msg=$(field message '^"')
+	# A session can say something on purpose: its PushNotification tool, a background
+	# worker waiting on approval, a refusal that fell back to another model. A toast each,
+	# ranked for LEADER+t; the message test below still decides the pane's state
+	kind=$(field notification_type 'a-z_')
+	case $kind in
+	push_notification | worker_permission_prompt | model_refusal_fallback) ping "$kind" "$msg" ;;
+	esac
 	case $msg in
 	*permission*)
 		state=asking

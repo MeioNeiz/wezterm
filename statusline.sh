@@ -34,6 +34,9 @@ readonly NOTES="$HOME/.claude/fleet/notes.tsv"
 readonly CTX_DIR="$HOME/.claude/cache/context"
 readonly RATE_FILE="$HOME/.claude/cache/rate-limits"
 readonly RATE_EVERY=5
+# cc-peers' title memo, `mtime\x1fchecked_at\x1ftitle`; "sl" in the mtime slot says the
+# title came from here, which cc-peers trusts without looking at the transcript
+readonly TITLE_MEMO="$HOME/.claude/cache/titles"
 
 # ${#title} below must count characters, not bytes
 export LC_CTYPE=${LC_CTYPE:-en_GB.UTF-8}
@@ -69,6 +72,9 @@ IFS=$'\x1f' read -r transcript session dir title ctx_used ctx_size model effort 
 		| map(tostring | gsub("\\s+"; " ")) | join("\u001f")
 	' 2>/dev/null
 )
+
+# Claude's own session_name: /rename, else its title. Kept before the fallbacks below
+sname=$title
 
 # Older builds may not pass transcript_path; the layout is derivable from cwd.
 if [[ -z $transcript && -n $session && -n $dir ]]; then
@@ -204,6 +210,18 @@ if [[ -n $session && $ctx_used =~ ^[0-9]+$ ]]; then
 	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ctx_used" "${ctx_size:-0}" "${now:-0}" \
 		"${pc_expires:--}" "${pc_ttl:--}" "${pc_recache:--}" "${pc_hit:--}" \
 		>"$CTX_DIR/$session" 2>/dev/null
+fi
+
+# The title the transcript scan in cc-peers would find, handed over once per change: a
+# title only moves during a turn, and every turn renders this line. read is a builtin
+if [[ -n $session && -n $sname ]]; then
+	memo_src="" memo_title=""
+	[[ -r $TITLE_MEMO/$session ]] &&
+		IFS=$'\x1f' read -r memo_src _ memo_title <"$TITLE_MEMO/$session"
+	if [[ $memo_src != sl || $memo_title != "$sname" ]]; then
+		[[ -d $TITLE_MEMO ]] || mkdir -p "$TITLE_MEMO" 2>/dev/null
+		printf 'sl\x1f%s\x1f%s\n' "${now:-0}" "$sname" >"$TITLE_MEMO/$session" 2>/dev/null
+	fi
 fi
 
 # Rate limits are per account, so every session reports the same pair: one file for the

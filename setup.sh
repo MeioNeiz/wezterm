@@ -64,7 +64,7 @@ def norm: gsub("\""; "") | sub("^~"; "$HOME") | split($home) | join("$HOME");
 		{ type: "command", command: "\"$HOME/.claude/bin/cc-tint\"", timeout: 5 }
 	] },
 	UserPromptSubmit: { hooks: [hook("working")] },
-	Notification: { matcher: "permission_prompt", hooks: [hook("notify")] },
+	Notification: { matcher: "permission_prompt|push_notification|worker_permission_prompt|model_refusal_fallback", hooks: [hook("notify")] },
 	Stop: { hooks: [hook("done")] },
 	SessionEnd: { hooks: [hook("ended")] },
 	StopFailure: { hooks: [hook("errored")] },
