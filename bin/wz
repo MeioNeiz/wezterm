@@ -25,6 +25,9 @@ readonly ROSTER="$HOME/.claude/bin/cc-roster"
 readonly CTX_DIR="$HOME/.claude/cache/context"
 # Assumed when that record has no expiry. Must match wezterm.lua, cc-board and cc-fleet.
 readonly CACHE_TTL=3600
+# What LEADER+t and LEADER+T jump to: `epoch\tpane\trank\ttitle`, `-` when absent
+readonly NOTIFY_LOG="$CACHE/notify-log"
+readonly NOTIFY_KEEP=200
 
 usage() {
 	cat <<'USAGE'
@@ -55,9 +58,10 @@ driving
   wz go <target>                      focus a pane, switching tab and workspace
   wz join <src> <target> [--right|--left|--top|--bottom]
   wz break <target>                   move a pane out to its own tab
-  wz notify [--say] [--quiet] [--for S] [--pane N] <title> [body]
+  wz notify [--say] [--quiet] [--for S] [--pane N] [--rank R] <title> [body]
                                       a sound and a toast for S seconds (20); a click
-                                      on it goes to pane N; --say speaks it
+                                      on it goes to pane N; R (0-1) is how much it
+                                      matters, for LEADER+t; --say speaks it
 
 <target> is a wezterm pane id, a session name, a session id, or "." for this pane.
 A name it used to have works too, and cc-roster says so on stderr when one is used.
@@ -531,8 +535,21 @@ osa_quote() {
 # script cannot tell. On macOS cc-toast is a panel of our own that stays for --for seconds
 # and jumps to --pane on a click; a Notification Centre banner leaves after about five,
 # whatever it is told. osascript (shown as Script Editor) is the fallback.
+notify_log() {
+	local title=${3//[$'\t\n']/ }
+	mkdir -p "$CACHE" 2>/dev/null
+	printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "${1:--}" "${2:--}" "${title:--}" \
+		>>"$NOTIFY_LOG" 2>/dev/null || return 0
+	local n
+	n=$(wc -l <"$NOTIFY_LOG")
+	if ((n > 2 * NOTIFY_KEEP)); then
+		tail -n "$NOTIFY_KEEP" "$NOTIFY_LOG" >"$NOTIFY_LOG.$$" && mv "$NOTIFY_LOG.$$" "$NOTIFY_LOG"
+	fi
+	return 0
+}
+
 cmd_notify() {
-	local sound=true speak=false secs=20 pane=""
+	local sound=true speak=false secs=20 pane="" rank=""
 	while (($#)); do
 		case ${1:-} in
 		--quiet) sound=false; shift ;;
@@ -541,6 +558,8 @@ cmd_notify() {
 			[[ $secs =~ ^[0-9]+$ ]] || die "notify: --for needs whole seconds" ;;
 		--pane) pane=${2:-}; shift 2 || shift
 			[[ $pane =~ ^[0-9]+$ ]] || die "notify: --pane needs a pane id" ;;
+		--rank) rank=${2:-}; shift 2 || shift
+			[[ $rank =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || die "notify: --rank is 0 to 1" ;;
 		-h | --help) usage; return ;;
 		--) shift; break ;;
 		-*) die "notify: unknown option $1" ;;
@@ -551,6 +570,8 @@ cmd_notify() {
 	local title=$1 body=""
 	shift
 	(($#)) && body=$*
+
+	notify_log "$pane" "$rank" "$title"
 
 	local toast="$HOME/.claude/bin/cc-toast" args
 	if [[ $OSTYPE == darwin* && -x $toast ]]; then

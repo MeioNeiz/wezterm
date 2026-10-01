@@ -132,6 +132,9 @@ State these scripts write themselves, all of it theirs:
 - `~/.claude/fleet/actions.d/`      the shell -> Lua queue, one file per action, written
   aside and renamed in; Lua drains it by name. The old single `actions` file still drains
 - `~/.claude/cache/jobs-seen/<id>`, `job-rows`  which background jobs have been read
+- `~/.claude/cache/notify-log`      `epoch\tpane\trank\ttitle` per `wz notify`, `-` when
+  absent, trimmed to 200: what LEADER+t (Kev's top unseen) and LEADER+T (newest) jump to
+- `~/.claude/cache/cc-toast/<slot>` `<pid> <height>`, which toast holds which place
 - `~/.claude/cache/reap-stamp`      `cc-roster --digest` reaps at most hourly: state and
   map files for panes wezterm no longer has, maps naming an unknown session after a day,
   titles and context a week after their session is gone. Skipped if wezterm gives nothing

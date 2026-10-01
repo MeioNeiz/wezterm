@@ -2281,6 +2281,89 @@ fleet_key({
 	end),
 })
 
+-- The toasts, after the fact: `wz notify` logs `epoch\tpane\trank\ttitle` per toast, rank
+-- being Kev's 0-1 of how much it matters. LEADER+t goes to the one that matters most among
+-- those whose pane you have not been on since; LEADER+T to the newest, and again within a
+-- few seconds to the one before it. Either way the toast closes once you are on its pane
+local NOTIFY_LOG = wezterm.home_dir .. "/.claude/cache/notify-log"
+local NOTIFY_RECENT = 3 * 3600 -- older toasts are history, not news
+local NOTIFY_RANK_DEFAULT = 0.5 -- a toast raised without Kev's say
+local NOTIFY_STEP_SECONDS = 8 -- LEADER+T pressed again within this walks further back
+
+---@return table toasts with a live pane, newest first: { at, pane, rank, title }
+local function recent_toasts()
+	local out, now = {}, os.time()
+	local file = io.open(NOTIFY_LOG, "r")
+	if not file then
+		return out
+	end
+	for line in file:lines() do
+		local at, pane, rank, title = line:match("^(%d+)\t(%d+)\t([^\t]*)\t(.*)$")
+		at = tonumber(at)
+		if at and now - at <= NOTIFY_RECENT and wezterm.mux.get_pane(tonumber(pane)) then
+			table.insert(out, 1, {
+				at = at,
+				pane = tonumber(pane),
+				rank = tonumber(rank) or NOTIFY_RANK_DEFAULT,
+				title = title,
+			})
+		end
+	end
+	file:close()
+	return out
+end
+
+fleet_key({
+	key = "t",
+	mods = "LEADER",
+	action = wezterm.action_callback(function(window, pane)
+		local here = pane:pane_id()
+		local pick
+		for _, t in ipairs(recent_toasts()) do
+			local seen = (left_at[tostring(t.pane)] or 0) > t.at
+			if t.pane ~= here and not seen and (pick == nil or t.rank > pick.rank) then
+				pick = t
+			end
+		end
+		if not pick then
+			notify(window, "wezterm", "Nothing new in the toasts")
+			return
+		end
+		fleet_jump(window, pane, pick.pane)
+	end),
+})
+
+local toast_back = { at = 0, step = 0 }
+fleet_key({
+	key = "T",
+	mods = "LEADER",
+	action = wezterm.action_callback(function(window, pane)
+		local here, now = pane:pane_id(), os.time()
+		-- one per pane, so stepping back is pane to pane; not filtered by here, which moves
+		local toasts, have = {}, {}
+		for _, t in ipairs(recent_toasts()) do
+			if not have[t.pane] then
+				have[t.pane] = true
+				table.insert(toasts, t)
+			end
+		end
+		local step = 1
+		if #toasts == 0 then
+			step = 0
+		elseif now - toast_back.at <= NOTIFY_STEP_SECONDS then
+			step = toast_back.step % #toasts + 1
+		elseif toasts[1] and toasts[1].pane == here then
+			step = 2
+		end
+		if not toasts[step] or toasts[step].pane == here then
+			notify(window, "wezterm", "No recent toasts")
+			return
+		end
+		toast_back.at, toast_back.step = now, step
+		fleet_jump(window, pane, toasts[step].pane)
+	end),
+})
+
 fleet_key({
 	key = ";",
 	mods = "LEADER",

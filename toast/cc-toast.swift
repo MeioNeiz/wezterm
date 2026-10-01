@@ -113,6 +113,19 @@ func offsetAbove() -> CGFloat {
 	return y
 }
 
+// wezterm.lua's mirror of where you are: `focus\t<pane|->\t<looking 0|1>` on line one.
+// Once you are on the toast's pane, by its key, a click or any other way, it has been seen
+let paneRead = NSString(string: "~/.claude/cache/pane-read").expandingTildeInPath
+
+func lookingAt(_ pane: String) -> Bool {
+	guard !pane.isEmpty,
+		let text = try? String(contentsOfFile: paneRead, encoding: .utf8),
+		let line = text.split(separator: "\n").first
+	else { return false }
+	let f = line.split(separator: "\t").map(String.init)
+	return f.count >= 3 && f[0] == "focus" && f[1] == pane && f[2] == "1"
+}
+
 /// The frontmost on-screen WezTerm window: its number and frame in Cocoa coordinates
 func wezHost() -> (number: Int, frame: NSRect)? {
 	guard let pid = NSRunningApplication.runningApplications(withBundleIdentifier: WEZTERM)
@@ -240,6 +253,7 @@ final class Toast: NSObject {
 	var hovering = false
 	var closing = false
 	var timer: Timer?
+	var seenTicks = 0
 	var placedAt: CGFloat = -1
 	var host: (number: Int, frame: NSRect)?
 	var ticks = 0
@@ -402,6 +416,11 @@ final class Toast: NSObject {
 		timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [unowned self] _ in
 			if self.closing { return }
 			self.place(animated: true)
+			self.seenTicks += 1
+			if self.seenTicks % 5 == 0 && lookingAt(self.o.pane) {
+				self.dismiss()
+				return
+			}
 			if self.hovering || self.unseen { return }
 			self.left -= 0.1
 			if self.left <= 0 { self.dismiss() }

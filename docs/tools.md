@@ -87,10 +87,18 @@ was make it cheap enough to reach for mid-task. The parts worth knowing:
 
 `wz notify` is the one way anything here reaches you off screen: the stop-asks and drift
 hooks, cc-watch and wezterm.lua all go through it. On macOS it raises **cc-toast**, a
-panel of its own, top right, for `--for` seconds (20 by default): a Notification Centre
-banner leaves after about five whatever it is told, and there is no API that changes that.
-Toasts stack by slot, hovering holds the countdown, and a click with `--pane` runs
-`wz go <pane>` and brings WezTerm forward. It plays the sound itself unless `--quiet`.
+panel of its own at the top right of the WezTerm window, for `--for` seconds (20 by
+default; stop-asks sets it from Kev's rank, 8 to 48): a Notification Centre banner leaves
+after about five whatever it is told, and there is no API that changes that. Its own
+corner because native banners draw into one full-screen window, so there is no stacking
+below them. Toasts stack by slot, hovering holds the countdown, the countdown holds while
+another app is in front, and one closes itself once you are on its pane. A click with
+`--pane` runs `wz go <pane>` and brings WezTerm forward. It plays the sound unless `--quiet`.
+
+Every notify is logged to `~/.claude/cache/notify-log` with its pane and `--rank`, so the
+toasts can be followed after they have gone: **LEADER+t** goes to the one Kev ranked
+highest among those whose pane you have not been on since (three hours back), **LEADER+T**
+to the newest, and pressed again within 8s to the one before it, pane by pane.
 cc-toast is Swift, built by setup.sh from `toast/cc-toast.swift` into the gitignored
 `bin/cc-toast`; without it notify falls back to osascript (Script Editor's banner), and on
 Linux to notify-send.
