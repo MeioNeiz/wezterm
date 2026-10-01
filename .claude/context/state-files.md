@@ -18,7 +18,7 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
   `needs` is what one wants from Jacob, plus `detail`, `inFlight`. cc-fleet `--jobs`,
   `--job <id>` and a line in `--brief`
 - **`~/.claude/history.jsonl`**, every prompt Jacob has sent, for the age column
-- **`~/.cache/kev/asks/<sid>`** `verdict\tp\tepoch\tuuid`, the final reply judged blocked,
+- **`~/.cache/kev/asks/<sid>`** `verdict\tp\tepoch\tuuid\trank`, the final reply judged blocked,
   offer or done (kev-mcp `hooks/stop-asks.py`). In cc-board a verdict overrules the "?"
   rule both ways; absent means fall back. `~/.cache/kev/drift/<sid>.json` while a run
   looks off task: "drifting?" on a working frame. Both via `read`/`-e`, no fork
@@ -72,6 +72,8 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
   epoch after `left_at`, or marked (LEADER+U), and not the pane he is on. First sight is a
   baseline, never unread. Leaving updates `left_at` only after 2s on the pane
   (`READ_DWELL`): passing through is not reading
+- **`cache/kev-pick`** `#<epoch>\tfrom <pane>`, then `n, pane, score, why, name`: LEADER+t's
+  list, written by the `pick` action (dry run, no jump)
 - **`cache/notify-log`** `epoch, pane, rank, title` per `wz notify`, trimmed to 200: what
   LEADER+t (Kev's top unseen) and LEADER+T (newest) jump to
 - **`cache/cc-toast/<slot>`** `<pid> <height> <sticky 0|1> <started_ms>`, space-separated:

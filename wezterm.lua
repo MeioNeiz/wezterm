@@ -758,6 +758,9 @@ local unread_tick
 -- see "the two jobs a person waits on", after unread
 local fast_tick_start
 
+-- LEADER+t's say on what it picked and why, shown in the right status for a few seconds
+local pick_note
+
 ---Shell -> Lua action queue: the CLI cannot switch workspace (activate-pane leaves the GUI
 ---where it was) and SetUserVar is dead on this build (CLAUDE.md). One file per action in
 ---ACTION_DIR, each one tab-separated line, written whole and renamed in by `wz`; claimed by
@@ -766,9 +769,11 @@ local fast_tick_start
 local ACTION_FILE = "/.claude/fleet/actions"
 local ACTION_DIR = "/.claude/fleet/actions.d"
 
--- fleet_jump, assigned once it is defined: `jump` is a toast click, and it wants the same
--- in-process move LEADER+t makes rather than wz go's CLI round trips
-local jump_to
+-- Functions the action queue calls that are defined further down, filled in there. A
+-- table rather than one local each: the main chunk is at Lua's 200-local limit.
+-- jump: fleet_jump, for a toast click (in-process, not wz go's CLI round trips).
+-- pick: LEADER+t's ranking written to PICK_FILE without moving, to see what it would do
+local late = {}
 
 local function perform_action_line(window, pane, verb, a, b)
 	if verb == "workspace" and a and a ~= "" then
@@ -795,8 +800,12 @@ local function perform_action_line(window, pane, verb, a, b)
 			end)
 		end
 	elseif verb == "jump" and tonumber(a) then
-		if jump_to then
-			jump_to(window, pane, tonumber(a))
+		if late.jump then
+			late.jump(window, pane, tonumber(a))
+		end
+	elseif verb == "pick" then
+		if late.pick then
+			late.pick(pane)
 		end
 	elseif verb == "toast" then
 		-- wz queues this only off macOS, where wezterm's own toast is seen
@@ -973,6 +982,12 @@ wezterm.on("update-right-status", function(window, pane)
 			table.insert(parts, { Text = string.format(" ✓%d", away.fresh) })
 			width = width + 4
 		end
+	end
+
+	if pick_note and os.time() <= pick_note.until_at then
+		table.insert(parts, { Foreground = { Color = "#cba6f7" } })
+		table.insert(parts, { Text = pick_note.text })
+		width = width + utf8.len(pick_note.text)
 	end
 
 	for _, r in ipairs(rate_parts()) do
@@ -2149,7 +2164,7 @@ local function fleet_jump(window, pane, pane_id)
 		land()
 	end
 end
-jump_to = fleet_jump
+late.jump = fleet_jump
 
 -- Hand this pane's work over, choosing where it lands: beside this pane, a new tab, a new
 -- pane in any other tab (the work often moves to the tab where that topic lives), or pasted
@@ -2383,25 +2398,150 @@ local function recent_toasts()
 	return out
 end
 
-fleet_key({
-	key = "t",
-	mods = "LEADER",
-	action = wezterm.action_callback(function(window, pane)
-		local here = pane:pane_id()
-		local pick
-		for _, t in ipairs(recent_toasts()) do
-			local seen = (left_at[tostring(t.pane)] or 0) > t.at
-			if t.pane ~= here and not seen and (pick == nil or t.rank > pick.rank) then
-				pick = t
+-- LEADER+t, Kev's pick. The unseen toast Kev ranked highest, else the live session that
+-- scores best from what is already on disk: the merged pane state, Kev's verdict and rank
+-- on its last reply (stop-asks, `verdict\tp\tepoch\tuuid\trank`), unread, age, cache.
+-- Nothing is asked of Kev on the keypress, so it is instant and the same state always gives
+-- the same pick. Pressing again within PICK_STEP_SECONDS walks down that same list
+do
+	local KEV_ASKS = wezterm.home_dir .. "/.cache/kev/asks/"
+	local PICK_STEP_SECONDS = 8
+	local PICK_NOTE_SECONDS = 4
+	local PICK_RANK_DEFAULT = 0.3 -- a reply Kev never ranked: Kev down, or before ranks existed
+	local pick = { at = 0, list = {}, step = 0 }
+
+	local function verdict_of(sid)
+		local file = io.open(KEV_ASKS .. sid, "r")
+		if not file then
+			return nil
+		end
+		local line = file:read("*line") or ""
+		file:close()
+		local v, p, at, rank = line:match("^(%a+)\t([%d.]+)\t(%d+)\t[^\t]*\t?([%d.]*)")
+		if not v then
+			return nil
+		end
+		return { verdict = v, p = tonumber(p) or 0, at = tonumber(at) or 0, rank = tonumber(rank) }
+	end
+
+	---@return table every live session worth a look, best first: { pane, score, why, at }
+	local function kev_ranking(here)
+		local out, now = {}, os.time()
+		for id, reg in pairs(digest_rows()) do
+			local pane_id = tonumber(id)
+			if pane_id ~= here and wezterm.mux.get_pane(pane_id) then
+				local status, detail = pane_status({ pane_id = pane_id }, false)
+				local k = reg.sid ~= "" and verdict_of(reg.sid) or nil
+				local score, why
+				if status == "asking" then
+					score, why = 1.0, detail ~= "" and ("asking: " .. detail) or "asking"
+				elseif status == "errored" then
+					score, why = 0.8, "errored" .. (detail ~= "" and (": " .. detail) or "")
+				elseif status ~= "working" and status ~= "parked" then
+					if k and k.verdict == "blocked" then
+						score, why = 0.55 + 0.4 * k.p, "waiting on you"
+					else
+						local unread = pane_unread(pane_id, status)
+						score = (unread and 0.3 or 0.05) + 0.4 * ((k and k.rank) or PICK_RANK_DEFAULT)
+						why = unread and "finished, unread" or "finished"
+					end
+				end
+				if score then
+					local at = math.max(reg.seen or 0, k and k.at or 0)
+					-- a day halves it: yesterday's finish should not outrank this hour's
+					score = score / (1 + math.max(0, now - at) / 86400)
+					if status == "stale" then
+						score = score * 0.85 -- cold: as worth reading, dearer to answer
+					end
+					table.insert(out, { pane = pane_id, score = score, why = why, at = at })
+				end
 			end
 		end
-		if not pick then
-			notify(window, "wezterm", "Every recent toast seen; LEADER+T steps through them")
+		table.sort(out, function(a, b)
+			if a.score ~= b.score then
+				return a.score > b.score
+			end
+			if a.at ~= b.at then
+				return a.at > b.at
+			end
+			return a.pane < b.pane
+		end)
+		return out
+	end
+
+	local function pick_name(pane_id)
+		local p = wezterm.mux.get_pane(pane_id)
+		local title = p and p:get_title() or ""
+		title = strip_glyph(title)
+		if utf8.len(title) and utf8.len(title) > 28 then
+			title = title:sub(1, utf8.offset(title, 28) - 1) .. "…"
+		end
+		return title ~= "" and title or ("pane " .. pane_id)
+	end
+
+	local function pick_list(here)
+		local list, have = {}, {}
+		local best
+		for _, t in ipairs(recent_toasts()) do
+			local seen = (left_at[tostring(t.pane)] or 0) > t.at
+			if t.pane ~= here and not seen and (best == nil or t.rank > best.rank) then
+				best = t
+			end
+		end
+		if best then
+			table.insert(list, { pane = best.pane, why = "unseen toast", score = best.rank })
+			have[best.pane] = true
+		end
+		for _, r in ipairs(kev_ranking(here)) do
+			if not have[r.pane] then
+				table.insert(list, r)
+			end
+		end
+		return list
+	end
+
+	local PICK_FILE = wezterm.home_dir .. "/.claude/cache/kev-pick"
+	late.pick = function(pane)
+		local file = io.open(PICK_FILE .. ".tmp", "w")
+		if not file then
 			return
 		end
-		fleet_jump(window, pane, pick.pane)
-	end),
-})
+		file:write(string.format("#%d\tfrom %d\n", os.time(), pane:pane_id()))
+		for i, r in ipairs(pick_list(pane:pane_id())) do
+			file:write(string.format("%d\t%d\t%.3f\t%s\t%s\n", i, r.pane, r.score or 0, r.why,
+				pick_name(r.pane)))
+		end
+		file:close()
+		os.rename(PICK_FILE .. ".tmp", PICK_FILE)
+	end
+
+	fleet_key({
+		key = "t",
+		mods = "LEADER",
+		action = wezterm.action_callback(function(window, pane)
+			local here, now = pane:pane_id(), os.time()
+			if now - pick.at > PICK_STEP_SECONDS or #pick.list == 0 then
+				pick.list, pick.step = pick_list(here), 0
+			end
+			pick.at = now
+			-- step to the next pane still there that is not the one you are on
+			for _ = 1, #pick.list do
+				pick.step = pick.step % #pick.list + 1
+				local r = pick.list[pick.step]
+				if r.pane ~= here and wezterm.mux.get_pane(r.pane) then
+					pick_note = {
+						text = string.format(" t %d/%d %s: %s ", pick.step, #pick.list,
+							pick_name(r.pane), r.why),
+						until_at = now + PICK_NOTE_SECONDS,
+					}
+					fleet_jump(window, pane, r.pane)
+					return
+				end
+			end
+			notify(window, "wezterm", "Nothing to look at: every session is working or gone")
+		end),
+	})
+end
 
 local toast_back = { at = 0, step = 0 }
 fleet_key({

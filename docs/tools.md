@@ -104,9 +104,15 @@ reply ends on a question. The stack holds five: past that the oldest non-sticky 
 first, and a toast whose pane has closed dismisses itself within about 10s.
 
 Every notify is logged to `~/.claude/cache/notify-log` with its pane and `--rank`, so the
-toasts can be followed after they have gone: **LEADER+t** goes to the one Kev ranked
-highest among those whose pane you have not been on since (three hours back), **LEADER+T**
-to the newest, and pressed again within 8s to the one before it, pane by pane.
+toasts can be followed after they have gone. **LEADER+t** is Kev's pick: the unseen toast
+Kev ranked highest (three hours back), else the live session that scores best from what is
+on disk, with no Kev call on the keypress: asking 1.0, errored 0.8, Kev's blocked verdict
+0.55 + 0.4p, otherwise finished at 0.3 if unread or 0.05 if read, plus 0.4 times Kev's rank
+of the reply. A day halves a score and a cold cache takes 15% off; ties go to the newer.
+Working and parked sessions are left out. Pressed again within 8s it walks down the same
+list, and the right status says `t 2/9 <name>: <why>` for 4s. To see the list without
+moving, queue `pick` (`wz` action) and read `~/.claude/cache/kev-pick`. **LEADER+T** goes to
+the newest toast, and pressed again within 8s to the one before it, pane by pane.
 cc-toast is Swift, built by setup.sh from `toast/cc-toast.swift` into the gitignored
 `bin/cc-toast`; without it notify falls back to osascript (Script Editor's banner), and on
 Linux to notify-send.

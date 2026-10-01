@@ -31,6 +31,9 @@ State it reads (the digest, hook records, context, rate limits, pane-read, actio
   second. The registry arrives through `cache/fleet-digest`, never a jq here
 - Greys, widths and tab numbers: `.claude/rules/screen.md`, which loads with this file
 - Strings in `wezterm.GLOBAL` survive a config reload; locals do not
+- **The main chunk is at Lua's 200-local limit** ("too many local variables"). A new
+  feature's locals go inside `do ... end`; a function the action queue needs before it is
+  defined goes in the `late` table, not a new forward-declared local
 - A reload evaluates the config twice and only one state gets events, so a
   `wezterm.time.call_after` loop started at load can be the dead copy. Start timers from an
   event handler, as `fast_tick_start` does (the 0.1s loop for actions.d and pane-read)
