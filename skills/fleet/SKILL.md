@@ -29,6 +29,8 @@ Costs are output tokens, which is the budget that matters: you pay them every ca
 | ...two sessions at once | `cc-handover a b` | ~1150 |
 | ...the rest of this tab | `cc-handover .tab` | the same |
 | only the sessions on this tab | add `--tab` to any cc-fleet | scoped, so less |
+| organise panes by topic | `cc-sort` (dry), `--apply` after Jacob agrees | 0: Kev |
+| what was handed over yesterday | `cc-handovers` (`-d 0` today) | ~1-2k |
 
 `cc-fleet --brief` also names any session past 60% of its context window, fullest first,
 because that is the fact that leads somewhere: `cc-handover --new` is what to do about
@@ -130,7 +132,12 @@ cc-spawn --shell                   # a plain pane to watch something in
 cc-spawn --ask '...'               # leave permission prompts on
 cc-spawn --worktree=auth-guard '...'    # its own checkout, its own branch
 cc-spawn --dry-run '...'
+cc-spawn --effort low 'verify the email draft at ... against docs/...'
 ```
+
+**Choose `--effort` when you write the brief.** Effort is per session, so spawn time is
+the only moment it can be set; the default is xhigh. `low` for a lookup, a verifier, a
+one-shot answer or a standby session; leave it out for real work. `--model` likewise.
 
 **`--worktree` when two sessions would otherwise edit the same repo at once.** Claude
 Code makes it at `<repo>/.claude/worktrees/<name>` on `worktree-<name>`, locks it for the

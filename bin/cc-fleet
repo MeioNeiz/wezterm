@@ -24,6 +24,8 @@ readonly CTX_DIR="$HOME/.claude/cache/context"
 # Past this handing a session over is a live option; past FULL it is overdue.
 readonly CTX_WARN=60
 readonly CTX_FULL=80
+# The prompt cache's life, from statusUpdatedAt. Must match cc-board and wezterm.lua.
+readonly PROMPT_CACHE_TTL=3600
 
 # shellcheck source=bin/cc-colour
 source "$HOME/.claude/bin/cc-colour" --lib
@@ -259,6 +261,14 @@ while IFS="$US" read -r _ _ _ _ _ _ _ _ _ _ _ _ c_sid _; do
 	printf -v "cx_${c_sid//-/_}" '%s' "${c_pct:-}"
 done <<<"$rows"
 
+# Last reply per session, for whether its prompt cache is still warm. One jq, 5ms.
+while IFS='=' read -r k_sid k_at; do
+	[[ -n $k_sid && -n $k_at ]] || continue
+	printf -v "ck_${k_sid//-/_}" '%s' "$k_at"
+done < <(jq -r 'select(.sessionId != null)
+	| "\(.sessionId)=\(((.statusUpdatedAt // .updatedAt // 0) / 1000) | floor)"' \
+	"$HOME"/.claude/sessions/*.json 2>/dev/null)
+
 if [[ $mode == brief ]]; then
 	# What has asked for you by name comes first: it wants something done away from here.
 	needs=""
@@ -441,8 +451,10 @@ while IFS="$US" read -r _ _ ws n wants old rank _ _ _ pane name kind detail idle
 		colour=$DIM
 		;;
 	*)
-		# rank 3 is a session you prompted inside the stale window: live work.
-		if ((rank >= 3)); then
+		# Grey once its prompt cache has gone cold: picking it up pays for the context.
+		kkey="ck_${id//-/_}"
+		kat=${!kkey:-0}
+		if ((kat > 0 ? now - kat < PROMPT_CACHE_TTL : rank >= 3)); then
 			glyph="✳"
 			colour=$YELLOW
 		else

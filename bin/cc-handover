@@ -26,6 +26,7 @@ cc-handover - hand a session's work to a fresh one
   cc-handover [T]                    print the brief for a session (default: this one)
   cc-handover [T] --new [--right|--down|--tab|--window]
                                      open a fresh session, seeded with it
+  cc-handover [T] --new --in <pane>  open it split from that pane, in that pane's tab
   cc-handover [T] --to <pane>        paste the brief into a session already open
   cc-handover [T] --save             just write the file and print its path
   cc-handover [T] --new --dry-run    print the command it would run, and stop
@@ -69,6 +70,7 @@ targets=()
 action=print
 split="--right"
 to=""
+in_pane=""
 turns=3
 why=""
 dry=false
@@ -78,6 +80,7 @@ while (($#)); do
 	--dry-run) dry=true ;;
 	--save) action=save ;;
 	--to) shift; to=${1:-}; action=to; [[ -n $to ]] || die "--to needs a pane" ;;
+	--in) shift; in_pane=${1:-}; [[ $in_pane =~ ^[0-9]+$ ]] || die "--in needs a pane id" ;;
 	--right | --left | --top | --bottom) split=$1 ;;
 	--down) split="--bottom" ;;
 	--up) split="--top" ;;
@@ -356,6 +359,8 @@ new)
 	case $split in tab | window) spawn_where="--$split" ;; esac
 	spawn=(cc-spawn --cwd "$cwd" "$spawn_where")
 	[[ $pane != "-" ]] && spawn=(cc-spawn --cwd "$cwd" --from "$pane" "$spawn_where")
+	# --in: split from a pane elsewhere, so the new session lands in that pane's tab
+	[[ -n $in_pane ]] && spawn=(cc-spawn --cwd "$cwd" --from "$in_pane" "$spawn_where")
 	$dry && spawn+=(--dry-run)
 	new=$("${spawn[@]}" -- "$brief") || exit 1
 	if $dry; then

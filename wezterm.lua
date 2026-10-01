@@ -40,6 +40,10 @@ config.window_padding = { left = 4, right = 4, top = 2, bottom = 0 }
 config.adjust_window_size_when_changing_font_size = false
 config.audible_bell = "Disabled"
 config.scrollback_lines = 50000
+-- OpenGL (the default) goes through glium, which panics on a drawable over
+-- GL_MAX_VIEWPORT_DIMS; inside macOS draw_rect that cannot unwind and aborts the GUI with
+-- every pane in it (2026-09-28, wezterm#2760). WebGpu is Metal here and never calls glium
+config.front_end = "WebGpu"
 
 -- Tab bar. fancy_tab_bar.rs caps every tab at `pixel_width / num_tabs - 1.5 cells`,
 -- unconditionally. Cap is in PIXELS, so more characters means a narrower frame font
@@ -667,6 +671,9 @@ local focused_identity
 -- see "the chime" at the foot
 local chime_overdue
 
+-- see "unread", after pane_status
+local unread_tick
+
 ---Shell -> Lua action queue: the CLI cannot switch workspace (activate-pane leaves the GUI
 ---where it was) and SetUserVar is dead on this build (CLAUDE.md). One tab-separated line
 ---per action; claimed by atomic rename so exactly one window drains a batch.
@@ -730,6 +737,9 @@ end
 wezterm.on("update-right-status", function(window, pane)
 	drain_actions(window, pane)
 	digest_refresh()
+	if unread_tick then
+		pcall(unread_tick, window)
+	end
 	if chime_overdue then
 		pcall(chime_overdue, window)
 	end
@@ -968,7 +978,9 @@ local function pane_dir(pane)
 end
 
 local FRESH_SECONDS = 90 -- how long a finished turn still reads as just-finished
-local STALE_SECONDS = 4 * 3600 -- past this, a waiting pane stops competing for attention
+-- the prompt cache's life: past it a stopped pane has gone cold, and picking it up pays
+-- for its whole context again. Must match cc-board and cc-fleet
+local CACHE_TTL = 3600
 -- Must match cc-roster and cc-board. A Monitor cannot outlive an hour.
 local PARKED_MONITOR_MAX = 3600
 local PARKED_MAX = 4 * 3600
@@ -1039,11 +1051,118 @@ local function pane_status(pane, spinning)
 	if age < FRESH_SECONDS then
 		return "fresh", ""
 	end
-	if age > STALE_SECONDS then
+	if age > CACHE_TTL then
 		return "stale", ""
 	end
 	return "waiting", ""
 end
+
+-- ============================================================
+-- Unread: a pane whose turn ended (Stop: done or parked) after you last left it. Focus
+-- reads it; LEADER+U marks the focused pane unread until you leave and come back.
+-- Strings in GLOBAL, so a config reload keeps what you have read. Mirrored to READ_FILE
+-- for cc-board: `focus\t<pane|->\t<looking 0|1>`, then `<pane>\t<left at>\t<marked 0|1>`
+-- ============================================================
+local READ_FILE = wezterm.home_dir .. "/.claude/cache/pane-read"
+local left_at = {} -- pane id -> epoch you last left it, or first saw it
+local marked = {} -- pane id -> true
+local focus_pane = wezterm.GLOBAL.read_focus -- your pane, kept while wezterm is in back
+local looking = wezterm.GLOBAL.read_looking == true
+
+for id, at in (wezterm.GLOBAL.read_left or ""):gmatch("(%d+):(%d+)") do
+	left_at[id] = tonumber(at)
+end
+for id in (wezterm.GLOBAL.read_marked or ""):gmatch("%d+") do
+	marked[id] = true
+end
+
+local function unread_save()
+	local left, marks = {}, {}
+	local lines = { string.format("focus\t%s\t%d", focus_pane or "-", looking and 1 or 0) }
+	for id, at in pairs(left_at) do
+		table.insert(left, id .. ":" .. at)
+		table.insert(lines, string.format("%s\t%d\t%d", id, at, marked[id] and 1 or 0))
+	end
+	for id in pairs(marked) do
+		table.insert(marks, id)
+		if left_at[id] == nil then
+			table.insert(lines, string.format("%s\t0\t1", id))
+		end
+	end
+	wezterm.GLOBAL.read_left = table.concat(left, ",")
+	wezterm.GLOBAL.read_marked = table.concat(marks, ",")
+	wezterm.GLOBAL.read_focus = focus_pane
+	wezterm.GLOBAL.read_looking = looking
+	if not POSIX then
+		return
+	end
+	local tmp = READ_FILE .. ".tmp"
+	local file = io.open(tmp, "w")
+	if file then
+		file:write(table.concat(lines, "\n"), "\n")
+		file:close()
+		os.rename(tmp, READ_FILE)
+	end
+end
+
+-- every window ticks; only the focused one moves focus, and the one holding your pane
+-- notices wezterm going to the back
+unread_tick = function(window)
+	local focused = window:is_focused()
+	local id = tostring(window:active_pane():pane_id())
+	if focused then
+		if id ~= focus_pane then
+			if focus_pane ~= nil and looking then
+				left_at[focus_pane] = os.time()
+			end
+			marked[id] = nil
+			focus_pane = id
+			looking = true
+			unread_save()
+		elseif not looking then
+			looking = true
+			unread_save()
+		end
+	elseif looking and id == focus_pane then
+		left_at[id] = os.time()
+		looking = false
+		unread_save()
+	end
+end
+
+---@return boolean true when the pane has a finished turn you have not looked at
+local function pane_unread(pane_id, status)
+	if status == "working" or status == "asking" or status == "errored" then
+		return false
+	end
+	local id = tostring(pane_id)
+	if marked[id] then
+		return true
+	end
+	if looking and id == focus_pane then
+		return false
+	end
+	local rec = read_pane_state(pane_id)
+	if rec == nil or (rec.state ~= "done" and rec.state ~= "parked") then
+		return false
+	end
+	-- first sight is the baseline, so a reload or a new config does not light every pane
+	if left_at[id] == nil then
+		left_at[id] = os.time()
+		unread_save()
+		return false
+	end
+	return rec.at > left_at[id]
+end
+
+table.insert(config.keys, {
+	key = "U",
+	mods = "LEADER",
+	action = wezterm.action_callback(function(_, pane)
+		marked[tostring(pane:pane_id())] = true
+		unread_save()
+	end),
+})
 
 -- status by hue, not brightness; see docs/colour.md
 local TAB_COLOURS = {
@@ -1056,7 +1175,7 @@ local TAB_COLOURS = {
 	waiting = "#ffd7af", -- stopped, waiting on you
 	working = "#a6e3a1", -- busy
 	parked = "#89dceb", -- turn over, its own background work still running
-	stale = "#6c7086", -- waited hours, or the session has exited
+	stale = "#6c7086", -- prompt cache gone cold, or the session has exited
 }
 
 -- which pane to name when only one fits; errored first, a dead turn resumes for nobody
@@ -1164,11 +1283,11 @@ end
 
 focused_identity = pane_identity
 
--- Status is a ●; only the states you act on (asking, errored, fresh) get their own shape.
+-- Status is a ●; only the states you act on (asking, errored, unread) get their own shape.
 -- Label text belongs to identity.
 
 ---@return string colour, string marker, integer marker width in cells
-local function status_style(status, detail, active, budget)
+local function status_style(status, detail, active, budget, unread)
 	if status == "asking" then
 		-- with room, name the tool: "?bash ..."
 		if detail ~= "" and budget >= 20 then
@@ -1184,8 +1303,15 @@ local function status_style(status, detail, active, budget)
 		end
 		return TAB_COLOURS.errored, "!", 1
 	end
+	-- ✓ is a reply you have not read: yellow while fresh, then warm amber or cold grey
 	if status == "fresh" then
-		return TAB_COLOURS.fresh, "✓", 1
+		if unread then
+			return TAB_COLOURS.fresh, "✓", 1
+		end
+		status = "waiting"
+	end
+	if unread then
+		return TAB_COLOURS[status] or TAB_COLOURS.waiting, "✓", 1
 	end
 	-- calm blue only for the pane on screen; see on_screen
 	if status == "waiting" and active then
@@ -1342,6 +1468,7 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 					status = status,
 					detail = detail,
 					identity = fg,
+					unread = pane_unread(pane.pane_id, status),
 				})
 			elseif quiet then
 				silent = silent + 1 -- a pane that exists but has not said what it is
@@ -1363,6 +1490,7 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 					status = status,
 					detail = detail,
 					identity = zfg,
+					unread = pane_unread(tab.active_pane.pane_id, status),
 				},
 			}
 		end
@@ -1396,7 +1524,8 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 		if per == 0 or (count > 1 and per < TERSE_LABEL) then
 			-- too tight: one glyph per pane
 			for _, label in ipairs(labels) do
-				local colour, marker = status_style(label.status, label.detail, label.active, 0)
+				local colour, marker =
+					status_style(label.status, label.detail, label.active, 0, label.unread)
 				table.insert(items, { Attribute = { Intensity = label.active and "Bold" or "Normal" } })
 				table.insert(items, { Foreground = { Color = colour } })
 				table.insert(items, { Text = marker ~= "" and marker or (label.active and "◆" or "●") })
@@ -1422,7 +1551,7 @@ wezterm.on("format-tab-title", function(tab, tabs, _, _, _, max_width)
 				end
 				local text = (count > 1 or per < MIN_LABEL) and strip_filler(label.text) or label.text
 				local colour, marker, marker_width =
-					status_style(label.status, label.detail, label.active, per)
+					status_style(label.status, label.detail, label.active, per, label.unread)
 				if marker == "" then
 					marker, marker_width = label.active and "◆" or "●", 1
 				end
@@ -1565,7 +1694,7 @@ local FLEET_GLYPH = {
 -- unfiltered list opens on whatever wants you
 local FLEET_WEIGHT = { asking = 4, busy = 3, idle = 2, shell = 1 }
 
--- dimmed past this; matches cc-fleet's default
+-- dimmed past this when cc-board has no cache clock for the session; cc-fleet's default
 local FLEET_STALE = 8 * 3600
 
 ---Time since your last prompt, in the width the picker can spare.
@@ -1589,9 +1718,9 @@ local function fleet_pad(text, width)
 	return text .. string.rep(" ", width - #text)
 end
 
----@return table InputSelector choices, id = the pane to jump to
+---@return table rows, sorted: what wants you first, then most recently prompted
 ---cc-board, not cc-fleet: only the pane's screen tells finished from asking (~0.5s)
-local function fleet_choices()
+local function fleet_rows()
 	local ok, ran, stdout = pcall(wezterm.run_child_process, { board_script, "--tsv", "--all" })
 	if not ok or not ran then
 		return {}
@@ -1602,7 +1731,7 @@ local function fleet_choices()
 		for field in (line .. "\t"):gmatch("([^\t]*)\t") do
 			table.insert(f, field)
 		end
-		-- ws, pane, name, kind, asks, idle, pct, title, last, identity colour
+		-- ws, pane, name, kind, asks, idle, pct, title, last, identity colour, cache left
 		local pane = tonumber(f[2])
 		if pane and f[3] ~= "" then
 			local asks = f[5] == "yes"
@@ -1617,6 +1746,7 @@ local function fleet_choices()
 				title = f[8],
 				last = f[9],
 				identity = (f[10] or ""):match("^#%x%x%x%x%x%x$"),
+				cache_left = tonumber(f[11]) or -1,
 				weight = asks and 5 or (FLEET_WEIGHT[f[4]] or 0),
 			})
 		end
@@ -1631,16 +1761,22 @@ local function fleet_choices()
 		local bi = b.idle < 0 and math.huge or b.idle
 		return ai < bi
 	end)
+	return rows
+end
 
+---@return table InputSelector choices, id = the pane to jump to
+local function fleet_choices()
 	local choices = {}
-	for _, r in ipairs(rows) do
+	for _, r in ipairs(fleet_rows()) do
 		local marker, colour
 		if r.asks then
 			marker, colour = "⚠", TAB_COLOURS.asking
 		else
 			local glyph = FLEET_GLYPH[r.kind] or { "·", TAB_COLOURS.stale }
 			marker, colour = glyph[1], glyph[2]
-			if r.kind == "idle" and (r.idle < 0 or r.idle >= FLEET_STALE) then
+			local cold = r.cache_left == 0
+				or (r.cache_left < 0 and (r.idle < 0 or r.idle >= FLEET_STALE))
+			if r.kind == "idle" and cold then
 				marker, colour = "·", TAB_COLOURS.stale
 			end
 		end
@@ -1703,6 +1839,233 @@ local function fleet_jump(window, pane, pane_id)
 	end
 end
 
+-- Hand this pane's work over, choosing where it lands: beside this pane, a new tab, a new
+-- pane in any other tab (the work often moves to the tab where that topic lives), or pasted
+-- into an idle session. cc-handover builds the brief from the transcript and cc-note; the
+-- old pane stays for you to close. Handovers were typed prompts, ~5 a day, and donors went
+-- at a median 332k after 80 calls above 300k (jevlab round 7). Tabs are ordered by title
+-- words shared with this session, this workspace first, unless Kev is up: then by cc-sort
+-- --rank (Kev's p that a tab's sessions share this one's topic; cached pairs plus what it
+-- answers in 1 s, which the picker waits for; cc-watch warms the focused pane's pairs),
+-- Kev-scored tabs first. Every pick is
+-- logged to ~/.cache/kev/handover-dest.jsonl with which ranking it saw.
+local handover_script = wezterm.home_dir .. "/.claude/bin/cc-handover"
+local sort_script = wezterm.home_dir .. "/.claude/bin/cc-sort"
+-- Off since 2026-10-01: Kev is always up now, so every LEADER+H paid the 1 s wait, and in
+-- handover-dest.jsonl no pick ever went to a Kev-ranked tab (both were "Beside this pane")
+local KEV_RANK = false
+local handover_log = wezterm.home_dir .. "/.cache/kev/handover-dest.jsonl"
+
+local function title_words(text)
+	local set = {}
+	for w in (text or ""):lower():gmatch("[%w]+") do
+		if #w > 3 then
+			set[w] = true
+		end
+	end
+	return set
+end
+
+local function shared_words(a, b)
+	local n = 0
+	for w in pairs(a) do
+		if b[w] then
+			n = n + 1
+		end
+	end
+	return n
+end
+
+-- a tab title led by a status glyph was pinned by the save layer, not typed by you
+local function typed_title(t)
+	if not t or t == "" then
+		return ""
+	end
+	local ok, cp = pcall(utf8.codepoint, t, 1)
+	if ok and cp and cp >= 0x2000 then
+		return ""
+	end
+	return t
+end
+
+local function run_handover(window, pane_id, args)
+	-- cc-handover calls cc-roster, cc-spawn and jq by name; the GUI's PATH has none of them
+	local cmd = string.format(
+		'PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH" \'%s\' %d %s',
+		handover_script, pane_id, args)
+	local ok, ran, stdout, stderr = pcall(wezterm.run_child_process, { LOGIN_SHELL, "-lc", cmd })
+	if ok and ran then
+		window:toast_notification("wezterm", (stdout:match("[^\n]+") or "Handed over"), nil, 3000)
+	else
+		window:toast_notification("wezterm", "Handover failed: " .. tostring(stderr or ""), nil, 4000)
+	end
+end
+
+fleet_key({
+	key = "H",
+	mods = "LEADER",
+	action = wezterm.action_callback(function(window, pane)
+		local here = pane:pane_id()
+		local rows, by_pane, me = fleet_rows(), {}, nil
+		for _, r in ipairs(rows) do
+			by_pane[r.pane] = r
+			if r.pane == here then
+				me = r
+			end
+		end
+		local mine = title_words(me and (me.title .. " " .. me.last) or "")
+		local ok_tab, here_tab = pcall(function()
+			return pane:tab():tab_id()
+		end)
+		local active_ws = window:active_workspace()
+		local tabs = {}
+		for _, mw in ipairs(wezterm.mux.all_windows()) do
+			local ws = mw:get_workspace()
+			for idx, tab in ipairs(mw:tabs()) do
+				if not (ok_tab and tab:tab_id() == here_tab) then
+					local names, text, first = {}, typed_title(tab:get_title()), nil
+					for _, p in ipairs(tab:panes()) do
+						first = first or p:pane_id()
+						local r = by_pane[p:pane_id()]
+						if r then
+							table.insert(names, r.name)
+							text = text .. " " .. r.title
+						end
+					end
+					if first then
+						table.insert(tabs, {
+							id = tab:tab_id(), ws = ws, idx = idx, first = first, names = names,
+							title = typed_title(tab:get_title()),
+							score = shared_words(mine, title_words(text)) + (ws == active_ws and 0.5 or 0),
+						})
+					end
+				end
+			end
+		end
+		local by = "words"
+		local ok_rank, ran, out = false, false, nil
+		if KEV_RANK then
+			ok_rank, ran, out = pcall(wezterm.run_child_process, {
+				LOGIN_SHELL, "-lc", string.format(
+					'PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH" \'%s\' --rank %d --timeout 1',
+					sort_script, here) })
+		end
+		if ok_rank and ran then
+			local kev = {}
+			for id, p in out:gmatch("(%d+)\t([%d.]+)") do
+				kev[tonumber(id)] = tonumber(p)
+			end
+			for _, t in ipairs(tabs) do
+				t.kev = kev[t.id]
+				by = t.kev and "kev" or by
+			end
+		end
+		table.sort(tabs, function(a, b)
+			if (a.kev ~= nil) ~= (b.kev ~= nil) then
+				return a.kev ~= nil
+			end
+			if a.kev and a.kev ~= b.kev then
+				return a.kev > b.kev
+			end
+			return a.score > b.score
+		end)
+
+		local choices = {
+			{ id = "here", label = "Beside this pane (new session)" },
+			{ id = "tab", label = "New tab (new session)" },
+		}
+		for _, t in ipairs(tabs) do
+			local label = string.format("%s · tab %d%s · %s", t.ws, t.idx,
+				t.title ~= "" and (" · " .. t.title) or "",
+				#t.names > 0 and table.concat(t.names, ", ") or "no sessions")
+			table.insert(choices, { id = "in:" .. t.first, label = "New pane in " .. label })
+		end
+		for _, r in ipairs(rows) do
+			if r.pane ~= here and r.kind == "idle" and not r.asks then
+				table.insert(choices, { id = "to:" .. r.pane,
+					label = string.format("Paste into %s · %s", r.name, r.title) })
+			end
+		end
+
+		window:perform_action(
+			act.InputSelector({
+				title = "Hand over " .. (me and me.name or "this pane") .. " to",
+				fuzzy = true,
+				fuzzy_description = "hand over to: ",
+				choices = choices,
+				action = wezterm.action_callback(function(win, _, id)
+					if not id then
+						return
+					end
+					local rank = 0
+					for k, c in ipairs(choices) do
+						if c.id == id then
+							rank = k
+						end
+					end
+					local f = io.open(handover_log, "a")
+					if f then
+						f:write(string.format(
+							'{"ts":%d,"from":"%s","dest":"%s","rank":%d,"n":%d,"by":"%s"}\n',
+							os.time(), me and me.name or "", id, rank, #choices, by))
+						f:close()
+					end
+					local kind, target = id:match("^(%a+):?(%d*)$")
+					if kind == "here" then
+						run_handover(win, here, "--new --right")
+					elseif kind == "tab" then
+						run_handover(win, here, "--new --tab")
+					elseif kind == "in" then
+						run_handover(win, here, "--new --in " .. target)
+					elseif kind == "to" then
+						run_handover(win, here, "--to " .. target)
+					end
+				end),
+			}),
+			pane
+		)
+	end),
+})
+
+-- Straight to the next pane waiting on you, no picker. Waiting is cc-board's asks: a dialog,
+-- or Kev's verdict that the final reply needs you (jevlab stop-asks; the "?" rule when Kev
+-- is down). Blocked stops used to wait as long as finished ones (median 2.7 vs 3.0 min),
+-- 42% of them while you prompted other sessions. Order is the picker's, most recently
+-- prompted first, so a warm prompt cache gets answered first. Pressing again skips panes
+-- this cycle already visited; the cycle restarts once none is left.
+local focus_seen = {}
+fleet_key({
+	key = "f",
+	mods = "LEADER",
+	action = wezterm.action_callback(function(window, pane)
+		local here = pane:pane_id()
+		local waiting = {}
+		for _, r in ipairs(fleet_rows()) do
+			if r.asks and r.pane ~= here then
+				table.insert(waiting, r)
+			end
+		end
+		if #waiting == 0 then
+			focus_seen = {}
+			window:toast_notification("wezterm", "Nothing is waiting on you", nil, 2000)
+			return
+		end
+		local pick
+		for _, r in ipairs(waiting) do
+			if not focus_seen[r.pane] then
+				pick = r
+				break
+			end
+		end
+		if not pick then
+			focus_seen = {}
+			pick = waiting[1]
+		end
+		focus_seen[pick.pane] = true
+		fleet_jump(window, pane, pick.pane)
+	end),
+})
+
 fleet_key({
 	key = ";",
 	mods = "LEADER",
@@ -1715,7 +2078,7 @@ fleet_key({
 		window:perform_action(
 			act.InputSelector({
 				title = "Claude fleet",
-				description = "Every live session, anywhere. ⚠ is waiting on you; dimmed is cold.",
+				description = "Every live session, anywhere. ⚠ is waiting on you; dimmed: cache cold, an hour since its reply.",
 				fuzzy = true,
 				fuzzy_description = "jump to: ",
 				choices = choices,
@@ -2455,6 +2818,8 @@ fleet_key({
 local PALETTE = {
 	b = "Fleet: board",
 	[";"] = "Fleet: jump to any session",
+	["f"] = "Fleet: next pane waiting on you",
+	H = "Fleet: hand this pane over to a fresh session",
 	["@"] = "Fleet: type a peer session name",
 	w = "Workspace: switch (alt-tab order)",
 	W = "Workspace: new",

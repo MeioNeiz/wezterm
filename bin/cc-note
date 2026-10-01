@@ -14,6 +14,9 @@ readonly LOCK="$FLEET/.lock"
 # Past this many rows, ended sessions are swept; a sweep costs a roster.
 readonly SWEEP_AT=200
 readonly LOG_KEEP=200
+# cc-handover carries show's output, so this is what a successor inherits: 5 lost a
+# handover's FIRST step and first TODO
+readonly SHOW_LOG=20
 
 usage() {
 	cat <<'USAGE'
@@ -228,7 +231,7 @@ cmd_show() {
 	fi
 	[[ $F_FLAGS != "-" ]] && printf '  flags     %s\n' "$F_FLAGS"
 	local logs
-	logs=$(cmd_log "$sid" --tail 5)
+	logs=$(cmd_log "$sid" --tail "$SHOW_LOG")
 	[[ -n $logs ]] && printf '  log\n%s\n' "$(printf '%s\n' "$logs" | sed 's/^/    /')"
 	return 0
 }

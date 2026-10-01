@@ -18,12 +18,13 @@ told apart by **what carries them**, not by hue:
 | cc-fleet, LEADER+; picker | state glyph | name column |
 | window status bar | - | the workspace name, from the focused pane |
 
-**Status is a dot.** Only asking and fresh get a shape of their own (`?`, `✓`); everything
+**Status is a dot.** Only asking and unread get a shape of their own (`?`, `✓`); everything
 else is the same `●` in a different colour. Giving each state its own glyph was tried and it
 looked like punctuation - a tab of four panes has to read as one row, and that only happens
 when the shape is constant and the colour varies. The bar, `cc-board` and its strip all
-use the one alphabet; the board adds `›` for a shell pane, which the bar never sees. Fresh
-ages out at 90s in both (`FRESH_SECONDS`, `FRESH_SECS`), and waiting is `#ffd7af` against
+use the one alphabet; the board adds `›` for a shell pane, which the bar never sees. `✓`
+stays until you focus the pane, in whatever colour its state has reached: yellow while
+fresh, peach while the prompt cache is warm, grey once it is cold. Fresh ages out at 90s in both (`FRESH_SECONDS`, `FRESH_SECS`), and waiting is `#ffd7af` against
 fresh's `#f9e2af`, so copying the glyphs without the hues would leave `✓` and `●` both yellow.
 
 ### colouring the inside of a pane

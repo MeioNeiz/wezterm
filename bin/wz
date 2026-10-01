@@ -480,7 +480,8 @@ osa_quote() {
 }
 
 # WezTerm is not registered with Notification Centre, so its toasts show nothing and a
-# script cannot tell. The toast is still raised; the sound is what carries the message.
+# script cannot tell. On macOS osascript is the route that shows (as Script Editor;
+# Jacob confirmed 2026-09-26); the wezterm toast is for elsewhere.
 cmd_notify() {
 	local sound=true speak=false
 	while (($#)); do
@@ -498,11 +499,11 @@ cmd_notify() {
 	shift
 	(($#)) && body=$*
 
-	if wezterm cli list --format json >/dev/null 2>&1; then
-		queue_action toast "$title" "$body"
-	elif [[ $OSTYPE == darwin* ]]; then
+	if [[ $OSTYPE == darwin* ]]; then
 		osascript -e "display notification \"$(osa_quote "$body")\" \
 			with title \"$(osa_quote "$title")\"" 2>/dev/null
+	elif wezterm cli list --format json >/dev/null 2>&1; then
+		queue_action toast "$title" "$body"
 	else
 		notify-send -- "$title" "$body" 2>/dev/null
 	fi

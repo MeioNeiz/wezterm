@@ -24,6 +24,11 @@ cc-spawn - start a Claude session in a new pane, with a task
   --tab | --window   a new tab in the same window, or a new window
   --shell            a plain shell rather than Claude, for a pane to watch things in
   --ask              leave permission prompts on (default: bypassed)
+  --effort <level>   low | medium | high | xhigh | max (default: settings, xhigh). Pick it
+                     from the brief: low for a lookup, a verifier or a standby, the
+                     default for real work. Effort is per session, so this is the only
+                     moment it can be chosen
+  --model <model>    opus, sonnet, fable or a full id (default: settings)
   --worktree[=<name>]  give the session its own git worktree, so it cannot collide with
                      whatever else is working in that repo. Claude Code makes it at
                      <repo>/.claude/worktrees/<name> on a branch of its own; a bare
@@ -56,6 +61,8 @@ ask=false
 dry=false
 worktree=false
 wtname=""
+effort=""
+model=""
 while (($#)); do
 	case $1 in
 	--cwd) shift; cwd=${1:-}; [[ -n $cwd ]] || die "--cwd needs a directory" ;;
@@ -67,6 +74,8 @@ while (($#)); do
 	--window) where="window" ;;
 	--shell) shell=true ;;
 	--ask) ask=true ;;
+	--effort) shift; effort=${1:-} ;;
+	--model) shift; model=${1:-}; [[ -n $model ]] || die "--model needs a model" ;;
 	--worktree) worktree=true ;;
 	--worktree=*) worktree=true; wtname=${1#--worktree=} ;;
 	--dry-run) dry=true ;;
@@ -80,6 +89,10 @@ done
 
 $shell || (($#)) || die "need a prompt (or --shell)"
 $worktree && $shell && die "--worktree needs a Claude session, not --shell"
+case $effort in
+"" | low | medium | high | xhigh | max) ;;
+*) die "--effort is low, medium, high, xhigh or max" ;;
+esac
 
 pane=""
 if [[ -n $from ]]; then
@@ -117,6 +130,8 @@ else
 	# built in pieces: an empty array expansion is unbound under bash 3.2 and set -u
 	cmd=("${CLEAN_ENV[@]}" claude)
 	$ask || cmd+=(--dangerously-skip-permissions)
+	[[ -n $effort ]] && cmd+=(--effort "$effort")
+	[[ -n $model ]] && cmd+=(--model "$model")
 	if $worktree; then
 		cmd+=(--worktree)
 		[[ -n $wtname ]] && cmd+=("$wtname")
@@ -138,8 +153,9 @@ if $dry; then
 	else
 		wt=""
 		$worktree && wt=" --worktree${wtname:+ $wtname}"
-		printf '  %s claude%s%s -- <prompt, %s chars>\n' "${CLEAN_ENV[*]}" "$perm" "$wt" \
-		"${#prompt}"
+		opts="${effort:+ --effort $effort}${model:+ --model $model}"
+		printf '  %s claude%s%s%s -- <prompt, %s chars>\n' "${CLEAN_ENV[*]}" "$perm" "$opts" \
+			"$wt" "${#prompt}"
 	fi
 	exit 0
 fi

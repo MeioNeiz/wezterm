@@ -13,6 +13,9 @@ Everything here is symlinked into place, so edit the file in this repo, not the 
     bin/cc-note   <- ~/.claude/bin/cc-note     what a session says about itself
     bin/cc-spawn  <- ~/.claude/bin/cc-spawn    starts a session in a pane, cleanly
     bin/cc-handover <- ~/.claude/bin/cc-handover  moves work off a session that is full
+    bin/cc-sort   <- ~/.claude/bin/cc-sort     Kev groups panes by topic; LEADER+H ranking
+    bin/cc-handovers <- ~/.claude/bin/cc-handovers  daily digest of handovers, launchd
+    bin/cc-watch  <- ~/.claude/bin/cc-watch    Kev toasts on notable background output
     skills/fleet  <- ~/.claude/skills/fleet    the skill Claude reads to drive all of it
     statusline.sh <- ~/.claude/statusline.sh   the line at the bottom of every pane
     hooks/wezterm-pane-state.sh   <- ~/.claude/hooks/  what a pane is doing, five events
@@ -70,6 +73,10 @@ State the scripts read, none of it theirs:
   before 2026-09-04 carry no sid and are trusted rather than dropped. One pane had spent
   five hours reading as a pane to close while the session actually in it sat on a dialog
 - `~/.claude/history.jsonl`         every prompt I have sent, for the age column
+- `~/.cache/kev/asks/<sid>`         `verdict\tp\tepoch\tuuid`, the final reply judged blocked,
+  offer or done (kev-mcp `hooks/stop-asks.py`). cc-board's asks: a verdict overrules the
+  "?" rule both ways; absent means fall back. `~/.cache/kev/drift/<sid>.json` while a run
+  looks off task: "drifting?" on a working frame. Both via `read`/`-e`, no fork
 - `~/.claude/cache/fleet-rows`      cc-fleet's row cache, 8s
 - `~/.claude/session-colours`       hand-pinned hues, `<session-id>\t<hue>`, cc-colour
 
@@ -91,6 +98,11 @@ State these scripts write themselves, all of it theirs:
   and nothing else reads it. It is how the registry reaches Lua, which cannot afford a jq
   over 38 registry files on a one-second tick. The epoch is in the file because Lua has
   no stat
+- `~/.claude/cache/pane-read`       `focus\t<pane|->\t<looking>`, then
+  `pane\tleft_at\tmarked` per pane: what you have read. Written by wezterm.lua on focus
+  moves (it lives in `wezterm.GLOBAL`, this is the mirror), read by cc-board. A pane is
+  unread when its hook record is done or parked with an epoch after `left_at`, or marked
+  (LEADER+U), and is not the pane you are on. First sight is a baseline, never unread
 - `~/.claude/fleet/notes.tsv`       cc-note: `sid, at, flags, progress, status`, one line
   per annotated session. Read by the statusLine, cc-fleet and the tab bar, so every field
   is written with a `-` placeholder rather than left empty: tab is IFS whitespace and an
@@ -98,9 +110,16 @@ State these scripts write themselves, all of it theirs:
 - `~/.claude/fleet/todo/<sid>`, `~/.claude/fleet/log/<sid>`  read only on demand, never
   by anything on a timer
 - `~/.claude/fleet/handover/<name>-<stamp>.md`  the briefs cc-handover writes
+- `~/.cache/kev/cc-sort-pairs.json`  cc-sort's Kev p(same topic) per pair of session
+  descriptions, a day; `cc-sort.jsonl` its plans and rankings. `~/.cache/kev/cc-watch/`
+  cc-watch's pid, run.log and asks.jsonl. cc-handovers writes only to the vault
 
 `statusUpdatedAt` in the registry is when a session's last request finished, so it is the
-clock the prompt cache runs on (`CACHE_TTL`, an hour). A transcript's mtime looks like the
+clock the prompt cache runs on (`CACHE_TTL`, an hour, in wezterm.lua, cc-board and
+cc-fleet). Past it a stopped session is cold, and cold is what greys it everywhere: the
+tab bar, the board, the LEADER+; picker and the cc-fleet dashboard. `cc-fleet --stale`
+and `--reap` stay on hours since your last prompt, because closing a pane is a different
+question from what resuming it costs. A transcript's mtime looks like the
 same thing and is not - they get appended to long after the last exchange, and by that
 measure every session on the machine looks warm. One jq over every registry file is 5ms;
 a tail and a jq per session is half a second.
@@ -147,6 +166,9 @@ Do not go looking again.
   which looks like the missing half of the bridge below. It is not: the allowlist is OSC
   0/1/2, 9, 99, 777 and BEL, and 1337 is not on it. OSC 9 through that field is the
   supported way to raise a toast from a hook, and needs no tty.
+- **WezTerm toasts are invisible on macOS** (not registered with Notification Centre),
+  and so is OSC 9 through wezterm. `wz notify` uses osascript there, which shows as
+  Script Editor. Anything that must be seen goes through `wz notify`.
 - **`claude agents --json` is not a second source of state.** For interactive sessions it
   is the registry and nothing else: byte-identical on `status`, `waitingFor`, `name`, `cwd`
   and `pid` over three back-to-back runs, at 120-180ms against under 10ms for one jq over
@@ -235,7 +257,7 @@ Do not go looking again.
 
     CC_BOARD_SIZE=44x50 cc-board --once LCA     ROWSxCOLS, not the other way round
     cc-board --once --rows|--grid|--all
-    cc-board --tsv --all                        what the wezterm pickers read, 10 fields
+    cc-board --tsv --all                        what the wezterm pickers read, 11 fields
 
 `pane_status` is testable without the GUI, and worth testing, because it is now a
 precedence over two sources rather than a lookup: lift its block plus `digest_rows` and

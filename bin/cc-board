@@ -17,7 +17,10 @@ source "$HOME/.claude/bin/cc-colour" --lib
 readonly ROSTER_CACHE="$HOME/.claude/cache/fleet-rows"
 readonly PANE_MAP="$HOME/.claude/wezterm-sessions"
 readonly PANE_STATE="$HOME/.claude/wezterm-state"
+# What you have read, kept by wezterm.lua: see "unread" there.
+readonly PANE_READ="$HOME/.claude/cache/pane-read"
 readonly US=$'\x1f'
+# Cold is the prompt cache expiring; STALE_SECS only when there is no registry clock.
 readonly STALE_SECS=$((8 * 3600))
 # Must match FRESH_SECONDS in wezterm.lua, or the two ✓ age out apart.
 readonly FRESH_SECS=90
@@ -25,6 +28,7 @@ readonly REFRESH_SECS=6
 # Must match PARKED_* in wezterm.lua and cc-roster. A Monitor cannot outlive an hour.
 readonly PARKED_MONITOR_MAX=3600
 readonly PARKED_MAX=14400
+# Must match CACHE_TTL in wezterm.lua and cc-fleet.
 readonly CACHE_TTL=${CC_CACHE_TTL:-3600}
 # Every clock is arithmetic on NOW and TZOFF, never a date fork per row. A timestamp from
 # across a DST change reads an hour out.
@@ -88,7 +92,8 @@ cc-board - every Claude session in a workspace, on one screen
   cc-board --rows          start in rows rather than in the grid
   cc-board --once          print one frame and exit
   cc-board --watch         redraw on a loop, no keyboard
-  cc-board --tsv           ws, pane, name, state, asks, idle, pct, title, last-line, colour -
+  cc-board --tsv           ws, pane, name, state, asks, idle, pct, title, last-line, colour,
+                           cache seconds left (-1 unknown) -
                            the enriched roster, for the wezterm pickers and for scripts
 
   h j k l  move            enter  jump to it          m  mark / unmark
@@ -340,7 +345,23 @@ scan_hook_maps() {
 		# No comma can appear in a detail (error kind or tool name).
 		map_set "hk_st_$p" "${st:-idle},${at:-0},${dt}"
 	done
+	READ_HAVE=false
+	READ_FOCUS=""
+	[[ -r $PANE_READ ]] || return 0
+	READ_HAVE=true
+	# No empty field in this file, so IFS=tab is safe here.
+	while IFS=$'\t' read -r p at k; do
+		if [[ $p == focus ]]; then
+			[[ $k == 1 ]] && READ_FOCUS=$at
+			continue
+		fi
+		[[ $p =~ ^[0-9]+$ && $at =~ ^[0-9]+$ ]] || continue
+		map_set "rd_at_$p" "$at"
+		[[ $k == 1 ]] && map_set "rd_mk_$p" 1
+	done <"$PANE_READ"
 }
+READ_HAVE=false
+READ_FOCUS=""
 
 # State, and when the hook wrote it: for a working session, when it started.
 PSTATE=""
@@ -554,6 +575,12 @@ run_tails() {
 
 # The statusLine's record, for when a narrow pane clips "N% of 1M" off screen.
 readonly CTX_DIR="$HOME/.claude/cache/context"
+# Kev's verdicts, written by kev-mcp hooks: stop-asks.py per stop (blocked | offer | done),
+# drift-check.py while a run looks off task. Absent when Kev is down: nothing changes.
+readonly ASKS_DIR="$HOME/.cache/kev/asks"
+readonly DRIFT_DIR="$HOME/.cache/kev/drift"
+# % of the window (1M here) past which a finished session should hand over: 300k
+readonly HANDOVER_PCT=30
 ctx_from_cache() {
 	local i=$1 f pct _rest
 	[[ -n ${E_ID[i]:-} ]] || return 0
@@ -680,13 +707,20 @@ merge_roster() {
 	recompute_flags
 }
 
-# Asking is the hook state or a closing line ending in a question: the reason this reads
-# screens at all.
+# Asking is the hook state, else Kev's verdict on the final reply, else a closing line
+# ending in a question: the reason this reads screens at all. The "?" rule alone missed 23
+# of 28 real blocked stops and flagged 10 optional offers (jevlab stop-asks), so a verdict
+# overrules it both ways. Busy panes skip the file: the verdict is for the last stop.
 recompute_flags() {
-	local i
+	local i v
 	WAITING=0
 	for ((i = 0; i < ${#E_PANE[@]}; i++)); do
-		if [[ ${E_KIND[i]} == asking || ${E_LAST[i]} == *'?' ]]; then
+		v=""
+		if [[ ${E_KIND[i]} != busy && -n ${E_ID[i]} && -r $ASKS_DIR/${E_ID[i]} ]]; then
+			read -r v _ <"$ASKS_DIR/${E_ID[i]}" || v=""
+		fi
+		[[ ${E_PANE[i]} == [0-9]* ]] && printf -v "verd_${E_PANE[i]}" '%s' "$v"
+		if [[ ${E_KIND[i]} == asking || $v == blocked || (-z $v && ${E_LAST[i]} == *'?') ]]; then
 			E_ASKS[i]=yes
 			WAITING=$((WAITING + 1))
 		else
@@ -697,20 +731,41 @@ recompute_flags() {
 	LOADED_AT=$SECONDS
 }
 
+# Stopped, and its prompt cache has expired: picking it up now pays for the whole context.
 is_cold() {
 	local i=$1
 	[[ ${E_ASKS[i]} == yes ]] && return 1
 	[[ ${E_KIND[i]} == busy ]] && return 1
+	cache_left_of "${E_ID[i]}"
+	((CACHE_LEFT == 0)) && return 0
+	((CACHE_LEFT > 0)) && return 1
 	[[ -z ${E_IDLE[i]} ]] && return 1
 	((${E_IDLE[i]} >= 0 && ${E_IDLE[i]} < STALE_SECS)) && return 1
 	return 0
 }
 
-# Stopped within FRESH_SECS: the tab bar's ✓. DONE_AT is restored because emit_row reads it.
+# A turn that ended after you last left the pane, or one marked with LEADER+U. The pane
+# you are on is read, whatever its record says.
+is_unread() {
+	local i=$1 p=${E_PANE[i]} k
+	[[ $p == [0-9]* ]] || return 1
+	[[ ${E_ASKS[i]} == yes || ${E_KIND[i]} == busy || ${E_KIND[i]} == errored ]] && return 1
+	k="rd_mk_$p"
+	[[ -n ${!k:-} ]] && return 0
+	[[ $p == "$READ_FOCUS" ]] && return 1
+	case ${E_HKIND[i]:-} in done | parked) ;; *) return 1 ;; esac
+	k="rd_at_$p"
+	[[ ${!k:-} =~ ^[0-9]+$ ]] || return 1
+	((${E_SINCE[i]:-0} > ${!k}))
+}
+
+# Stopped within FRESH_SECS and not yet read: the tab bar's yellow ✓. DONE_AT is restored
+# because emit_row reads it.
 is_fresh() {
 	local i=$1 keep=$DONE_AT rc=1
 	[[ ${E_ASKS[i]} == yes ]] && return 1
 	[[ ${E_KIND[i]} == busy ]] && return 1
+	$READ_HAVE && ! is_unread "$i" && return 1
 	done_at "$i"
 	((DONE_AT > 0 && NOW - DONE_AT < FRESH_SECS)) && rc=0
 	DONE_AT=$keep
@@ -1166,7 +1221,7 @@ group_heading() {
 }
 
 # The tab bar's alphabet: a dot coloured by state, with a shape only for ! errored,
-# ? asking and ✓ just finished. › is a shell, which the bar never shows.
+# ? asking and ✓ unread (yellow while fresh). › is a shell, which the bar never shows.
 GLYPH=""
 COLOUR=""
 STATE=""
@@ -1201,6 +1256,8 @@ style_of() {
 		GLYPH="●"
 		COLOUR=$AMBER
 	fi
+	[[ $STATE == cold || $STATE == waiting ]] && is_unread "$i" && GLYPH="✓"
+	return 0
 }
 
 # ---------------------------------------------------------------- header
@@ -1358,6 +1415,22 @@ row_label() {
 	fi
 }
 
+# Kev's flags lead the label in rows, since the row has no spare column: drifting (a run
+# that looks off task) and hand over (big, finished or only offering, not blocked).
+FLAG=""
+flag_of() {
+	local i=$1 verdkey="verd_${E_PANE[i]}"
+	FLAG=""
+	if [[ ${E_KIND[i]} == busy ]]; then
+		[[ -n ${E_ID[i]} && -e $DRIFT_DIR/${E_ID[i]}.json ]] && FLAG="drifting?"
+	elif [[ ${E_KIND[i]} == idle && ${E_PCT[i]:-0} =~ ^[0-9]+$ ]] && ((E_PCT[i] >= HANDOVER_PCT)); then
+		case ${!verdkey:-} in
+		done | offer) FLAG="hand over?" ;;
+		esac
+	fi
+	return 0
+}
+
 BODY=()
 push() { BODY[${#BODY[@]}]=$1; }
 
@@ -1386,6 +1459,8 @@ emit_row() {
 	set_age "${E_IDLE[i]}"
 	meta=$AGE
 	row_label "$i"
+	flag_of "$i"
+	[[ -n $FLAG ]] && ROWLABEL="${FLAG} · ${ROWLABEL}"
 	labelcol=$TEXT
 	[[ $STATE == cold ]] && labelcol=$FAINT
 	[[ $STATE == cold && -n $bg ]] && labelcol=$DIM
@@ -1485,6 +1560,13 @@ emit_expansion() {
 			set_age $((NOW - E_SINCE[i]))
 			seg=" · working ${AGE}"
 		fi
+		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
+	fi
+	# Big and at a natural break (Kev: finished or only offering, not blocked): the moment to
+	# hand over (LEADER+H). Donors used to go at a median 332k after 80 calls above 300k.
+	flag_of "$i"
+	if [[ -n $FLAG ]]; then
+		seg=" · ${FLAG}"
 		((${#meta} + ${#seg} <= w)) && meta="${meta}${seg}"
 	fi
 	done_at "$i"
@@ -1733,7 +1815,8 @@ build_grid() {
 				l1+="${CTXBAR}${bg}${DIM} "
 				pad_to "${E_PCT[i]:+${E_PCT[i]}%}" 4
 				l1+="${PAD} ${COLOUR}"
-				pad_to "${E_TITLE[i]}" "$topic_w"
+				flag_of "$i"
+				pad_to "${FLAG:+${FLAG} · }${E_TITLE[i]}" "$topic_w"
 				l1+="${PAD}${RESET}"
 
 				if [[ -z ${E_LAST[i]} ]]; then
@@ -1818,8 +1901,9 @@ HELPKEYS=(
 )
 
 HELPNOTES=(
-	"! errored · ? waiting on you · ✓ just finished"
-	"● green working, amber stopped, grey cold"
+	"! errored · ? waiting on you · ✓ unread: focus reads it, LEADER+U marks it again"
+	"hand over? big (30%+) and finished: LEADER+H hands it to a fresh session"
+	"● green working, amber stopped, grey cold: an hour since its last reply"
 	"the bar is context used, amber past half, red past 80%"
 	"• its prompt cache is still warm, so picking it up costs nothing"
 	"x closes a pane; the chat survives, claude --resume brings it back"
@@ -1908,9 +1992,11 @@ if [[ $mode == tsv ]]; then
 		# No name yet (still in its grace period), and the pickers key on the name.
 		[[ -n ${E_NAME[i]} ]] || continue
 		id_colour "${E_ID[i]}"
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		cache_left_of "${E_ID[i]}"
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 			"${E_WS[i]}" "${E_PANE[i]}" "${E_NAME[i]}" "${E_KIND[i]}" "${E_ASKS[i]}" \
-			"${E_IDLE[i]}" "${E_PCT[i]}" "${E_TITLE[i]}" "${E_LAST[i]}" "#${IDC_HEX}"
+			"${E_IDLE[i]}" "${E_PCT[i]}" "${E_TITLE[i]}" "${E_LAST[i]}" "#${IDC_HEX}" \
+			"$CACHE_LEFT"
 	done
 	exit 0
 fi

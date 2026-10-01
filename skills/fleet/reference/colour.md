@@ -7,17 +7,17 @@ and a mis-description sends him to the wrong pane.
 ## Status is a dot
 
 `●` in the state's colour, one per pane, with `?` for blocked on a prompt and `✓` for
-just finished. Mauve anywhere a pane needs an answer. The tab bar, `cc-board` and its
+a reply you have not read (focusing the pane reads it, LEADER+U marks it unread again). Mauve anywhere a pane needs an answer. The tab bar, `cc-board` and its
 strip all use the one alphabet; the board adds `›` for a shell pane, which the bar never
 shows.
 
 | state | colour | means |
 |---|---|---|
 | asking / waiting | `#cba6f7` mauve | stopped, wants an answer |
-| fresh | `#f9e2af` yellow | finished in the last 90s |
-| waiting | `#ffd7af` peach | stopped, no longer fresh |
+| fresh | `#f9e2af` yellow | finished in the last 90s, unread |
+| waiting | `#ffd7af` peach | stopped, prompt cache still warm |
 | working | `#a6e3a1` green | busy, needs nothing |
-| stale | `#6c7086` grey | hours old, or the session has exited |
+| stale | `#6c7086` grey | cache cold (an hour since its reply), or exited |
 
 Fresh ages out at 90 seconds (`FRESH_SECONDS`, `FRESH_SECS`), and waiting's `#ffd7af`
 sits next to fresh's `#f9e2af`, so copying the glyphs without the hues would leave `✓`
