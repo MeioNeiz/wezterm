@@ -1,6 +1,6 @@
 ---
 name: fleet
-description: See and drive the live Claude Code sessions and wezterm panes on this machine, and move work between them. Use for what is running, what needs attention, what a session is doing, which chats are stale, jumping to / closing / regrouping panes; for handing work from a full session to a fresh one ("hand this over", "running out of context", "fresh agent", "pick up where X left off"); for starting a session on a task; for recording what a session is waiting on; and for waiting on or watching a pane.
+description: See and drive the live Claude Code sessions and wezterm panes on this machine, and move work between them. Use for what is running, what needs attention, what a session is doing, which chats are stale, jumping to / closing / regrouping panes; for handing work from a full session to a fresh one ("hand this over", "running out of context", "fresh agent", "pick up where X left off"); for starting a session on a task; for recording what a session is waiting on; for which claude.ai account a session is on, or moving one to the other; and for waiting on or watching a pane.
 ---
 
 # The fleet
@@ -85,6 +85,7 @@ cc-handover .tab --new --window    # the whole tab's work continuing in one sess
 cc-handover --why 'context full' --new
 cc-handover                        # print the brief, spawn nothing
 cc-handover --to 7                 # paste into an open pane, unsent
+cc-handover d5-lca-48 --fork       # a full copy beside it, source untouched; warm only
 cc-handover --new --dry-run        # show the command, run nothing
 ```
 
@@ -105,13 +106,15 @@ says which applies (also on stderr): warm keeps a `claude --resume` line, cold s
 a resume would cost and that the brief replaces it, and `--to` refuses an idle cold
 target. Sessions never talk to each other to hand over: no asking one to summarise its
 work for a successor. The brief, the transcript, its background tasks' output files and
-`wz read <pane> -n 200` on its scrollback are the handover.
+the screen saved beside the brief are the handover; the source's pane is usually closed
+by then, so read that file, not the pane.
 
 `.tab` is the same target grammar as `.`, and it means every *other* live session on this
 pane's tab, in wezterm's own left-to-right order, skipping panes holding no session. It
 exists because "hand me the rest of this tab" otherwise takes three calls and a join.
 Jacob's key for it is LEADER+G; a gather leaves `!ccx` typed in the receiver, and Enter on
-it closes the sources that have stopped.
+it closes the sources that have stopped. A plain `--new` closes its source itself, once the
+new session is on the brief and the source has stopped: don't close it yourself.
 
 **A bare word in a cc-spawn argument list ends the options** and the rest becomes the
 prompt, `--dry-run` included. Flags only, before the prompt.
@@ -131,7 +134,21 @@ cc-spawn --ask '...'               # leave permission prompts on
 cc-spawn --worktree=auth-guard '...'    # its own checkout, its own branch
 cc-spawn --dry-run '...'
 cc-spawn --effort low 'verify the email draft at ... against docs/...'
+cc-spawn --account personal '...'  # the other claude.ai login (default: the folder's)
 ```
+
+**Two accounts, chosen by folder.** `~/.claude/accounts` maps folders to a claude.ai
+login (cc-account); a session keeps the one it started on and its statusLine names it.
+`cc-account switch [T]` moves a session to the other one once its turn ends, resumed in
+place, whole conversation, first reply at full price (refused cold); `cc-handover --new
+--account <name>` when it is big. Never `/login` to change account: it moves every session
+on that login. Signing a folder in is Jacob's: `! cc-account login <name>`.
+
+**Claude panes go side by side, not stacked.** A session reads down: its output, diffs
+and scrollback want height, and width past ~100 columns is wasted. So split `--right`
+(the default) and share the width; to add one more to a column, split it `--right` again
+rather than `--bottom`. Only stack when the panes would otherwise drop under ~80 columns,
+and then prefer a new `--tab`. A `--shell` pane watching a log is the exception.
 
 **Choose `--effort` when you write the brief.** Effort is per session, so spawn time is
 the only moment it can be set; the default is xhigh. `low` for a lookup, a verifier, a

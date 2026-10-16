@@ -25,7 +25,9 @@ sid=$(printf '%s' "$payload" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[0
 	head -1 | sed 's/^.*:[[:space:]]*"//; s/"$//')
 [ -n "$sid" ] || exit 0
 
-printf '%s\n' "$sid" >"$dir/$WEZTERM_PANE" 2>/dev/null
+# temp + mv: wezterm reads this every second, and `>` empties it before the write
+printf '%s\n' "$sid" >"$dir/.$WEZTERM_PANE.$$" 2>/dev/null &&
+	mv -f "$dir/.$WEZTERM_PANE.$$" "$dir/$WEZTERM_PANE" 2>/dev/null
 
 # The pane's last state record belongs to whoever was here before, and nothing rewrites
 # it until the first prompt. Readers drop it on sid anyway; clearing it here makes the

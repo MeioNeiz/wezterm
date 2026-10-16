@@ -98,8 +98,9 @@ three panes:
   `window_frame.font` at `window_frame.font_size`, Roboto Bold 12 by default on macOS,
   against a JetBrains Mono 14 terminal. Every width was counted in one unit and spent in
   the other, so the bar was about a fifth wider than the arithmetic believed. `FRAME_CELLS`
-  converts, out of the two point sizes and the two advance widths, shaded by
-  `FRAME_MARGIN` because a proportional font has no exact answer. The frame font is now
+  converted, out of the two point sizes and the two advance widths, shaded by
+  `FRAME_MARGIN` because a proportional font has no exact answer. (Since replaced by exact
+  measurement, below.) The frame font is now
   pinned rather than left to the default, so a wezterm upgrade cannot move the constant's
   premise. Point it at a monospace font and both factors become 1.0.
 - **a flat share cannot give space back.** `Call patching process` was handed the same 33
@@ -134,3 +135,44 @@ What is still not solved: ten tabs in a 111 column window cannot show topics at 
 the honest answer, and identity is carried by the pane tint instead. Nor can anything here
 buy a split tab more than its ninth of a nine-tab bar; that one is wezterm's rule, and the
 levers on it are the frame font size, the retro bar, or fewer tabs.
+
+## measured, not estimated (2026-10)
+
+A 13-tab, 29-pane window (jol, 211 columns) showed the whole right half of the bar empty
+and most tabs as bare dots. Every estimate above erred safe, and together they spent about
+40% of each tab: the ceiling was computed off a bar shortened by the window buttons,
+`PREFIX_CELLS` priced " 13: " at 5 Roboto letters when it draws as 3, and `FRAME_MARGIN`
+took another tenth.
+
+Now the fancy bar is measured in the unit it draws in. `frame.width` sums Roboto Bold's
+hmtx advances (wezterm's bundled copy, ASCII 32..126, 1/2048 em; anything else is
+JetBrains Mono's 0.6 em fallback), `frame.units` turns `get_dimensions()` pixels into the
+same unit, and `frame.fit` cuts a label to a budget in it. The prediction matched a
+screenshot to 2px. The retro bar runs the same code with every width 1.
+
+Three things that measurement turned up:
+
+- **`max_width` is the border box.** `box_model.rs` takes padding and border out of
+  `elem.max_width` before laying out text, so the text cap is the 1.5 cells *and* the
+  padding short of `pixel_width / num_tabs`. Measured where wezterm cut the text: 192px of
+  a 257px share at 2x, so `tab_ceiling` takes 3 cells, and `TAB_CHROME` is 1.4 cells
+  (30px a tab measured, wider than "@" would make it). Overshoot shows as a label that
+  ends without its "…".
+- **the right status is in the frame font too**, so `reserve` is `frame.width` of it. The
+  heartbeat's NBSP is priced as a space, or every label would reflow each second.
+- **a window's shared words are noise.** Half of jol's topics began "Meiolol" and a third
+  ended "handover", which at a dozen letters a pane was most of every label.
+  `shared_words` drops any word in at least 3 topics and a quarter of them (not stop
+  words), keeping a topic whole when nothing else would be left. The pane's statusLine
+  still has every word.
+
+Fancy prefixes lost their blanks and colon (`5 ●✓`, not ` 5: ●✓ `), since the tab's
+padding already separates them. A split whose labels would get under 8 letters with the
+dot (`SPLIT_LABEL`) draws its dots plus the neediest pane's topic, because "●● CPU, GPU
+and h…" says more than "● CP… │ ● we…". `frame.fit` keeps a word boundary only if it
+costs under a tenth of the budget.
+
+What it bought on jol: from dots or 5 letters a tab to 9 to 14 letters of topic, and
+nothing clipped. The
+right third stays empty because of wezterm's per-tab ceiling, which no labelling can
+reach; the levers on that are unchanged (frame font size, retro bar, fewer tabs).

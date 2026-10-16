@@ -5,6 +5,7 @@
 # pane is "-" when no wezterm pane holds the session; detail is empty unless blocked.
 
 set -u
+wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
 # The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
 PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
@@ -18,6 +19,11 @@ readonly DIGEST="$HOME/.claude/cache/fleet-digest"
 readonly REAP_STAMP="$HOME/.claude/cache/reap-stamp"
 readonly REAP_EVERY=3600
 readonly REAP_CACHES="$HOME/.claude/cache/titles $HOME/.claude/cache/context"
+# cc-handover's output: a source's screen matters only while its successor starts; a
+# brief until cc-handovers has written its day into handover-days, kept for a re-read
+readonly HANDOVER="$HOME/.claude/fleet/handover"
+readonly HANDOVER_SCREEN_DAYS=3
+readonly HANDOVER_BRIEF_DAYS=14
 # file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
 if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
@@ -166,17 +172,42 @@ all | row)
 *) : >"$work/states" ;;
 esac
 
+# A usage limit death resumes itself at the reset, so it reads as parked until then plus
+# RESUME_GRACE (wezterm.lua's rate.resume_at, which this must match). One file per account
+# (cc-account) and the record does not say whose: each reset is offered, the earliest that
+# fits wins. Only read when a record needs it: a label costs a date fork
+rl_resets=""
+if grep -q $'\terrored\t[0-9]*\trate_limit\t' "$work/states" 2>/dev/null; then
+	for f in "$HOME"/.claude/cache/rate-limits "$HOME"/.claude/cache/rate-limits-*; do
+		[[ ${f##*/} == *.* ]] && continue
+		IFS=$'\t' read -r _ p5 r5 p7 r7 _ <"$f" 2>/dev/null || continue
+		rl_at=0
+		if [[ $p7 =~ ^[0-9]+$ && $r7 =~ ^[0-9]+$ ]] && ((p7 >= 100)); then
+			rl_at=$r7 rl_span=$((7 * 86400))
+		elif [[ $r5 =~ ^[0-9]+$ ]]; then
+			rl_at=$r5 rl_span=$((5 * 3600))
+		fi
+		((rl_at > 0)) || continue
+		rl_label=$(date -r "$rl_at" '+%H:%M' 2>/dev/null || date -d "@$rl_at" '+%H:%M')
+		rl_resets+="$rl_at $rl_span $rl_label "
+	done
+fi
+
 # A hook record wins while it is newer than the registry: nothing fires when a prompt
 # is answered. An idle registry never overrules errored or parked, since idle is what
 # both look like from outside. Hook stamps seconds, registry ms: +1 so a same-second
 # hook wins the tie. parked reports as busy: the turn is over, its background work is not.
 # The registry's shell (turn over, a background shell running) is level-triggered and
-# passes through: it is the better word for what parked guesses at. asking is only ever
+# passes through: it is the better word for what parked guesses at, so an idle registry
+# newer than a parked shell (the Monitor tool's too) says it ended. asking is only ever
 # honoured while newer, so an Esc on a dialog, which fires no Stop, cannot strand it.
 awk -F'\t' -v OFS='\t' -v panefile="$work/panes" \
-	-v statefile="$work/states" -v pidfile="$work/pids" -v aliases="$aliases" '
+	-v statefile="$work/states" -v pidfile="$work/pids" -v aliases="$aliases" \
+	-v rl_resets="$rl_resets" '
 BEGIN {
 	srand(); now = srand()
+	# at, span, label per account
+	nrl = split(rl_resets, rl, " ")
 	while ((getline line < pidfile) > 0) alive[line + 0] = 1
 	while ((getline line < panefile) > 0) {
 		if (split(line, f, "\t") < 2) continue
@@ -188,9 +219,19 @@ BEGIN {
 		hook_state[f[1]] = f[2]; hook_at[f[1]] = f[3]; hook_detail[f[1]] = f[4]
 		# parked has no writer when the background work ends, so it expires (CLAUDE.md):
 		# the most each kind can live. Must match PARKED_* in wezterm.lua and cc-board.
-		cap = (f[4] == "monitor") ? 1800 : (f[4] == "shell" ? 7200 : 14400)
+		cap = (f[4] == "monitor") ? 1800 : 14400
 		if (f[2] == "parked" && now - f[3] > cap)
 			hook_state[f[1]] = "done"
+		if (f[2] == "errored" && f[4] == "rate_limit") {
+			best = 0
+			for (i = 1; i + 2 <= nrl; i += 3)
+				if (rl[i] + 0 > f[3] + 0 && rl[i] <= f[3] + rl[i + 1] && now <= rl[i] + 300 \
+					&& (best == 0 || rl[i] + 0 < rl[best] + 0))
+					best = i
+			if (best) {
+				hook_state[f[1]] = "parked"; hook_detail[f[1]] = "resumes " rl[best + 2]
+			}
+		}
 		# No sid on records older than the stamp: trusted rather than dropped.
 		hook_sid[f[1]] = (n >= 5) ? f[5] : ""
 	}
@@ -207,8 +248,10 @@ BEGIN {
 		if ((hs == "asking" && newer) || (hs == "errored" && (newer || quiet))) {
 			status = hs
 			if (hook_detail[pn] != "") detail = hook_detail[pn]
-		} else if (hs == "parked" && status != "shell" && (newer || status == "idle")) {
+		} else if (hs == "parked" && status != "shell" \
+			&& (newer || (status == "idle" && hook_detail[pn] != "shell"))) {
 			status = "busy"
+			if (hook_detail[pn] ~ /^resumes /) detail = hook_detail[pn]
 		}
 	}
 	if (aliases) print sid, name, status, detail, pn, cwd, pid, seen, started, former
@@ -235,7 +278,9 @@ rc=$?
 # Hourly, from the digest: state and map files for panes wezterm no longer has, and the
 # same for live panes still naming a session the registry has never heard of a day on
 # (pane ids restart at 0 with the GUI, so an old pair can sit on a new pane). Per-session
-# caches a week after the session is gone. Never the registry or notes.tsv.
+# caches a week after the session is gone. cc-handover's briefs and screens once old;
+# only its own names, never a brief a session wrote there by hand. Never the registry or
+# notes.tsv.
 reap() {
 	local now at live f p sid k
 	now=$(date +%s)
@@ -245,8 +290,11 @@ reap() {
 	fi
 	mkdir -p "${REAP_STAMP%/*}" 2>/dev/null
 	touch "$REAP_STAMP"
+	# A new Claude Code: its enum values against the last version's, one toast if any
+	# moved. Detached, and a readlink and a stat when nothing has changed
+	"$HOME/.claude/bin/cc-doctor" --enums --notify </dev/null >/dev/null 2>&1 &
 	# No answer from wezterm is not "no panes": skip rather than reap the lot.
-	live=$(wezterm cli list --format json 2>/dev/null | jq -r '.[].pane_id' 2>/dev/null)
+	live=$(wzcli list --format json 2>/dev/null | jq -r '.[].pane_id' 2>/dev/null)
 	[[ -n $live ]] || return 0
 	for p in $live; do printf -v "lp_$p" 1; done
 	while IFS=$'\t' read -r sid _; do
@@ -272,6 +320,10 @@ reap() {
 		k="rs_${sid//-/_}"
 		[[ -n ${!k:-} ]] || rm -f "$f"
 	done
+	find "$HANDOVER" -maxdepth 1 -type f \( \
+		-name '*.scrollback.txt' -mtime "+$HANDOVER_SCREEN_DAYS" -o \
+		-name '*-20[0-9][0-9][01][0-9][0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9]*.md' \
+		-mtime "+$HANDOVER_BRIEF_DAYS" \) -delete 2>/dev/null
 	return 0
 }
 

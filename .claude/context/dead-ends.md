@@ -3,11 +3,17 @@
 Each was tried and measured on this machine. Do not go looking again without new evidence
 (a new wezterm or Claude Code version that says otherwise).
 
-- **OSC 1337 `SetUserVar` does nothing on this build** (wezterm 20260803). No
-  `user-var-changed` fires and `pane:get_user_vars()` stays empty, inside the pane and from
-  outside, either terminator. The byte path is fine (`OSC 0` down the same tty lands in
-  `cli list`), so the sequence is unhandled. The working CLI -> Lua bridge is a file the
-  `update-status` handler drains each second (`fleet/actions.d/`)
+- **OSC 1337 `SetUserVar` fires its event only for the pane on screen** (wezterm 20260803,
+  re-measured 2026-10-05 on the live GUI). `user-var-changed` fired for the focused pane,
+  not for two in other workspaces (a visible unfocused pane: untested);
+  `get_user_vars()` held the values for every pane, on screen or not.
+  The 4 September test wrote to panes that were not on screen and called it dead. So it
+  cannot carry an action or a hook's state to Lua for a pane in another tab or workspace,
+  and reading it per pane is a mux call each, no cheaper than the memoised state file.
+  What it does do: `wz` pokes the focused pane's tty with it (`wz_poke`) so the GUI drains
+  `fleet/actions.d/` at once, the file staying the channel. Test: a logging
+  `user-var-changed` handler, then `printf '\033]1337;SetUserVar=%s=%s\007' k "$(printf
+  v | base64)" > /dev/ttysNNN`; the value must be base64, or it is dropped silently
 - **`terminalSequence` will not rescue OSC 1337 either.** A hook can return it and have it
   written with no tty, but the allowlist is OSC 0/1/2, 9, 99, 777 and BEL. OSC 9 through it
   is the supported toast from a hook

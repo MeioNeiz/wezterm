@@ -4,6 +4,9 @@
 # transcript (see docs/tools.md). Permissions are bypassed unless --ask.
 
 set -u
+wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
+# shellcheck source=/dev/null
+source "$HOME/.claude/bin/cc-account" --lib
 
 # Cleared, not filtered: the session a human would have started from a plain shell.
 # TERM_PROGRAM=kitty as in the zsh alias: as WezTerm, claude wraps frames in synchronized
@@ -20,6 +23,7 @@ usage() {
 cc-spawn - start a Claude session in a new pane, with a task
 
   cc-spawn [options] <prompt...>
+  cc-spawn [options] --fork <session> [prompt...]
 
   --cwd <dir>        where it runs (default: this pane's directory)
   --from <target>    the pane to split from (default: this one)
@@ -32,14 +36,26 @@ cc-spawn - start a Claude session in a new pane, with a task
                      default for real work. Effort is per session, so this is the only
                      moment it can be chosen
   --model <model>    opus, sonnet, fable or a full id (default: settings)
+  --account <name>   the claude.ai account it runs on (default: the one --cwd's folder
+                     gets in ~/.claude/accounts; cc-account)
   --worktree[=<name>]  give the session its own git worktree, so it cannot collide with
                      whatever else is working in that repo. Claude Code makes it at
                      <repo>/.claude/worktrees/<name> on a branch of its own; a bare
                      --worktree lets it pick the name
+  --fork <session>   a copy of a session, its whole conversation, in a new pane; the
+                     source carries on untouched. Only for a warm one: forking a cold
+                     session pays for its whole context again (cc-handover --fork checks)
+  --resume <session> carry on that session itself, same id. Never while it is open
+                     elsewhere: both would write one transcript (--replace closes it)
+  --replace <pane>   start in that pane's place: split from it, close it, and start once
+                     the claude in it has exited. How cc-account switch moves a session
+  --print-sid        print the new session's id after the pane id, tab-separated
   --dry-run          print what it would run
 
-Prints the new pane id. The environment is cleaned first, which is the whole point:
-without it the new session inherits CLAUDE_CODE_CHILD_SESSION and saves no transcript.
+Prints the new pane id. The session id is chosen here and passed as --session-id, so it
+is known before the session has started. The environment is cleaned first, which is the
+whole point: without it the new session inherits CLAUDE_CODE_CHILD_SESSION and saves no
+transcript.
 
   cc-spawn --cwd ~/work/api 'read src/auth.ts and list every path that skips the guard'
   cc-spawn --tab --cwd ~/work/api 'run the failing test and tell me why it fails'
@@ -66,6 +82,11 @@ worktree=false
 wtname=""
 effort=""
 model=""
+fork=""
+resume=""
+replace=""
+account=""
+print_sid=false
 while (($#)); do
 	case $1 in
 	--cwd) shift; cwd=${1:-}; [[ -n $cwd ]] || die "--cwd needs a directory" ;;
@@ -81,6 +102,11 @@ while (($#)); do
 	--model) shift; model=${1:-}; [[ -n $model ]] || die "--model needs a model" ;;
 	--worktree) worktree=true ;;
 	--worktree=*) worktree=true; wtname=${1#--worktree=} ;;
+	--fork) shift; fork=${1:-}; [[ -n $fork ]] || die "--fork needs a session id" ;;
+	--resume) shift; resume=${1:-}; [[ -n $resume ]] || die "--resume needs a session id" ;;
+	--replace) shift; replace=${1:-}; [[ -n $replace ]] || die "--replace needs a pane" ;;
+	--account) shift; account=${1:-}; [[ -n $account ]] || die "--account needs a name" ;;
+	--print-sid) print_sid=true ;;
 	--dry-run) dry=true ;;
 	-h | --help) usage; exit 0 ;;
 	--) shift; break ;;
@@ -94,10 +120,19 @@ case $effort in
 "" | low | medium | high | xhigh | max) ;;
 *) die "--effort is low, medium, high, xhigh or max, not \"$effort\"" ;;
 esac
-$shell || (($#)) || die "need a prompt (or --shell)"
+$shell || [[ -n $fork$resume ]] || (($#)) || die "need a prompt (or --shell)"
+[[ -n $fork && -n $resume ]] && die "--fork or --resume, not both"
+[[ -n $resume ]] && $shell && die "--resume needs a Claude session, not --shell"
+[[ -z $resume || $resume =~ ^[0-9a-f-]{36}$ ]] ||
+	die "--resume needs a full session id, not \"$resume\""
 $worktree && $shell && die "--worktree needs a Claude session, not --shell"
+[[ -n $fork ]] && $shell && die "--fork needs a Claude session, not --shell"
+[[ -z $fork || $fork =~ ^[0-9a-f-]{36}$ ]] ||
+	die "--fork needs a full session id, not \"$fork\""
 
 pane=""
+# --replace splits from the pane it replaces
+[[ -n $replace ]] && from=$replace
 if [[ -n $from ]]; then
 	case $from in
 	*[!0-9]*) pane=$(cc-roster --pane "$from") ;;
@@ -110,7 +145,7 @@ fi
 
 if [[ -z $cwd ]]; then
 	if [[ -n $pane ]]; then
-		cwd=$(wezterm cli list --format json 2>/dev/null |
+		cwd=$(wzcli list --format json 2>/dev/null |
 			jq -r --arg p "$pane" '.[] | select(.pane_id == ($p | tonumber))
 				| .cwd // "" | sub("^file://[^/]*"; "")' 2>/dev/null | head -1)
 	fi
@@ -123,25 +158,61 @@ if $worktree && ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
 	die "--worktree needs a git repo, and $cwd is not in one"
 fi
 
+# Explicit or by folder, always set: a session spawned from another inherits its
+# CLAUDE_CONFIG_DIR, which is the other account's whenever the folders differ
+acct_load
+acct_env_args=()
+if [[ -n $ACCT_NAMES ]]; then
+	if [[ -z $account ]]; then
+		acct_for "$cwd"
+		account=$ACCT
+	fi
+	acct_env "$account" || die "no account \"$account\" in $ACCT_FILE"
+	acct_env_args=("${ACCT_ENV[@]}")
+elif [[ -n $account ]]; then
+	die "--account: no accounts set up ($ACCT_FILE, cc-account --help)"
+fi
+
 prompt="$*"
+sid=""
+if [[ -n $resume ]]; then
+	sid=$resume
+else
+	$shell || sid=$(uuidgen | tr 'A-F' 'a-f')
+fi
 perm=" --dangerously-skip-permissions"
-$ask && perm=""
+$ask && perm=" --permission-mode default"
 
 if $shell; then
 	cmd=("$SHELL")
 else
 	# built in pieces: an empty array expansion is unbound under bash 3.2 and set -u
-	cmd=("${CLEAN_ENV[@]}" claude)
-	$ask || cmd+=(--dangerously-skip-permissions)
+	# env takes no option after an assignment, so the unset goes in front of CLEAN_ENV's
+	if ((${#acct_env_args[@]})); then
+		cmd=(env -u CLAUDE_CONFIG_DIR "${CLEAN_ENV[@]:1}")
+		[[ ${acct_env_args[0]} != -u ]] && cmd+=("${acct_env_args[@]}")
+	else
+		cmd=("${CLEAN_ENV[@]}")
+	fi
+	cmd+=(claude)
+	# with no mode named, Claude starts in auto mode, which is not prompts on
+	if $ask; then cmd+=(--permission-mode default); else cmd+=(--dangerously-skip-permissions); fi
 	[[ -n $effort ]] && cmd+=(--effort "$effort")
 	[[ -n $model ]] && cmd+=(--model "$model")
+	# a resume never restores bypass, which is why the mode above is always passed
+	if [[ -n $resume ]]; then
+		cmd+=(--resume "$resume")
+	else
+		[[ -n $fork ]] && cmd+=(--resume "$fork" --fork-session)
+		cmd+=(--session-id "$sid")
+	fi
 	if $worktree; then
 		cmd+=(--worktree)
 		[[ -n $wtname ]] && cmd+=("$wtname")
 	fi
 	# --worktree takes an optional value and would swallow a bare prompt as its name;
 	# -- also keeps a prompt that opens with a dash from reading as a flag.
-	cmd+=(-- "$prompt")
+	[[ -n $prompt ]] && cmd+=(-- "$prompt")
 fi
 
 if [[ $where != window ]]; then
@@ -149,25 +220,48 @@ if [[ $where != window ]]; then
 		die "no pane to split from (run this inside wezterm, or pass --from, or --window)"
 fi
 
+# --replace: the new pane waits for the old claude to exit, or the two would share a
+# transcript for a moment. The pane is killed below, once the new one exists
+if [[ -n $replace ]]; then
+	old_pid=$(cc-roster --row "$pane" 2>/dev/null | cut -f7)
+	if [[ $old_pid =~ ^[0-9]+$ ]]; then
+		cmd=(/bin/sh -c 'while kill -0 "$0" 2>/dev/null; do sleep 0.2; done; exec "$@"' \
+			"$old_pid" "${cmd[@]}")
+	fi
+fi
+
 if $dry; then
-	printf 'would spawn %s in %s\n' "$where" "$cwd"
+	printf 'would spawn %s in %s%s\n' "$where" "$cwd" "${replace:+, closing pane $pane}"
 	if $shell; then
 		printf '  %s\n' "$SHELL"
 	else
 		wt=""
 		$worktree && wt=" --worktree${wtname:+ $wtname}"
 		opts="${effort:+ --effort $effort}${model:+ --model $model}"
-		printf '  %s claude%s%s%s -- <prompt, %s chars>\n' "${CLEAN_ENV[*]}" "$perm" "$opts" \
-			"$wt" "${#prompt}"
+		if [[ -n $resume ]]; then
+			opts+=" --resume $resume"
+		else
+			opts+="${fork:+ --resume $fork --fork-session} --session-id $sid"
+		fi
+		launch="${cmd[*]}"
+		printf '  %s claude%s%s%s -- <prompt, %s chars>\n' "${launch%% claude *}" "$perm" \
+			"$opts" "$wt" "${#prompt}"
 	fi
 	exit 0
 fi
 
 case $where in
-tab) new=$(wezterm cli spawn --pane-id "$pane" --cwd "$cwd" -- "${cmd[@]}") ;;
-window) new=$(wezterm cli spawn --new-window --cwd "$cwd" -- "${cmd[@]}") ;;
-*) new=$(wezterm cli split-pane --pane-id "$pane" "$where" --cwd "$cwd" -- "${cmd[@]}") ;;
+tab) new=$(wzcli spawn --pane-id "$pane" --cwd "$cwd" -- "${cmd[@]}") ;;
+window) new=$(wzcli spawn --new-window --cwd "$cwd" -- "${cmd[@]}") ;;
+*) new=$(wzcli split-pane --pane-id "$pane" "$where" --cwd "$cwd" -- "${cmd[@]}") ;;
 esac
 
 [[ -n $new ]] || die "wezterm would not open a pane"
-printf '%s\n' "$new"
+if $print_sid && [[ -n $sid ]]; then
+	printf '%s\t%s\n' "$new" "$sid"
+else
+	printf '%s\n' "$new"
+fi
+# Last: with --replace from inside the session being replaced, this kills our own parent
+[[ -n $replace ]] && wzcli kill-pane --pane-id "$pane" >/dev/null 2>&1
+exit 0

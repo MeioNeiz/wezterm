@@ -1,4 +1,4 @@
-# The tools: wz, cc-note, cc-handover, cc-spawn, and Kev's three
+# The tools: wz, cc-note, cc-handover, cc-spawn, cc-account, and Kev's three
 
 Pointed at from CLAUDE.md and docs/INDEX.md.
 
@@ -78,6 +78,11 @@ was make it cheap enough to reach for mid-task. The parts worth knowing:
   asserts the answer is digits before returning: a pane id reaches `kill-pane` and once
   reached an `rm`, and nothing downstream should have to wonder. It used to go through
   cc-peers and cost 1.4s a call; see "what it costs".
+- **`go` across workspaces pokes the GUI.** The action file is the channel; after writing
+  it `wz` sets a `wz_poke` user var on the focused pane's tty, and wezterm.lua drains the
+  queue at once instead of on its next 0.1s tick. Only a pane on screen fires that event
+  (`dead-ends.md`), which the focused one always is; lost or not, the file still runs once.
+  The client is the one with the least `idle_time`, if a second is ever attached.
 - **The event log is polled, not pushed.** wezterm has no outbound event stream, and the
   states worth waking up for (busy, asking, idle) are Claude's rather than wezterm's, so
   they would not appear in one if it existed. `wz events --daemon` diffs a five-field
@@ -93,20 +98,27 @@ was make it cheap enough to reach for mid-task. The parts worth knowing:
 `wz notify` is the one way anything here reaches you off screen: the stop-asks and drift
 hooks, cc-watch and wezterm.lua all go through it. On macOS it raises **cc-toast**, a
 panel of its own at the top right of the WezTerm window, for `--for` seconds (20 by
-default; stop-asks sets it from Kev's rank, 8 to 48): a Notification Centre banner leaves
+default) or until you are on its pane: a Notification Centre banner leaves
 after about five whatever it is told, and there is no API that changes that. Its own
 corner because native banners draw into one full-screen window, so there is no stacking
-below them. Toasts stack by slot, hovering holds the countdown, the countdown holds while
-another app is in front, and one closes itself once you are on its pane. A click with
-`--pane` runs `wz go <pane>` and brings WezTerm forward. It plays the sound unless `--quiet`.
+below them. Toasts stack in LEADER+t's order (below), so the top toast is where LEADER+t
+goes and pressing it again walks down the stack; one that matters more pushes in above and
+the rest glide down. Hovering holds the countdown, the countdown holds while another app is
+in front, and one closes itself once you are on its pane. The countdown also holds once nothing has been touched for 60s (walked away, locked, display asleep;
+`CC_TOAST_AWAY` overrides the 60), and on your return the toast gets at least 8s more.
+A click with `--pane` runs `wz go <pane>` and brings WezTerm forward. It plays the sound
+unless `--quiet`.
 
 A toast with `--pane` wears that session's identity hue (cc-colour, resolved by wz): a
 gradient over the glass, a 3pt bar down the left and the title in the hue, so it reads as
 the pane it came from. **`--sticky`** has no countdown and is marked by a small dot in the
-hue; it closes only when you are on its pane, click it, or press x. stop-asks makes one
-sticky when the verdict is blocked at p >= 0.6, the rank is >= 0.75, or Kev is down and the
-reply ends on a question. The stack holds five: past that the oldest non-sticky one goes
-first, and a toast whose pane has closed dismisses itself within about 10s.
+hue; it closes only when you are on its pane, click it, or press x. **`--compact`** is a
+one-line pill, title then body, that opens into the full toast on hover. stop-asks makes
+every toast sticky, except a reply Kev ranks below 0.4 that is not blocked: that one is a
+pill for 8 + 40 x rank seconds. Kev down, it stays. Arrivals spring in, a toast ranked 0.5
+or more shimmers once, and a sticky one at 0.6 or more breathes (dot and edge). The stack
+holds five: past that the last in the order goes, non-sticky first (still in `wz toasts`),
+and a toast whose pane has closed dismisses itself within about 10s.
 
 Every notify is logged to `~/.claude/cache/notify-log` with its pane, session, `--rank`
 and body, so the toasts can be followed after they have gone: `wz toasts [<target>] [-n
@@ -114,14 +126,17 @@ N]` lists them with the time and whether you have been on the pane since. A stop
 pane you are looking at raises no toast, so it is not there either. stop-asks' body is the
 reply's labelled caveat ("One thing to know:", "Not tested yet:") if it has one, else its
 first sentence of six words or more; the toast shows about 90 characters of it.
-**LEADER+t** is Kev's pick: the unseen toast Kev ranked highest (three hours back), else
-the live session that scores best from what is on disk, with no Kev call on the keypress:
-asking 1.0, errored 0.8, Kev's blocked verdict 0.55 + 0.4p, otherwise finished at 0.3 if
-unread or 0.05 if read, plus 0.4 times Kev's rank of the reply. A day halves a score and a
-cold cache takes 15% off; ties go to the newer. Working and parked sessions are left out.
-Pressed again within 8s it walks down the same list, and the right status says `t 2/9
-<name>: <why>` for 4s. To see the list without moving, queue `pick` (`wz` action) and read
-`~/.claude/cache/kev-pick`. **LEADER+T** goes to the newest toast, and pressed again
+**LEADER+t** is Kev's pick, and the one ranking for the toast stack too: each pane scores
+from what is on disk, with no Kev call: `cc-note needs` 1.1 whatever the state, never
+aged or discounted, registry or not (the status bar's "needs you"), asking 1.0, errored 0.8, Kev's blocked verdict
+0.55 + 0.4p, otherwise finished at 0.3 if unread or 0.05 if read, plus 0.4 times Kev's
+rank of the reply. An unseen toast (three hours back) lifts its pane to the toast's rank if
+that is higher, so a push or a usage limit counts, and a working pane with one is in. A
+day halves a score and a cold cache takes 15% off; ties go to the newer. Pressed again
+within 8s it walks down the same list, and the right status says `t 2/9 <name>: <why>` for
+4s. wezterm.lua writes the list to `~/.claude/cache/kev-pick` every 2s while toasts are up
+and on a `pick` action, which each new toast queues and waits 0.25s on so it lands in its
+place; cc-toast falls back to `--rank` for a pane not listed or a file 10s stale. **LEADER+T** goes to the newest toast, and pressed again
 within 8s to the one before it, pane by pane. cc-toast is Swift, built by setup.sh from
 `toast/cc-toast.swift` into the gitignored `bin/cc-toast`; without it notify falls back to
 osascript (Script Editor's banner), and on Linux to notify-send.
@@ -195,6 +210,16 @@ Two things that are not obvious and cost a while to find:
 - **every spawned session starts with `--dangerously-skip-permissions`**, which is how
   every agent here is run. A pane that stopped to ask does show as `asking` on the board,
   so it is not invisible, it is just wall clock nobody is spending. `--ask` opts one out.
+- **cc-spawn picks the session id** (`uuidgen`, passed as `--session-id`), so it is known
+  before the session starts; `--print-sid` prints it after the pane id. cc-handover
+  `--new` uses it to watch the receiver by session rather than by a pane id that can be
+  reused. The restore strips `--session-id`, `--fork-session` and everything from `--`
+  (the prompt) before adding `--resume`: kept, a resume replayed the original brief as
+  its next turn, and a cold restore's fresh brief lost to the stale first positional.
+- **`--fork` copies a warm session**: `cc-handover <T> --fork` runs `claude --resume <sid>
+  --fork-session` in a new pane, the whole conversation at cache-read price, source
+  untouched, no brief, nothing closed. Refused when cold, where it would re-read the whole
+  context and `--new` is cheaper. Bypass is passed again, since a resume never restores it.
 - **a message typed while a turn is running is a `queue-operation` record**, not a user
   turn, so every "last prompt" reader is blind to it. It is usually the steer that
   changed what the work was. The brief carries everything queued since the last real
@@ -209,7 +234,9 @@ Two things that are not obvious and cost a while to find:
   without them the last reply plus an hour and `used_pct x window`. It also goes to stderr
   per source. Sessions do not talk to each other to hand over: the successor gets the
   transcript, the output files its background tasks wrote (`<tmp>/tasks/<id>.output`,
-  from its tool results) and, while the pane is open, `wz read <pane> -n 200`.
+  from its tool results) and its pane's last 200 lines, saved beside the brief at the
+  handover, since `--new` and a gather close the pane and its id gets reused. Only when
+  this run leaves the pane open does the brief add `wz read <name> -n 200`, by name.
 
 Also: the `last-prompt` record beside the transcript is Claude's own UI copy and arrives
 already truncated with an ellipsis, so the brief greps the whole file for the last real
@@ -230,6 +257,12 @@ the receiver is busy on the brief types `!ccx` into its prompt, unsent, with
 `send-text --no-paste` so the `!` switches it to bash mode as a typed key does. A fresh
 session is polled every 0.5s for up to a minute first: keys typed before its prompt is up
 are lost.
+
+A plain `--new` of one session records its source the same way but types nothing: once
+the new session is busy on the brief, a detached loop runs `ccx` as the new pane every 2s
+until the source is closed, for up to 30 min. A self-handover is mid-turn until it has
+reported, so it goes a few seconds after. Past 30 min it stays, and `!ccx` typed in the
+new session still closes it. A plain `--to` closes nothing (it pastes, unsent).
 
 Enter on it runs **ccx**, which closes each source whose pane still holds the same session
 and is not busy, asking, waiting or running a background shell, and keeps the rest listed
@@ -268,3 +301,65 @@ it after, and Kev's verdict on the successor's last stop. Written at 08:30 by la
 (`cc-handovers --install`, setup.sh runs it) to `~/.claude/fleet/handover-days/`, which
 /weekly-review in the vault reads; `HANDOVER_DAYS` overrides. Without a kev-mcp checkout it
 still runs, with no verdicts. Linux has no launchd: `--install` prints the cron line.
+
+## accounts: cc-account
+
+Two claude.ai logins at once, one per config folder. Claude Code keeps its login per
+`CLAUDE_CONFIG_DIR`: `~/.claude.json` and keychain item `Claude Code-credentials` for the
+default, `<dir>/.claude.json` and `Claude Code-credentials-<hash of dir>` otherwise. So a
+`/login` moves every session **in its folder** and none in another. `~/.claude` is the
+default account; every other account's folder (`~/.claude-personal`) holds links back into
+it for everything but the login (`cc-account link`, which setup.sh runs; the `own()` list
+says what stays apart), so all sessions share settings, hooks, skills, `projects/`, the
+registry and every state file, and nothing in the fleet has to know there are two.
+
+The map is `~/.claude/accounts`, out of the repo: `<name> <folder> <email> <dirs>...`, `*`
+for the default. The account is fixed when a session starts:
+
+- the zsh `claude` function asks `cc-account env --cwd $PWD`; `claude --<name>` overrides
+- `cc-spawn` always sets it, from `--account` or `--cwd`, since a spawned session would
+  otherwise inherit its parent's folder. cc-handover passes `--account` through
+- `~/.claude` is reached by **unsetting** `CLAUDE_CONFIG_DIR`, never by setting it to
+  `~/.claude`: that is a third login (`~/.claude/.claude.json`, a hashed keychain item)
+- `cc-account login <name>` signs a folder in from a plain shell (`! cc-account login
+  personal`); `cc-account status` says who is signed in where
+
+**Moving a running session**: `cc-account switch [T] [--to <name>]` waits for its turn to
+end, then `cc-spawn --replace <pane> --resume <sid>`: a pane split from the old one whose
+command waits for the old claude to exit, the old pane killed, the conversation resumed in
+place under the other login with the same session id (and its `--effort`; the name is
+re-derived). Run from inside the session it detaches first, since killing the pane kills
+its own parent. Another account means no prompt cache, so the first reply re-reads the
+whole context; refused when cold, as every resume is, unless `--force`. For a big session
+`cc-handover --new --account <name>` is cheaper.
+
+The statusLine names the account once there are two, yellow `personal, not work` when it
+is not the folder's. Rate limits are per account: `cache/rate-limits` for `~/.claude`'s,
+`rate-limits-<name>` for the others; the right status shows each, prefixed by name.
+
+## cc-doctor: drift between copies, and new values in Claude Code
+
+Most bugs the October survey found were one fact kept in several places that had drifted
+apart. `cc-doctor` checks those places and prints a line per check, `ok`, `warn` or `FAIL`
+with file:line, and exits 1 on any FAIL (`--quiet`: only what is not ok; about 0.2s):
+both links for every bin/ script, plus hooks, wezterm.lua, statusline.sh and the skill;
+cc-toast built from its current source; settings.json running every command setup.sh
+registers, with its Notification matcher (read from setup.sh's `$want` at run time, so
+the list lives in one place); `PARKED_MAX`, `PARKED_MONITOR_MAX` and `CACHE_TTL` equal in
+every reader (cc-fleet's own `CACHE_TTL` is its row cache; its `PROMPT_CACHE_TTL` is
+compared); every `wezterm cli` call passing `--no-auto-start`; wezterm.lua loading; the
+survey in `research/sources.md` behind the running Claude Code (warn only, never a fail);
+and the running version's new values acknowledged.
+
+**The version watch** is the survey's most useful trick made routine: `strings` of a new
+binary, diffed against the last, finds values the changelog never mentions. `cc-doctor
+--enums` reads seven sets: hook events, `notification_type`, StopFailure error kinds,
+statusLine top-level keys (literal ones only; the common `session_id`, `cwd` and the like
+come through a helper and are not seen), registry `status`, `waitingFor`, and Stop's
+`background_tasks[].type` labels. Each set is found by values it holds, since minified
+variable names change every build. A set that comes back empty prints as "the extraction
+needs a look", not as every value removed. The hourly reap in `cc-roster --digest` runs
+`--enums --notify` detached: a readlink and a stat until the version changes, then about
+a second of extraction and one toast naming what moved. When the readers that switch on
+those values have been told (CLAUDE.md), `cc-doctor --enums --ack` clears the FAIL.
+`--diff <a> <b>` compares two binaries and writes nothing: the next survey's first step.

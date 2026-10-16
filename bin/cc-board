@@ -7,6 +7,7 @@
 # field would fold into its neighbour.
 
 set -u
+wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
 # The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
 PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
@@ -28,9 +29,8 @@ readonly STALE_SECS=$((8 * 3600))
 readonly FRESH_SECS=90
 readonly REFRESH_SECS=6
 # Must match PARKED_* in wezterm.lua and cc-roster: the most each kind of background task
-# can live. A Monitor 30m (2.1.271), a background shell 2h (2.1.285), the rest 4h.
+# can live. A Monitor 30m (2.1.271), the rest 4h (a terminal's shells: no cap, 2.1.288).
 readonly PARKED_MONITOR_MAX=1800
-readonly PARKED_SHELL_MAX=7200
 readonly PARKED_MAX=14400
 # Must match CACHE_TTL in wezterm.lua and cc-fleet.
 readonly CACHE_TTL=${CC_CACHE_TTL:-3600}
@@ -55,6 +55,31 @@ stamp_now() {
 	fi
 	NOW0=$NOW
 	SEC0=$SECONDS
+}
+
+# A usage limit death resumes itself at the reset: true, with RESUME_HM, while the record
+# at $1 is waiting for the first reset after it, plus RESUME_GRACE. One file per account
+# (cc-account) and the record does not say whose, so the earliest that fits. Must match
+# wezterm.lua's rate.resume_at and cc-roster
+readonly RESUME_GRACE=300
+rate_resume() {
+	local died=$1 f p5 r5 p7 r7 at span best=0 secs
+	for f in "$HOME"/.claude/cache/rate-limits "$HOME"/.claude/cache/rate-limits-*; do
+		# rate-limits.<pid> is a write in progress
+		[[ ${f##*/} == *.* ]] && continue
+		IFS=$'\t' read -r _ p5 r5 p7 r7 _ <"$f" 2>/dev/null || continue
+		at=0
+		if [[ $p7 =~ ^[0-9]+$ && $r7 =~ ^[0-9]+$ ]] && ((p7 >= 100)); then
+			at=$r7 span=$((7 * 86400))
+		elif [[ $r5 =~ ^[0-9]+$ ]]; then
+			at=$r5 span=$((5 * 3600))
+		fi
+		((at > died && at <= died + span && NOW <= at + RESUME_GRACE)) || continue
+		((best == 0 || at < best)) && best=$at
+	done
+	((best > 0)) || return 1
+	secs=$(((best + TZOFF) % 86400))
+	printf -v RESUME_HM '%02d:%02d' $((secs / 3600)) $((secs % 3600 / 60))
 }
 
 # NOW moved on by $SECONDS since the last stamp_now, without a fork.
@@ -235,7 +260,7 @@ is_chrome() {
 
 read_pane() {
 	local pane=$1 text ctx line last=""
-	text=$(wezterm cli get-text --pane-id "$pane" 2>/dev/null)
+	text=$(wzcli get-text --pane-id "$pane" 2>/dev/null)
 	while IFS= read -r line; do
 		strip_leaders "$line"
 		line=$STRIPPED
@@ -344,8 +369,12 @@ scan_hook_maps() {
 		if [[ $st == parked && $at =~ ^[0-9]+$ ]] && ((NOW > 0)); then
 			lim=$PARKED_MAX
 			[[ $dt == monitor ]] && lim=$PARKED_MONITOR_MAX
-			[[ $dt == shell ]] && lim=$PARKED_SHELL_MAX
 			((NOW - at > lim)) && st=done
+		fi
+		if [[ $st == errored && $dt == rate_limit && $at =~ ^[0-9]+$ ]] &&
+			rate_resume "$at"; then
+			st=parked
+			dt="resumes $RESUME_HM"
 		fi
 		# No comma can appear in a detail (error kind or tool name).
 		map_set "hk_st_$p" "${st:-idle},${at:-0},${dt}"
@@ -532,6 +561,7 @@ scan_panes() {
 			esac
 			# The raw hook state, for merge_roster. Empty means the idle above is a guess.
 			E_HKIND[n]=$PSTATE
+			E_HDETAIL[n]=$PDETAIL
 			E_DETAIL[n]=""
 			[[ $PSTATE == errored ]] && E_DETAIL[n]=$PDETAIL
 			E_IDLE[n]=""
@@ -544,7 +574,7 @@ scan_panes() {
 			n=$((n + 1))
 			;;
 		esac
-	done < <(wezterm cli list --format json 2>/dev/null | jq -r --arg us "$US" '
+	done < <(wzcli list --format json 2>/dev/null | jq -r --arg us "$US" '
 		([ .[] | { w: .window_id, t: .tab_id, ti: (.tab_title // "") } ]
 		 | unique_by([.w, .t]) | sort_by(.w, .t)
 		 | .[] | [ "T", (.w|tostring), (.t|tostring), .ti ] | join($us)),
@@ -660,6 +690,7 @@ merge_roster() {
 			E_ID[i]=""
 			E_SINCE[i]=0
 			E_HKIND[i]=""
+			E_HDETAIL[i]=""
 			E_GEOM[i]=""
 			E_TITLE[i]=""
 			E_LAST[i]=""
@@ -672,8 +703,10 @@ merge_roster() {
 		[[ -n ${E_PCT[i]:-} ]] || ctx_from_cache "$i"
 		# The roster is a cache of the registry; hook files are written the instant a turn
 		# ends. It names the state only where no hook wrote since it was assembled, and an
-		# idle registry never overrules errored or parked, since idle is how both look.
+		# idle registry never overrules errored or parked, since idle is how both look. A
+		# parked shell is the exception: cc-roster says idle only once the registry has.
 		hk=${E_HKIND[i]:-}
+		[[ $hk == parked && ${E_HDETAIL[i]:-} == shell ]] && hk=shell
 		if [[ -z $hk ]] || ((${E_SINCE[i]:-0} <= ROSTER_AT)); then
 			case $hk in
 			errored | parked) [[ $kind == idle ]] || E_KIND[i]=$kind ;;
@@ -2050,7 +2083,7 @@ fi
 # ---------------------------------------------------------------- interactive
 
 if [[ -z $workspace ]] && ! $all && [[ -n ${WEZTERM_PANE:-} ]]; then
-	workspace=$(wezterm cli list --format json 2>/dev/null |
+	workspace=$(wzcli list --format json 2>/dev/null |
 		jq -r --arg p "$WEZTERM_PANE" \
 			'.[] | select((.pane_id|tostring) == $p) | .workspace' 2>/dev/null)
 fi
@@ -2155,7 +2188,7 @@ refresh() {
 }
 
 jump() {
-	wezterm cli activate-pane --pane-id "$1" 2>/dev/null
+	wzcli activate-pane --pane-id "$1" 2>/dev/null
 }
 
 # The tab the board is in now, asked fresh: LEADER+b moves it between tabs.
@@ -2164,7 +2197,7 @@ find_home_target() {
 	HOME_TARGET=""
 	[[ -n ${WEZTERM_PANE:-} ]] || return
 	# Rightmost, so moved panes land on the end of the tab.
-	HOME_TARGET=$(wezterm cli list --format json 2>/dev/null |
+	HOME_TARGET=$(wzcli list --format json 2>/dev/null |
 		jq -r --arg me "$WEZTERM_PANE" '
 			(.[] | select((.pane_id|tostring) == $me) | .tab_id) as $tab
 			| [ .[] | select(.tab_id == $tab) | select((.pane_id|tostring) != $me) ]
@@ -2183,7 +2216,7 @@ move_marked() {
 	for ((i = 0; i < ${#E_PANE[@]}; i++)); do
 		is_marked "${E_PANE[i]}" || continue
 		[[ ${E_PANE[i]} == "$target" || ${E_PANE[i]} == "-" ]] && continue
-		if wezterm cli split-pane --pane-id "$target" --move-pane-id "${E_PANE[i]}" \
+		if wzcli split-pane --pane-id "$target" --move-pane-id "${E_PANE[i]}" \
 			--right >/dev/null 2>&1; then
 			moved=$((moved + 1))
 			# Walk the target along, or they arrive in reverse.
@@ -2253,9 +2286,11 @@ while :; do
 		painted=$FRAME
 	fi
 
-	# After a jump this tab is off screen: block until a key says you are back.
+	# After a jump this tab is off screen: block until a key says you are back. That key
+	# is spent waking a stale frame, except a quit, which needs no fresh one.
 	if $paused; then
 		read_key ""
+		[[ $KEY == ESC || $KEY == CHARq ]] && break
 		paused=false
 		MESSAGE=""
 		refresh fresh
@@ -2377,7 +2412,7 @@ while :; do
 		painted=$FRAME
 		read_key ""
 		if [[ $KEY == CHARy ]]; then
-			wezterm cli kill-pane --pane-id "${E_PANE[i]}" 2>/dev/null
+			wzcli kill-pane --pane-id "${E_PANE[i]}" 2>/dev/null
 			MESSAGE="closed ${E_NAME[i]:-pane ${E_PANE[i]}}"
 			refresh fresh
 		fi

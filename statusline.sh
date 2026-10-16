@@ -22,6 +22,8 @@ readonly CACHE_DIR="$HOME/.claude/cache/statusline"
 # run, since the statusLine is on the critical path of every turn.
 # shellcheck source=/dev/null
 source "$HOME/.claude/bin/cc-colour" --lib
+# shellcheck source=/dev/null
+source "$HOME/.claude/bin/cc-account" --lib
 readonly BLUE=$'\033[38;2;137;180;250m'
 readonly MAUVE=$'\033[38;2;203;166;247m'
 readonly YELLOW=$'\033[38;2;249;226;175m'
@@ -32,7 +34,12 @@ readonly MAX_TITLE=64
 readonly MAX_NOTE=52
 readonly NOTES="$HOME/.claude/fleet/notes.tsv"
 readonly CTX_DIR="$HOME/.claude/cache/context"
-readonly RATE_FILE="$HOME/.claude/cache/rate-limits"
+# Rate limits are per account: this session's from CLAUDE_CONFIG_DIR, which Claude passes on
+acct_load
+acct_current
+account=$ACCT
+acct_suffix "$account"
+readonly RATE_FILE="$HOME/.claude/cache/rate-limits$ACCT_SUFFIX"
 readonly RATE_EVERY=5
 # cc-peers' title memo, `mtime\x1fchecked_at\x1ftitle`; "sl" in the mtime slot says the
 # title came from here, which cc-peers trusts without looking at the transcript
@@ -162,6 +169,19 @@ fi
 label=${root:-$dir}
 label=${label##*/}
 
+# Which login this pane runs on, once there is more than one. Loud when it is not the
+# account this folder defaults to, which is a session moved on purpose or by mistake
+acct_tag=""
+acct_odd=false
+if [[ $ACCT_NAMES == *" "* ]]; then
+	acct_tag=$account
+	acct_for "$dir"
+	if [[ $ACCT != "$account" ]]; then
+		acct_tag="$account, not $ACCT"
+		acct_odd=true
+	fi
+fi
+
 # Auto-compact is off, so nothing else warns before the window fills. Naming the
 # window size too, since a 200k session and a 1M one wear the same percentage very
 # differently.
@@ -205,10 +225,18 @@ fi
 # How full this session is and when its prompt cache goes cold, for everything that
 # cannot ask: Claude hands both to the statusLine and nowhere else (see CLAUDE.md). Silent
 # on failure, since a pane's own line must never break over a cache it writes for others.
+# The last four fields are the rate limits this session reported last time, for the block
+# below to tell a new response from a re-render.
+rl_fresh=0
 if [[ -n $session && $ctx_used =~ ^[0-9]+$ ]]; then
 	[[ -d $CTX_DIR ]] || mkdir -p "$CTX_DIR" 2>/dev/null
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ctx_used" "${ctx_size:-0}" "${now:-0}" \
-		"${pc_expires:--}" "${pc_ttl:--}" "${pc_recache:--}" "${pc_hit:--}" \
+	s5=- s5_at=- s7=- s7_at=-
+	[[ -r $CTX_DIR/$session ]] &&
+		IFS=$'\t' read -r _ _ _ _ _ _ _ s5 s5_at s7 s7_at <"$CTX_DIR/$session"
+	[[ $rl_5h\ $rl_5h_at\ $rl_7d\ $rl_7d_at != "$s5 $s5_at $s7 $s7_at" ]] && rl_fresh=1
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ctx_used" "${ctx_size:-0}" \
+		"${now:-0}" "${pc_expires:--}" "${pc_ttl:--}" "${pc_recache:--}" "${pc_hit:--}" \
+		"${rl_5h:--}" "${rl_5h_at:--}" "${rl_7d:--}" "${rl_7d_at:--}" \
 		>"$CTX_DIR/$session" 2>/dev/null
 fi
 
@@ -224,12 +252,17 @@ if [[ -n $session && -n $sname ]]; then
 	fi
 fi
 
-# Rate limits are per account, so every session reports the same pair: one file for the
-# machine, rewritten at most every RATE_EVERY seconds by whichever pane renders first.
+# Rate limits are per account, a file each (RATE_FILE), but the payload does not say which
+# login: after a /login an idle pane still carries the old one's figures, and every
+# re-render repeats the last response's. So a session writes only figures that changed since
+# its own last render, a new response, and otherwise at most every RATE_EVERY seconds keeps
+# the file alive while it agrees with it. Never "later reset wins": another account's window
+# can reset later and would stick until it did.
 if [[ $rl_5h != "-" || $rl_7d != "-" ]] && [[ -n $rl_5h ]]; then
-	rl_last=0
-	[[ -r $RATE_FILE ]] && read -r rl_last _ <"$RATE_FILE"
-	if ((${now:-0} - ${rl_last:-0} >= RATE_EVERY)); then
+	rl_last=0 f5=- f5_at=- f7=- f7_at=-
+	[[ -r $RATE_FILE ]] && IFS=$'\t' read -r rl_last f5 f5_at f7 f7_at _ <"$RATE_FILE"
+	if ((rl_fresh)) || { ((${now:-0} - ${rl_last:-0} >= RATE_EVERY)) &&
+		[[ $rl_5h\ $rl_5h_at\ $rl_7d\ $rl_7d_at == "$f5 $f5_at $f7 $f7_at" ]]; }; then
 		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${now:-0}" "$rl_5h" "${rl_5h_at:--}" "$rl_7d" \
 			"${rl_7d_at:--}" "${rl_spend:--}" >"$RATE_FILE.$$" 2>/dev/null &&
 			mv -f "$RATE_FILE.$$" "$RATE_FILE" 2>/dev/null
@@ -262,6 +295,11 @@ out="${IDC_ANSI:-$BLUE}${title}${RESET}"
 [[ -n $note_progress ]] && out+="${meta}  ·  ${RESET}${YELLOW}${note_progress}${RESET}"
 [[ -n $note_status ]] && out+="${meta}  ·  ${RESET}${YELLOW}▸ ${note_status}${RESET}"
 [[ -n $label ]] && out+="${meta}  ·  ${label}${RESET}"
+if $acct_odd; then
+	out+="${meta}  ·  ${RESET}${YELLOW}${acct_tag}${RESET}"
+elif [[ -n $acct_tag ]]; then
+	out+="${meta}  ·  ${acct_tag}${RESET}"
+fi
 [[ -n $branch ]] && out+="${meta}  ·  ${branch}${RESET}"
 [[ -n $context ]] && out+="${meta}  ·  ${RESET}${context_colour:-$meta}${context}${RESET}"
 [[ -n $engine ]] && out+="${meta}  ·  ${engine}${RESET}"

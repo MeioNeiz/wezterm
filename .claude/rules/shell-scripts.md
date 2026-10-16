@@ -25,6 +25,8 @@ before changing a field, a reader or a writer.
 - **awk is byte-based**: a bracket expression of multibyte glyphs matches their bytes and
   strips one, corrupting the line. No `\x` escapes in regexes. Match multibyte text as a
   literal sequence, or do it in the shell
+- **`env` takes no option after an assignment** (BSD): `env A=1 -u B cmd` runs `-u`. Every
+  `-u` first, then assignments (cc-spawn, the zsh `claude`)
 - **No apostrophes inside a single-quoted awk program.** "the hook's detail" in a comment
   closes the string; the error surfaces as bash syntax twenty lines further down
 
@@ -69,7 +71,10 @@ before changing a field, a reader or a writer.
   is a `systemMessage` (shown to Jacob, not the model) warning that a resume is cold
 - The Notification matcher (settings.json and setup.sh) must list every
   `notification_type` the hook acts on: `permission_prompt`, `push_notification`,
-  `worker_permission_prompt`, `model_refusal_fallback`. A type it omits never arrives
+  `worker_permission_prompt`, `model_refusal_fallback`, `quota_auto_resume_stale`,
+  `quota_auto_resume_disabled`, `auth_storage_failure`. A type it omits never arrives.
+  Rerunning setup.sh rewrites the matcher; the hook decides state by type, never by the
+  message text
 - `hooks/claude-session-brief.py` is called by wezterm.lua too, not only by Claude
 - `~/.claude/hooks/wezterm-backfill-sessions.py` stays outside the repo: nothing calls it
 
@@ -86,4 +91,8 @@ before changing a field, a reader or a writer.
   multibyte)
 - The interactive board needs a real pty: drive it with `pty.fork()` and split the capture
   on `\x1b[H` for a frame at a time
+- A hook under test needs a tty one non-shell parent up, or `resident()` drops it: under
+  `script -q <file> python3 -c 'subprocess.run(["sh", hook, state], stdin=...)'`, stdin
+  from /dev/null (a socket fails `script`), and a scratch HOME so no toast fires and no
+  real record is written. A shell parent is climbed past to `script`, which has no tty
 - Fixtures are time-relative: regenerate them each run, in the scratchpad

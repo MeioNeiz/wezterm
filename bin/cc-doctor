@@ -1,0 +1,686 @@
+#!/bin/bash
+# Checks what drifts when one fact lives in several copies: the links setup.sh makes, the
+# hooks it registers, the constants every reader repeats. And watches each new Claude Code
+# binary for values our readers switch on and have not been told about (CLAUDE.md: a
+# state string has to be told about every new value Claude writes).
+
+set -u
+# The digest runs this from the GUI with PATH=/usr/bin:/bin:/usr/sbin:/sbin
+PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+readonly VERSIONS="$HOME/.local/share/claude/versions"
+readonly ENUMS="${CC_ENUMS_DIR:-$HOME/.claude/cache/cc-enums}"
+readonly SETTINGS="$HOME/.claude/settings.json"
+SETS="hook_event notification_type stopfailure_error statusline_field registry_status"
+readonly SETS="$SETS waiting_for background_task_type"
+
+usage() {
+	cat <<'USAGE'
+cc-doctor - drift between the copies of one fact, and new values in Claude Code
+
+  cc-doctor [--quiet]          every check, one line each: ok, warn or FAIL with file:line
+                               (--quiet: only what is not ok). Exit 1 if any FAIL
+  cc-doctor --enums [<v>]      a Claude Code binary's value sets against the last snapshot
+                               before it: what was added or removed (default: the running
+                               version; <v> is a version on disk or a path)
+  cc-doctor --enums --notify   the same, silent, plus one toast per version. What the
+                               hourly cc-roster --digest runs; a stat when nothing is new
+  cc-doctor --enums --ack [<v>]   the readers have been told: the check stops failing
+  cc-doctor --enums --diff <a> <b>   two binaries compared, nothing written
+
+The checks: every bin/ script linked as ~/.claude/bin/<name> and ~/.local/bin/<name>, the
+hooks, wezterm.lua, statusline.sh and skills/fleet linked; cc-toast built and newer than
+its source; settings.json running every hook command setup.sh registers, with its
+Notification matcher; PARKED_MAX, PARKED_MONITOR_MAX and CACHE_TTL equal in every reader;
+every `wezterm cli` call passing --no-auto-start; wezterm.lua loading; the survey in
+docs/research/sources.md not behind the running Claude Code (warn: never fails); and the
+running version's new values acknowledged.
+
+The value sets, from `strings` of the binary: hook_event, notification_type,
+stopfailure_error, statusline_field (literal top-level keys only: the common
+session_id, cwd and the like come from a helper and are not seen), registry_status,
+waiting_for, background_task_type (Stop's background_tasks[].type labels).
+Snapshots: ~/.claude/cache/cc-enums/<version> (CC_ENUMS_DIR overrides).
+
+  cc-doctor --quiet
+  cc-doctor --enums --diff 2.1.286 2.1.289
+USAGE
+}
+
+die() {
+	echo "cc-doctor: $*" >&2
+	exit 2
+}
+
+# 0 when $1 sorts before $2, dot-separated integers
+ver_lt() {
+	local IFS=. i
+	local -a a=($1) b=($2)
+	for ((i = 0; i < ${#a[@]} || i < ${#b[@]}; i++)); do
+		((10#${a[i]:-0} < 10#${b[i]:-0})) && return 0
+		((10#${a[i]:-0} > 10#${b[i]:-0})) && return 1
+	done
+	return 1
+}
+
+is_version() { [[ $1 =~ ^[0-9]+(\.[0-9]+)+$ ]]; }
+
+# The one ~/.local/bin/claude runs, else the newest on disk. Sets RUNNING
+running_version() {
+	local t v
+	RUNNING=""
+	t=$(readlink "$HOME/.local/bin/claude" 2>/dev/null)
+	if [[ $t == "$VERSIONS"/* && -f $t ]]; then
+		RUNNING=${t##*/}
+		return
+	fi
+	for t in "$VERSIONS"/*; do
+		v=${t##*/}
+		is_version "$v" || continue
+		[[ -z $RUNNING ]] || ver_lt "$RUNNING" "$v" && RUNNING=$v
+	done
+}
+
+# A version or a path to a binary. Sets BIN and VER
+binary_for() {
+	if [[ -f $1 ]]; then
+		BIN=$1
+	else
+		BIN="$VERSIONS/$1"
+	fi
+	VER=${BIN##*/}
+	[[ -f $BIN ]] || die "no Claude Code binary at $BIN"
+}
+
+# One grep each, in parallel over one strings dump: BSD grep takes ten times as long on
+# the alternation of all five as on the five apart
+readonly ENUM_GREPS=(
+	'\["[^"\\]+"(,"[^"\\]+")+\]'
+	'waitingFor(:|\?\?)"[^"]+"'
+	'queuedElicitation\)return[^}]*'
+	'\{[a-z_]+:"[^"]+"(,[a-z_]+:"[^"]+")+\}'
+	'return\{[^;]*exceeds_200k_tokens:[^;]*'
+)
+
+# Property names survive minification, variable names do not: every set is found by the
+# values or keys it holds. An array set is the largest array holding all its anchors
+read -r -d '' ENUM_AWK <<'AWK'
+function has(h, list,   a, n, i) {
+	n = split(list, a, " ")
+	for (i = 1; i <= n; i++) if (!(a[i] in h)) return 0
+	return 1
+}
+function array(s,   a, n, i, h, set) {
+	n = split(substr(s, 3, length(s) - 4), a, "\",\"")
+	for (i = 1; i <= n; i++) h[a[i]] = 1
+	if (has(h, "PreToolUse SessionEnd Stop Notification")) set = "hook_event"
+	else if (has(h, "permission_prompt idle_prompt")) set = "notification_type"
+	else if (has(h, "authentication_failed rate_limit max_output_tokens"))
+		set = "stopfailure_error"
+	# the smallest here: the job states are a larger array that also holds these four
+	else if (has(h, "busy idle waiting")) set = "registry_status"
+	else return
+	if (set in best_n && (set == "registry_status" ? n >= best_n[set] : n <= best_n[set]))
+		return
+	best_n[set] = n
+	best[set] = s
+}
+function quoted(set, s,   v) {
+	while (match(s, /"[^"]*"/)) {
+		v = substr(s, RSTART + 1, RLENGTH - 2)
+		if (v != "") out[set "\t" v] = 1
+		s = substr(s, RSTART + RLENGTH)
+	}
+}
+# a key at an element start: name: or shorthand name, / name}
+function key(s, j,   t) {
+	t = substr(s, j, 80)
+	if (d == 1) spread = substr(t, 1, 3) == "..."
+	if (match(t, /^[A-Za-z_$][A-Za-z0-9_$]*[:,}]/))
+		out["statusline_field\t" substr(t, 1, RLENGTH - 1)] = 1
+}
+# Top-level keys of the object built for the statusLine, and the keys of the objects
+# spread into it conditionally (...x&&{rate_limits:q}). Spreads of a call are not followed
+function statusline(s,   i, n, c, q) {
+	n = length(s); d = 0; q = ""; sd = 0; spread = 0
+	for (i = 7; i <= n; i++) {
+		c = substr(s, i, 1)
+		if (q != "") {
+			if (c == "\\") i++
+			else if (c == q) q = ""
+			continue
+		}
+		if (c == "\"" || c == "'" || c == "`") { q = c; continue }
+		if (c == "{" || c == "(" || c == "[") {
+			d++
+			if (d == 1) key(s, i + 1)
+			else if (d == 2 && c == "{" && spread) { sd = 2; key(s, i + 1) }
+			continue
+		}
+		if (c == "}" || c == ")" || c == "]") {
+			if (d == sd) sd = 0
+			if (--d == 0) return
+			continue
+		}
+		if (c == "," && (d == 1 || d == sd)) key(s, i + 1)
+	}
+}
+/^\["/ { array($0); next }
+/^waitingFor/ { quoted("waiting_for", $0); next }
+# the function deriving waitingFor from the dialog state: every literal it returns
+/^queuedElicitation/ {
+	s = $0
+	while (match(s, /return"[^"]*"/)) {
+		v = substr(s, RSTART + 6, RLENGTH - 6)
+		s = substr(s, RSTART + RLENGTH)
+		quoted("waiting_for", v)
+	}
+	next
+}
+# task type -> Stop label; another map from the same keys gives one-letter id prefixes
+/^\{/ && (/local_bash:"shell"/ || /local_agent:"subagent"/) {
+	s = $0
+	while (match(s, /:"[^"]*"/)) {
+		out["background_task_type\t" substr(s, RSTART + 2, RLENGTH - 3)] = 1
+		s = substr(s, RSTART + RLENGTH)
+	}
+	next
+}
+/^return\{/ { statusline($0) }
+END {
+	for (set in best) quoted(set, best[set])
+	for (k in out) print k
+}
+AWK
+
+extract_enums() {
+	local tmp i
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/cc-doctor.XXXXXX") || return 1
+	LC_ALL=C strings -n 4 "$1" >"$tmp/s"
+	for ((i = 0; i < ${#ENUM_GREPS[@]}; i++)); do
+		LC_ALL=C grep -oE "${ENUM_GREPS[i]}" "$tmp/s" >"$tmp/$i" &
+	done
+	wait
+	rm -f "$tmp/s"
+	cat "$tmp"/[0-9]* | LC_ALL=C awk "$ENUM_AWK" | LC_ALL=C sort -u
+	rm -rf "$tmp"
+}
+
+# Snapshot versions on disk, oldest first, one per line
+snapshots() {
+	local f v
+	for f in "$ENUMS"/*; do
+		v=${f##*/}
+		is_version "$v" && echo "$v"
+	done | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n
+}
+
+# Writes <v> and <v>.diff (first line #from <previous snapshot, or ->, then +/- set value)
+# unless the snapshot exists. Never an empty snapshot: it would make everything new
+snapshot() {
+	local v=$1 bin=$2 prev="" s tmp
+	[[ -s $ENUMS/$v ]] && return 0
+	mkdir -p "$ENUMS" || return 1
+	tmp="$ENUMS/.$v.$$"
+	extract_enums "$bin" >"$tmp"
+	if [[ ! -s $tmp ]]; then
+		rm -f "$tmp"
+		echo "cc-doctor: nothing extracted from $bin" >&2
+		return 1
+	fi
+	for s in $(snapshots); do
+		ver_lt "$s" "$v" && prev=$s
+	done
+	{
+		echo "#from ${prev:--}"
+		[[ -n $prev ]] && diff_sets "$ENUMS/$prev" "$tmp"
+	} >"$ENUMS/$v.diff"
+	mv -f "$tmp" "$ENUMS/$v"
+}
+
+# +/- set value lines between two snapshots. A set gone whole means the extraction broke,
+# not that Claude dropped every value: one ! line instead of a list. A set new whole is
+# one this script has just learnt to read: one * line, not a change
+diff_sets() {
+	LC_ALL=C comm -3 "$1" "$2" | LC_ALL=C awk -F'\t' -v OFS='\t' -v old="$1" -v new="$2" '
+	BEGIN {
+		while ((getline l < old) > 0) { split(l, f, "\t"); had[f[1]]++ }
+		while ((getline l < new) > 0) { split(l, f, "\t"); has[f[1]]++ }
+	}
+	/^\t/ {
+		sub(/^\t/, ""); split($0, f, "\t")
+		if (had[f[1]]) print "+", f[1], f[2]
+		else if (!(f[1] in fresh)) { fresh[f[1]] = 1; print "*", f[1], "first read" }
+		next
+	}
+	{
+		split($0, f, "\t")
+		if (has[f[1]]) print "-", f[1], f[2]
+		else if (!(f[1] in gone)) { gone[f[1]] = 1; print "!", f[1], "no longer found" }
+	}'
+}
+
+# Human lines for a .diff file, or a diff on stdin
+show_diff() {
+	awk -F'\t' '
+	/^#/ { next }
+	$1 == "+" { print "  + " $2 " " $3 }
+	$1 == "-" { print "  - " $2 " " $3 " (gone)" }
+	$1 == "!" { print "  ! " $2 ": none found, the extraction needs a look" }
+	$1 == "*" { print "  * " $2 ": not read before this version, nothing to compare" }'
+}
+
+changes() { awk '/^[-+!]/ { n++ } END { print n + 0 }' "$1"; }
+
+announce() {
+	local v=$1 title body
+	[[ -e $ENUMS/$v.announced ]] && return 0
+	if [[ $(changes "$ENUMS/$v.diff") -gt 0 ]]; then
+		{
+			IFS= read -r title
+			IFS= read -r body
+		} < <(awk -F'\t' -v v="$v" '
+		/^[-+!]/ {
+			n++
+			s = s (s ? ", " : "") $1 $2 " " $3
+			if ($1 == "+") { a++; one = "new " $2 " " $3 } else one = $2 " " $3 " gone"
+		}
+		END {
+			if (n == 1) print "Claude Code " v ": " one
+			else print "Claude Code " v ": " a + 0 " new, " n - a " gone"
+			print (n > 1 ? s ". " : "") "cc-doctor --enums, then --ack once readers know"
+		}' "$ENUMS/$v.diff")
+		"$HOME/.claude/bin/wz" notify --quiet --rank 0.2 --for 30 "$title" "$body" \
+			</dev/null >/dev/null 2>&1
+	fi
+	touch "$ENUMS/$v.announced"
+}
+
+cmd_enums() {
+	local notify=false ack=false diff=false a b prev
+	while (($#)); do
+		case $1 in
+		--notify) notify=true ;;
+		--ack) ack=true ;;
+		--diff) diff=true ;;
+		-h | --help) usage; exit 0 ;;
+		-*) die "unknown option $1" ;;
+		*) break ;;
+		esac
+		shift
+	done
+	if $diff; then
+		(($# == 2)) || die "--diff needs two versions or binaries"
+		binary_for "$1"; a=$BIN
+		binary_for "$2"; b=$BIN
+		local tmp=${TMPDIR:-/tmp}/cc-doctor.$$
+		extract_enums "$a" >"$tmp.a"
+		extract_enums "$b" >"$tmp.b"
+		echo "Claude Code ${a##*/} -> ${b##*/}:"
+		diff_sets "$tmp.a" "$tmp.b" | show_diff
+		awk -F'\t' -v sets="$SETS" '{ n[$1]++ }
+		END {
+			k = split(sets, a, " ")
+			for (i = 1; i <= k; i++) printf "  %s %d", a[i], n[a[i]]
+			print ""
+		}' "$tmp.b"
+		rm -f "$tmp.a" "$tmp.b"
+		return
+	fi
+	if (($#)); then binary_for "$1"; else
+		running_version
+		[[ -n $RUNNING ]] || { $notify && exit 0; die "no Claude Code in $VERSIONS"; }
+		# the fast path the hourly digest takes: one readlink and one stat
+		$notify && [[ -e $ENUMS/$RUNNING.announced ]] && exit 0
+		binary_for "$RUNNING"
+	fi
+	if $ack; then
+		[[ -s $ENUMS/$VER ]] || die "no snapshot for $VER yet: cc-doctor --enums $VER first"
+		touch "$ENUMS/$VER.ack"
+		echo "acknowledged Claude Code $VER"
+		return
+	fi
+	if $notify; then
+		{ command -v strings && command -v comm; } >/dev/null || exit 0
+		snapshot "$VER" "$BIN" 2>/dev/null && announce "$VER"
+		exit 0
+	fi
+	snapshot "$VER" "$BIN" || exit 1
+	IFS= read -r prev <"$ENUMS/$VER.diff"
+	prev=${prev#\#from }
+	if [[ $prev == - ]]; then
+		echo "Claude Code $VER: first snapshot, nothing to compare with"
+	elif [[ $(changes "$ENUMS/$VER.diff") -eq 0 ]]; then
+		echo "Claude Code $VER: nothing new since $prev"
+	else
+		echo "Claude Code $VER against $prev:"
+		show_diff <"$ENUMS/$VER.diff"
+		[[ -e $ENUMS/$VER.ack ]] && echo "  (acknowledged)" ||
+			echo "  told the readers? cc-doctor --enums --ack $VER"
+	fi
+}
+
+# --- the drift checks ---
+
+QUIET=false
+FAILED=0
+report() {
+	[[ $1 == FAIL ]] && FAILED=1
+	$QUIET && [[ $1 == ok ]] && return
+	printf '%-4s %s\n' "$1" "$2"
+	[[ -n ${3:-} ]] && printf '%s\n' "$3"
+	return 0
+}
+
+check_links() {
+	local f n k t want bad="" count=0
+	local -a paths=() wants=()
+	for f in "$REPO"/bin/*; do
+		n=${f##*/}
+		paths+=("$HOME/.claude/bin/$n" "$HOME/.local/bin/$n")
+		wants+=("$f" "$HOME/.claude/bin/$n")
+	done
+	for f in "$REPO"/hooks/*; do
+		paths+=("$HOME/.claude/hooks/${f##*/}")
+		wants+=("$f")
+	done
+	paths+=("$HOME/.wezterm.lua" "$HOME/.claude/statusline.sh" "$HOME/.claude/skills/fleet")
+	wants+=("$REPO/wezterm.lua" "$REPO/statusline.sh" "$REPO/skills/fleet")
+	# path, tab, link target (empty for a real file); a missing path prints nothing
+	while IFS= read -r f; do
+		k=${f%%$'\t'*}
+		k="lk_${k//[^A-Za-z0-9]/_}"
+		printf -v "$k" '%s' "=${f#*$'\t'}"
+	done < <(if [[ $OSTYPE == darwin* ]]; then
+		stat -f '%N%t%Y' "${paths[@]}" 2>/dev/null
+	else
+		find "${paths[@]}" -maxdepth 0 -printf '%p\t%l\n' 2>/dev/null
+	fi)
+	for ((n = 0; n < ${#paths[@]}; n++)); do
+		f=${paths[n]}
+		want=${wants[n]}
+		k="lk_${f//[^A-Za-z0-9]/_}"
+		t=${!k:-}
+		count=$((count + 1))
+		if [[ -z $t ]]; then
+			bad+="    ${f/#$HOME/~}: missing, wants -> ${want/#$HOME/~}"$'\n'
+		elif [[ $t == = ]]; then
+			bad+="    ${f/#$HOME/~}: a real file, not a link"$'\n'
+		elif [[ ${t#=} != "$want" ]]; then
+			bad+="    ${f/#$HOME/~} -> ${t#=}, wants ${want/#$HOME/~}"$'\n'
+		fi
+	done
+	if [[ -n $bad ]]; then
+		report FAIL "links: not as setup.sh makes them (rerun setup.sh)" "${bad%$'\n'}"
+	else
+		report ok "links: $count, bin/ twice over, hooks, wezterm.lua, statusline, skill"
+	fi
+	[[ $OSTYPE == darwin* ]] || return 0
+	if [[ ! -x $REPO/bin/cc-toast ]]; then
+		report FAIL "cc-toast: not built (setup.sh builds it; wz notify falls back)"
+	elif [[ $REPO/toast/cc-toast.swift -nt $REPO/bin/cc-toast ]]; then
+		report FAIL "cc-toast: older than toast/cc-toast.swift (rerun setup.sh)"
+	else
+		report ok "cc-toast: built from the current source"
+	fi
+}
+
+# One awk over the repo: the constants, the wezterm cli calls, setup.sh's hook object and
+# the survey's version. Prints result lines (ok|FAIL, text) and data lines for bash
+read -r -d '' REPO_AWK <<'AWK'
+function rel(f) { return substr(f, length(repo) + 2) }
+function num(e,   v, a, n, i) {
+	sub(/^[^=]*=[ ]*/, "", e)
+	gsub(/\$\{[A-Za-z_]*:-/, "", e)
+	if (!match(e, /^[0-9][0-9 *]*/)) return "?"
+	n = split(substr(e, 1, RLENGTH), a, "*")
+	v = 1
+	for (i = 1; i <= n; i++) v *= a[i] + 0
+	return v
+}
+function put(name, f, line, v) {
+	val[name, rel(f)] = v
+	loc[name, rel(f)] = rel(f) ":" line
+}
+function agree(name, files, label,   a, n, i, k, v, seen, nd, s) {
+	n = split(files, a, " ")
+	for (i = 1; i <= n; i++) {
+		k = a[i]
+		# cc-fleet has a CACHE_TTL of its own (its rows, 8s): the prompt one is named apart
+		if (name == "CACHE_TTL" && ("PROMPT_CACHE_TTL", k) in val) {
+			v = val["PROMPT_CACHE_TTL", k]
+			s = s (s ? ", " : "") loc["PROMPT_CACHE_TTL", k] " " v " (PROMPT_CACHE_TTL)"
+		} else if ((name, k) in val) {
+			v = val[name, k]
+			s = s (s ? ", " : "") loc[name, k] " " v
+		} else {
+			v = "missing"
+			s = s (s ? ", " : "") k " not found"
+		}
+		if (!(v in seen)) { seen[v] = 1; nd++ }
+	}
+	if (nd == 1 && v != "missing") print "ok\t" label " = " v ": " s
+	else print "FAIL\t" label " disagrees: " s
+}
+FNR == 1 { heredoc = ""; f = rel(FILENAME) }
+f == "setup.sh" {
+	if (/^def /) { print "jqdef\t" $0; sawdef = 1; next }
+	if (sawdef && !inwant && !wantdone && /^\{[ \t]*$/) inwant = 1
+	if (inwant) {
+		if (/^\} as \$want/) { print "jqobj\t}"; inwant = 0; wantdone = 1; next }
+		print "jqobj\t" $0
+		if (/matcher:/) print "matcherline\t" FNR
+	}
+	next
+}
+f == "docs/research/sources.md" {
+	if (/^\| Claude Code \| [0-9]/ && !survey) {
+		split($0, c, "|"); split(c[3], w, " "); survey = w[1]
+		print "survey\t" survey "\t" f ":" FNR
+	}
+	next
+}
+f ~ /^bin\// && FNR == 1 && !/^#!/ { nextfile }
+(index(" " ttl_files " ", " " f " ") || index(" " parked_files " ", " " f " ")) &&
+/^(local |readonly )?(PARKED_MAX|PARKED_MONITOR_MAX|CACHE_TTL|PROMPT_CACHE_TTL)[ ]*=/ {
+	name = $0
+	sub(/^(local |readonly )/, "", name)
+	sub(/[ ]*=.*/, "", name)
+	put(name, FILENAME, FNR, num($0))
+}
+f == "bin/cc-roster" && /cap[ ]*=.*"monitor"/ {
+	# the first number after ? is the monitor cap, the last one on the line the general cap
+	s = substr($0, index($0, "?"))
+	if (match(s, /[0-9]+/))
+		put("PARKED_MONITOR_MAX", FILENAME, FNR, substr(s, RSTART, RLENGTH))
+	while (match(s, /[0-9]+/)) {
+		last = substr(s, RSTART, RLENGTH)
+		s = substr(s, RSTART + RLENGTH)
+	}
+	put("PARKED_MAX", FILENAME, FNR, last)
+}
+f ~ /^bin\// {
+	if (heredoc != "") { if ($0 == heredoc) heredoc = ""; next }
+	if (match($0, /<<-?['"]?[A-Z_]+/)) {
+		heredoc = substr($0, RSTART, RLENGTH)
+		sub(/^<<-?['"]?/, "", heredoc)
+	}
+	if (/^[ \t]*#/ || /--no-auto-start/) next
+	if (/wezterm cli/ || /"wezterm", *"cli"/) {
+		if (!(f in calls)) order[++nfiles] = f
+		calls[f] = calls[f] " " FNR
+		ncalls++
+	}
+}
+END {
+	agree("PARKED_MONITOR_MAX", parked_files, "PARKED_MONITOR_MAX")
+	agree("PARKED_MAX", parked_files, "PARKED_MAX")
+	agree("CACHE_TTL", ttl_files, "CACHE_TTL")
+	if (!ncalls) print "ok\twezterm cli: every call passes --no-auto-start"
+	else {
+		print "FAIL\twezterm cli: " ncalls " calls without --no-auto-start," \
+			" which can start a headless mux server"
+		for (i = 1; i <= nfiles; i++)
+			print "more\t    " order[i] ":" substr(calls[order[i]], 2)
+	}
+	if (!wantdone) print "nowant"
+	if (!survey) print "nosurvey"
+}
+AWK
+
+# setup.sh's $want object, run against settings.json with setup.sh's own norm
+check_hooks() {
+	local defs=$1 obj=$2 mline=$3 out line n=0 bad=""
+	if [[ -z $obj ]]; then
+		report FAIL "hooks: no \$want object found in setup.sh (cc-doctor needs updating)"
+		return
+	fi
+	[[ -f $SETTINGS ]] || { report FAIL "hooks: no $SETTINGS (rerun setup.sh)"; return; }
+	out=$(jq -r --arg home "$HOME" "$defs"$'\n'"($obj) as \$want"$'\n''
+	| . as $s
+	| ([$want[].hooks[]] | length | "n\t\(.)"),
+	  ($want | to_entries[] | .key as $ev | .value as $w
+	  | ([$s.hooks[$ev][]?.hooks[]?.command | norm]) as $got
+	  | ($w.hooks[] | (.command | norm) as $c | select(any($got[]; . == $c) | not)
+	    | "bad\t\($ev) does not run \($c)"),
+	    (select($w | has("matcher"))
+	    | [$w.hooks[].command | norm] as $mine
+	    | $s.hooks[$ev][]? | select(any(.hooks[]?.command | norm; IN($mine[])))
+	    | select(.matcher != $w.matcher)
+	    | "bad\t\($ev) matcher is \(.matcher // "(none)"),"
+	      + " setup.sh:'"$mline"' wants \($w.matcher)"))
+	' "$SETTINGS" 2>&1) || {
+		report FAIL "hooks: jq failed on setup.sh's object or settings.json: ${out%%$'\n'*}"
+		return
+	}
+	while IFS= read -r line; do
+		case ${line%%$'\t'*} in
+		n) n=${line#*$'\t'} ;;
+		bad) bad+="    ${line#*$'\t'}"$'\n' ;;
+		esac
+	done <<<"$out"
+	if [[ -n $bad ]]; then
+		report FAIL "hooks: settings.json is not what setup.sh registers (rerun setup.sh)" \
+			"${bad%$'\n'}"
+	else
+		report ok "hooks: all $n commands setup.sh registers are there, matcher equal"
+	fi
+}
+
+check_wezterm_config() {
+	local out line
+	if ! command -v wezterm >/dev/null; then
+		report warn "wezterm.lua: no wezterm to load it with"
+		return
+	fi
+	out=$(wezterm --config-file "$REPO/wezterm.lua" ls-fonts 2>&1 >/dev/null)
+	while IFS= read -r line; do
+		if [[ $line == *ERROR* ]]; then
+			report FAIL "wezterm.lua: does not load: ${line#*ERROR}"
+			return
+		fi
+	done <<<"$out"
+	report ok "wezterm.lua: loads (ls-fonts, no ERROR)"
+}
+
+check_survey() {
+	local survey=$1 where=$2
+	if [[ -z $RUNNING ]]; then
+		report warn "survey: no Claude Code found in $VERSIONS"
+	elif ver_lt "$survey" "$RUNNING"; then
+		report warn "survey: behind, Claude Code is $RUNNING and $where says $survey:" \
+			"    read the changelog from $survey on, and cc-doctor --enums --diff"
+	else
+		report ok "survey: $where is at $survey, running $RUNNING"
+	fi
+}
+
+check_enums() {
+	local prev n list
+	if [[ -z $RUNNING ]] || ! command -v strings >/dev/null; then
+		report warn "enums: no Claude Code binary or no strings(1) to read it with"
+		return
+	fi
+	if ! snapshot "$RUNNING" "$VERSIONS/$RUNNING" 2>/dev/null; then
+		report FAIL "enums: nothing extracted from $RUNNING (cc-doctor needs updating)"
+		return
+	fi
+	IFS= read -r prev <"$ENUMS/$RUNNING.diff"
+	prev=${prev#\#from }
+	n=$(changes "$ENUMS/$RUNNING.diff")
+	local what="$n changes"
+	((n == 1)) && what="1 change"
+	if [[ $prev == - ]]; then
+		report ok "enums: $RUNNING is the first snapshot, nothing to compare with"
+	elif ((n == 0)); then
+		report ok "enums: nothing new in $RUNNING since $prev"
+	elif [[ -e $ENUMS/$RUNNING.ack ]]; then
+		report ok "enums: $what in $RUNNING since $prev, acknowledged"
+	else
+		list=$(show_diff <"$ENUMS/$RUNNING.diff")
+		report FAIL "enums: $what in $RUNNING since $prev not acknowledged" \
+			"${list//  /    }"$'\n'"    tell the readers, then: cc-doctor --enums --ack"
+	fi
+}
+
+cmd_doctor() {
+	local real out line tag rest defs="" obj="" mline="?" survey="" swhere=""
+	real=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
+	REPO=${real%/bin/*}
+	[[ -f $REPO/setup.sh ]] || die "cannot find the repo from ${BASH_SOURCE[0]}"
+	running_version
+
+	check_links
+
+	local ttl="wezterm.lua bin/cc-board bin/cc-fleet bin/cc-handover bin/wz"
+	local parked="wezterm.lua bin/cc-board bin/cc-roster"
+	out=$(LC_ALL=C awk -v repo="$REPO" -v ttl_files="$ttl" -v parked_files="$parked" \
+		"$REPO_AWK" "$REPO/setup.sh" "$REPO/docs/research/sources.md" "$REPO/wezterm.lua" \
+		"$REPO"/bin/*)
+	local results="" more
+	while IFS= read -r line; do
+		tag=${line%%$'\t'*}
+		rest=${line#*$'\t'}
+		case $tag in
+		jqdef) defs+="$rest"$'\n' ;;
+		jqobj) obj+="$rest"$'\n' ;;
+		matcherline) mline=$rest ;;
+		survey) survey=${rest%%$'\t'*}; swhere=${rest#*$'\t'} ;;
+		ok | FAIL | more) results+="$line"$'\n' ;;
+		esac
+	done <<<"$out"
+
+	check_hooks "$defs" "$obj" "$mline"
+
+	# the awk's verdicts, a FAIL followed by its continuation lines
+	tag="" more=""
+	while IFS= read -r line; do
+		[[ -n $line ]] || continue
+		if [[ ${line%%$'\t'*} == more ]]; then
+			more+="${line#*$'\t'}"$'\n'
+			continue
+		fi
+		[[ -n $tag ]] && report "$tag" "$rest" "${more%$'\n'}"
+		tag=${line%%$'\t'*}
+		rest=${line#*$'\t'}
+		more=""
+	done <<<"$results"
+	[[ -n $tag ]] && report "$tag" "$rest" "${more%$'\n'}"
+
+	check_wezterm_config
+	if [[ -n $survey ]]; then
+		check_survey "$survey" "$swhere"
+	else
+		report warn "survey: no Claude Code version found in docs/research/sources.md"
+	fi
+	check_enums
+	exit "$FAILED"
+}
+
+case ${1:-} in
+--enums) shift; cmd_enums "$@" ;;
+--quiet) QUIET=true; cmd_doctor ;;
+-h | --help) usage ;;
+"") cmd_doctor ;;
+*) usage >&2; exit 2 ;;
+esac

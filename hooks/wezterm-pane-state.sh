@@ -5,7 +5,7 @@
 # The state is argv, not the payload, so this stays independent of hook field names.
 # Three events need the payload too, each the only source of what it carries:
 #   notify   only the message says why Claude stopped
-#   done     background_tasks tells finished from parked
+#   done     background_tasks and session_crons tell finished from parked
 #   errored  Stop does not fire when a turn dies on an API error
 #
 # Must stay silent (some hooks inject stdout into context) and never exit non-zero
@@ -57,6 +57,9 @@ ping() {
 		case $1 in
 		push_notification) set -- 0.8 "$who" "$2" ;;
 		worker_permission_prompt) set -- 0.7 "$who: a worker wants approval" "$2" ;;
+		quota_auto_resume_stale) set -- 0.7 "$who: usage limit reset, waiting for Enter" "$2" ;;
+		quota_auto_resume_disabled) set -- 0.7 "$who: usage limit, will not resume" "$2" ;;
+		auth_storage_failure) set -- 0.7 "$who: login could not be saved" "$2" ;;
 		*) set -- 0.4 "$who: refused, fell back" "$2" --quiet ;;
 		esac
 		sticky=""
@@ -70,16 +73,27 @@ notify)
 	msg=$(field message '^"')
 	# A session can say something on purpose: its PushNotification tool, a background
 	# worker waiting on approval, a refusal that fell back to another model. A toast each,
-	# ranked for LEADER+t; the message test below still decides the pane's state
+	# ranked for LEADER+t. The type decides the state, never the message: a push that
+	# mentions permission is not a prompt
 	kind=$(field notification_type 'a-z_')
 	case $kind in
-	push_notification | worker_permission_prompt | model_refusal_fallback) ping "$kind" "$msg" ;;
+	push_notification | worker_permission_prompt | model_refusal_fallback | \
+		quota_auto_resume_stale | quota_auto_resume_disabled | auth_storage_failure)
+		ping "$kind" "$msg"
+		;;
 	esac
-	case $msg in
-	*permission*)
+	case $kind in
+	permission_prompt | worker_permission_prompt)
 		state=asking
 		detail=$(printf '%s' "$msg" |
 			sed -n 's/.*to use \([A-Za-z][A-Za-z0-9_-]*\).*/\1/p' | head -1)
+		;;
+	quota_auto_resume_stale | quota_auto_resume_disabled)
+		# A rate_limit errored record reads as parked until the reset, since Claude
+		# resumes it then (autoContinueAtUsageLimit). These two say it will not: stale
+		# slept through the reset and waits for Enter, disabled never resumes
+		state=errored
+		detail=rate_limit_${kind#quota_auto_resume_}
 		;;
 	*)
 		# the 60s idle nag: Stop already recorded the truth, so leave it standing
@@ -115,6 +129,13 @@ done)
 			sed -n 's/.*"background_tasks"[[:space:]]*:[[:space:]]*\[[^]]*"type"[[:space:]]*:[[:space:]]*"\([A-Za-z_ -]*\)".*/\1/p' |
 			head -1)
 	fi
+	# A /loop, ScheduleWakeup or CronCreate starts the next turn itself: done would let the
+	# pane go cold and read as closable while the loop is still running
+	if [ "$state" = done ] && printf '%s' "$payload" |
+		grep -q '"session_crons"[[:space:]]*:[[:space:]]*\[[[:space:]]*{'; then
+		state=parked
+		detail=cron
+	fi
 	;;
 errored)
 	# StopFailure. Docs say `error`, one report says `error_type`, so both are tried.
@@ -132,7 +153,8 @@ sid=$(field session_id '0-9a-fA-F-')
 if [ -n "$sid" ] && [ "$state" != ended ]; then
 	map="$HOME/.claude/wezterm-sessions"
 	[ -d "$map" ] || mkdir -p "$map" 2>/dev/null
-	printf '%s\n' "$sid" >"$map/$WEZTERM_PANE" 2>/dev/null
+	printf '%s\n' "$sid" >"$map/.$WEZTERM_PANE.$$" 2>/dev/null &&
+		mv -f "$map/.$WEZTERM_PANE.$$" "$map/$WEZTERM_PANE" 2>/dev/null
 fi
 
 dir="$HOME/.claude/wezterm-state"

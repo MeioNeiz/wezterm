@@ -15,6 +15,7 @@
 # Silent on stdout on purpose: a SessionStart hook's stdout is injected into the session.
 
 set -u
+wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
 # The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
 PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # shellcheck source=bin/cc-colour
@@ -53,7 +54,7 @@ unpaint() {
 
 # The tty of one pane, by pane id. Hooks run detached, so /dev/tty is not the pane.
 pane_tty() {
-	wezterm cli list --format json 2>/dev/null | python3 -c '
+	wzcli list --format json 2>/dev/null | python3 -c '
 import json, sys
 want = int(sys.argv[1])
 for p in json.load(sys.stdin):
@@ -84,7 +85,7 @@ claude_tty() {
 # pane id, tty, tab-relative order. Only panes the SessionStart hook has claimed, so a
 # plain shell split keeps the colours it came with.
 claude_panes() {
-	wezterm cli list --format json 2>/dev/null | python3 -c '
+	wzcli list --format json 2>/dev/null | python3 -c '
 import json, sys, os
 home = os.path.expanduser("~")
 for p in json.load(sys.stdin):

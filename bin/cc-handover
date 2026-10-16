@@ -5,18 +5,28 @@
 # because a successor that can go and look beats one holding a summary.
 
 set -u
+wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
 
 readonly FLEET="$HOME/.claude/fleet"
 readonly OUT="$FLEET/handover"
-# A gather (.tab, or several sources) records its sources here, keyed by the receiving
-# pane: `pane\tsid\tname` per line. ccx reads it to close them once Jacob is satisfied
+# A gather (.tab, or several sources) or any --new records its sources here, keyed by
+# the receiving pane: `pane\tsid\tname` per line. ccx reads it to close them: a gather's
+# once Jacob is satisfied, a plain --new's at once
 readonly GATHERED="$FLEET/gathered"
-# What a gather types, unsent, into the receiver: Enter on it closes the sources
+# What is typed, unsent, into the receiver: Enter on it closes the sources
 readonly PREFILL='!ccx'
 # A fresh session is polled until it is busy on the brief; typing before its prompt is up
 # loses the keys
 readonly PREFILL_POLL=0.5
 readonly PREFILL_TRIES=120
+# A plain --new closes its source itself once that has stopped: a self-handover is
+# mid-turn until it has reported. Past this the source stays; !ccx typed in the new
+# session still closes it
+readonly CLOSE_POLL=2
+readonly CLOSE_TRIES=900
+# A source's screen is saved beside the brief: its pane may be closed by this very run,
+# and a pane id is reused, so a `wz read <id>` in the brief can read a stranger later
+readonly SCROLLBACK_LINES=200
 # Transcripts reach 13MB; the useful part is the end.
 readonly TAIL_BYTES=400000
 # Past this inline, the new session is handed the file path instead.
@@ -37,17 +47,25 @@ cc-handover - hand a session's work to a fresh one
 
   cc-handover [T]                    print the brief for a session (default: this one)
   cc-handover [T] --new [--right|--down|--tab|--window]
-                                     open a fresh session, seeded with it
+                                     open a fresh session, seeded with it; the source
+                                     closes once the new one is on the brief and it
+                                     has stopped
   cc-handover [T] --new --in <pane>  open it split from that pane, in that pane's tab
   cc-handover [T] --to <pane>        paste the brief into a session already open
   cc-handover .tab --to <pane>       gather: send it, then type !ccx there (unsent) to
                                      close the sources once you are satisfied; refused
                                      when that one is idle and cold, since pasting wakes it
   cc-handover [T] --save             just write the file and print its path
+  cc-handover [T] --fork [--right|--down|--tab|--window]
+                                     a copy of the session, whole conversation, in a
+                                     new pane; the source carries on. No brief: the copy
+                                     knows everything. Refused when cold, where a fork
+                                     re-reads the whole context and a brief is cheaper
   cc-handover [T] --new --dry-run    print the command it would run, and stop
 
   --turns N     how many substantive replies to carry (default 3)
   --why <text>  a line saying why the work moved
+  --account <name>  the account --new or --fork runs on (default: the folder's; cc-account)
 
 T is a session name, a session id, a pane id, "." for this session, or ".tab" for every
 other live session on this pane's tab.
@@ -89,9 +107,11 @@ in_pane=""
 turns=3
 why=""
 dry=false
+account=""
 while (($#)); do
 	case $1 in
 	--new) action=new ;;
+	--fork) action=fork ;;
 	--dry-run) dry=true ;;
 	--save) action=save ;;
 	--to) shift; to=${1:-}; action=to; [[ -n $to ]] || die "--to needs a pane" ;;
@@ -103,6 +123,7 @@ while (($#)); do
 	--window) split="window" ;;
 	--turns) shift; turns=${1:-3} ;;
 	--why) shift; why=${1:-} ;;
+	--account) shift; account=${1:-}; [[ -n $account ]] || die "--account needs a name" ;;
 	-h | --help) usage; exit 0 ;;
 	-*) die "unknown option $1" ;;
 	*) targets+=("$1") ;;
@@ -138,7 +159,7 @@ row_for() {
 tab_siblings() {
 	local tab panes out
 	[[ -n ${WEZTERM_PANE:-} ]] || die ".tab needs WEZTERM_PANE; run it from a wezterm pane"
-	panes=$(wezterm cli list --format json 2>/dev/null |
+	panes=$(wzcli list --format json 2>/dev/null |
 		jq -r --argjson me "${WEZTERM_PANE}" '
 			(map(select(.pane_id == $me)) | first | .tab_id) as $t
 			| .[] | select(.tab_id == $t and .pane_id != $me) | .pane_id')
@@ -164,7 +185,7 @@ LEAD_NAME=""
 
 render_session() {
 	local sid name cwd pane transcript title last_prompt last_prompt_at queued
-	local replies files branch dirty note tailfile outputs
+	local replies files branch dirty note tailfile outputs scroll
 
 	IFS=$'\x1f' read -r sid name cwd pane < <(
 		printf '%s\n' "$1" | awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s", $1, $2, $6, $5 }'
@@ -259,6 +280,16 @@ render_session() {
 	cache_note "$sid"
 	[[ -n $CACHE_NOTE ]] && printf '%s: %s\n' "$name" "$CACHE_NOTE" >&2
 
+	scroll=""
+	if [[ $pane != "-" ]]; then
+		scroll="${file%.md}.${name//[^A-Za-z0-9._-]/-}.scrollback.txt"
+		# Blank lines are most of a Claude pane: runs of them become one, padding goes
+		wzcli get-text --pane-id "$pane" --start-line "-$SCROLLBACK_LINES" 2>/dev/null |
+			awk '{ sub(/[[:space:]]+$/, "") }
+				$0 == "" { if (!b++) print ""; next } { b = 0; print }' >"$scroll"
+		[[ -s $scroll ]] || { rm -f "$scroll"; scroll=""; }
+	fi
+
 	{
 		printf '## From %s' "$name"
 		[[ -n $title ]] && printf ' - %s' "$title"
@@ -286,8 +317,12 @@ render_session() {
 				awk -F'\t' '{ printf "- `%s` (%d KB)\n", $1, ($2 + 1023) / 1024 }'
 			printf '\n'
 		fi
-		if [[ $pane != "-" ]]; then
-			printf 'Its pane is still open: `wz read %s -n 200` gives the scrollback.\n\n' "$pane"
+		[[ -n $scroll ]] && printf 'Its screen at the handover, the last %s lines: `%s`\n\n' \
+			"$SCROLLBACK_LINES" "$scroll"
+		# By name: wz resolves it through cc-roster, so it fails once the session is gone
+		if [[ $pane != "-" ]] && ! closes_source "$pane"; then
+			printf 'Its pane stays open: `wz read %s -n %s` shows it now.\n\n' \
+				"$name" "$SCROLLBACK_LINES"
 		fi
 		# Never point a successor at resuming a cold session: that re-reads it all
 		if [[ $CACHE_WARM == warm ]]; then
@@ -301,6 +336,16 @@ render_session() {
 	} >>"$file"
 
 	rm -f "$tailfile" "$tailfile.users"
+}
+
+# Whether this run closes the source in that pane: --new closes it itself, a gather types
+# !ccx into the receiver
+closes_source() {
+	case $action in
+	new) ! $dry ;;
+	to) $gather && [[ $1 != "$pane_to" ]] ;;
+	*) return 1 ;;
+	esac
 }
 
 # Whether resuming a session would hit its prompt cache. A cold one is never woken or
@@ -386,6 +431,32 @@ for t in "${targets[@]}"; do
 done
 ((${#rows[@]} > 1)) && gather=true
 
+# --fork: no brief, nothing closes; the warm check is the whole decision
+if [[ $action == fork ]]; then
+	$gather && die "--fork takes one session, not a gather"
+	IFS=$'\x1f' read -r fsid fname fpane fcwd < <(
+		printf '%s\n' "${rows[0]}" |
+			awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s", $1, $2, $5, $6 }'
+	)
+	cache_note "$fsid"
+	[[ $CACHE_WARM == warm ]] ||
+		die "--fork: $fname's prompt cache is ${CACHE_WARM:-of unknown warmth}${CACHE_COST:+ \
+($CACHE_COST to re-read)}; use --new for a fresh session with a brief"
+	[[ $fpane != "-" || $split == window ]] ||
+		die "$fname has no pane to split from; use --window"
+	spawn_where=$split
+	case $split in tab | window) spawn_where="--$split" ;; esac
+	spawn=(cc-spawn --cwd "${fcwd:-$PWD}" --fork "$fsid" --print-sid "$spawn_where")
+	[[ $fpane != "-" ]] && spawn+=(--from "$fpane")
+	[[ -n $in_pane ]] && spawn+=(--from "$in_pane")
+	[[ -n $account ]] && spawn+=(--account "$account")
+	$dry && spawn+=(--dry-run)
+	out=$("${spawn[@]}") || exit 1
+	$dry && { printf '%s\n' "$out"; exit 0; }
+	echo "forked $fname into pane ${out%%$'\t'*} (session ${out#*$'\t'}); $CACHE_NOTE"
+	exit 0
+fi
+
 # The sources, minus the receiver, for ccx
 write_gathered() {
 	local receiver=$1 row
@@ -402,13 +473,38 @@ prefill_later() {
 	local receiver=$1
 	(
 		for ((i = 0; i < PREFILL_TRIES; i++)); do
-			if cc-roster 2>/dev/null |
-				awk -F'\t' -v p="$receiver" '$5 == p && $3 == "busy" { f = 1 } END { exit !f }'
-			then
-				wezterm cli send-text --no-paste --pane-id "$receiver" -- "$PREFILL"
+			if receiver_busy "$receiver"; then
+				wzcli send-text --no-paste --pane-id "$receiver" -- "$PREFILL"
 				exit 0
 			fi
 			sleep "$PREFILL_POLL"
+		done
+	) </dev/null >/dev/null 2>&1 &
+	disown 2>/dev/null
+}
+
+# The receiver is on the brief. By session id when cc-spawn gave one: a pane id can be
+# taken by another session before this one is up
+receiver_busy() {
+	cc-roster 2>/dev/null | awk -F'\t' -v p="$1" -v s="${new_sid:-}" '
+		(s != "" ? $1 == s : $5 == p) && $3 == "busy" { f = 1 } END { exit !f }'
+}
+
+# Detached: once the receiver is busy on the brief, run ccx as the receiver until it has
+# closed the source. ccx skips a source that is mid-turn or holding a prompt open and
+# keeps it listed, so this retries until it stops. Gives up silently
+close_later() {
+	local receiver=$1
+	(
+		for ((i = 0; i < PREFILL_TRIES; i++)); do
+			receiver_busy "$receiver" && break
+			sleep "$PREFILL_POLL"
+		done
+		((i < PREFILL_TRIES)) || exit 0
+		for ((i = 0; i < CLOSE_TRIES; i++)); do
+			[[ -s $GATHERED/$receiver ]] || exit 0
+			WEZTERM_PANE=$receiver ccx
+			sleep "$CLOSE_POLL"
 		done
 	) </dev/null >/dev/null 2>&1 &
 	disown 2>/dev/null
@@ -475,6 +571,10 @@ brief=$(<"$file")
 if ((${#brief} > INLINE_MAX)); then
 	brief="Read $file and continue that work. It is a handover brief from a session
 that ran out of room; it names the source transcript if you need more than it carries."
+	# Said up front: told "a session", a receiver took the first section for the whole job
+	((${#rows[@]} > 1)) && brief="Read $file and continue that work. It is a handover
+brief gathering ${#rows[@]} sessions into this one, a section each: carry on all ${#rows[@]}, not
+just the first. Each section names its transcript if you need more than it carries."
 fi
 
 case $action in
@@ -485,11 +585,11 @@ print)
 	printf '%s\n' "$(<"$file")"
 	;;
 to)
-	wezterm cli send-text --pane-id "$pane_to" -- "$brief"
+	wzcli send-text --pane-id "$pane_to" -- "$brief"
 	if $gather; then
 		# chosen as the receiver on purpose, so sent: the prefill needs an empty prompt
 		sleep 0.3
-		wezterm cli send-text --no-paste --pane-id "$pane_to" -- $'\r'
+		wzcli send-text --no-paste --pane-id "$pane_to" -- $'\r'
 		write_gathered "$pane_to"
 		prefill_later "$pane_to"
 		echo "gathered ${#rows[@]} sessions into pane $pane_to; $PREFILL there closes them"
@@ -504,22 +604,33 @@ new)
 	# parser takes the first bare word as the start of the prompt.
 	spawn_where=$split
 	case $split in tab | window) spawn_where="--$split" ;; esac
-	spawn=(cc-spawn --cwd "$cwd" "$spawn_where")
-	[[ $pane != "-" ]] && spawn=(cc-spawn --cwd "$cwd" --from "$pane" "$spawn_where")
+	spawn=(cc-spawn --cwd "$cwd" --print-sid "$spawn_where")
+	[[ $pane != "-" ]] &&
+		spawn=(cc-spawn --cwd "$cwd" --print-sid --from "$pane" "$spawn_where")
 	# --in: split from a pane elsewhere, so the new session lands in that pane's tab
-	[[ -n $in_pane ]] && spawn=(cc-spawn --cwd "$cwd" --from "$in_pane" "$spawn_where")
+	[[ -n $in_pane ]] &&
+		spawn=(cc-spawn --cwd "$cwd" --print-sid --from "$in_pane" "$spawn_where")
+	[[ -n $account ]] && spawn+=(--account "$account")
 	$dry && spawn+=(--dry-run)
 	new=$("${spawn[@]}" -- "$brief") || exit 1
+	new_sid=""
+	if ! $dry && [[ $new == *$'\t'* ]]; then
+		new_sid=${new#*$'\t'}
+		new=${new%%$'\t'*}
+	fi
 	if $dry; then
 		printf '%s\n' "$new"
 		printf 'brief: %s\n' "$file"
 		exit 0
 	fi
 	[[ -n $new ]] || die "could not open a pane for the handover"
+	write_gathered "$new"
 	if $gather; then
-		write_gathered "$new"
 		prefill_later "$new"
 		echo "gathered ${#rows[@]} sessions into pane $new; $PREFILL is typed there to close them"
+	elif [[ -s $GATHERED/$new ]]; then
+		close_later "$new"
+		echo "handed $name over to pane $new; $name closes itself once it has stopped"
 	else
 		echo "handed $name over to pane $new"
 	fi

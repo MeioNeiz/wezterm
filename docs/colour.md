@@ -13,7 +13,7 @@ told apart by **what carries them**, not by hue:
 |---|---|---|
 | the pane itself | - | background hue, cursor, selection (OSC, see below) |
 | statusLine | the context % when it warns | the whole line: title bright, metadata muted |
-| tab bar | the dot in front of each label | the label text |
+| tab bar | the dot in front of each label | the label text; the active tab is lifted in it |
 | cc-board | state glyph, topic, asking-mauve | name column, cursor, address line |
 | cc-fleet, LEADER+; picker | state glyph | name column |
 | window status bar | - | the workspace name, from the focused pane |

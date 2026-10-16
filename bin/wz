@@ -3,6 +3,7 @@
 # resolve through cc-roster, so the address SendMessage takes works here too.
 
 set -u
+wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
 # The GUI runs these with PATH=/usr/bin:/bin:/usr/sbin:/sbin: no wezterm, no cc-*
 PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # file mtime: BSD stat on macOS; GNU elsewhere, where `stat -f` means the filesystem
@@ -62,11 +63,13 @@ driving
   wz go <target>                      focus a pane, switching tab and workspace
   wz join <src> <target> [--right|--left|--top|--bottom]
   wz break <target>                   move a pane out to its own tab
-  wz notify [--say] [--quiet] [--for S | --sticky] [--pane N] [--rank R] <title> [body]
-                                      a sound and a toast for S seconds (20), or until
+  wz notify [--say] [--quiet] [--for S | --sticky] [--compact] [--pane N] [--rank R]
+            <title> [body]            a sound and a toast for S seconds (20), or until
                                       you are on pane N with --sticky; a click goes to
                                       pane N, and it wears that session's colour; R (0-1)
-                                      is how much it matters, for LEADER+t; --say speaks it
+                                      is how much it matters: the stack's order, highest
+                                      on top, and LEADER+t; --compact is a one-line pill
+                                      that opens on hover; --say speaks it
 
 <target> is a wezterm pane id, a session name, a session id, or "." for this pane.
 A name it used to have works too, and cc-roster says so on stderr when one is used.
@@ -87,7 +90,7 @@ die() {
 
 # Field order used throughout: ws, win, tab, pane, active, dir, tty, title.
 pane_tsv() {
-	wezterm cli list --format json 2>/dev/null | jq -r '
+	wzcli list --format json 2>/dev/null | jq -r '
 		.[] | [
 			.workspace,
 			(.window_id | tostring),
@@ -213,9 +216,9 @@ cmd_read() {
 	pane=$(resolve "$target") || exit 1
 	{
 		if ((lines > 0)); then
-			wezterm cli get-text --pane-id "$pane" --start-line "-$lines"
+			wzcli get-text --pane-id "$pane" --start-line "-$lines"
 		else
-			wezterm cli get-text --pane-id "$pane"
+			wzcli get-text --pane-id "$pane"
 		fi
 	} | if ((tail_n > 0)); then
 		# Blank lines are most of a Claude pane and none of the answer.
@@ -308,7 +311,7 @@ cmd_grep() {
 		[[ $sess != "-" ]] && label="$label @$sess"
 		printf '%s\t%s\n' "$pnum" "$label" >>"$tmp/index"
 		files[i]="$tmp/$i"
-		wezterm cli get-text --pane-id "$pnum" --start-line "-$lines" >"$tmp/$i" 2>/dev/null &
+		wzcli get-text --pane-id "$pnum" --start-line "-$lines" >"$tmp/$i" 2>/dev/null &
 		i=$((i + 1))
 		((i % GREP_JOBS == 0)) && wait
 	done < <(rows_in_scope "$(scope_ws $all)" false)
@@ -331,7 +334,7 @@ cmd_grep() {
 
 	if $select; then
 		[[ -n $first ]] || die "grep: nothing matched, nothing to focus"
-		wezterm cli activate-pane --pane-id "$first"
+		wzcli activate-pane --pane-id "$first"
 	fi
 }
 
@@ -448,9 +451,9 @@ cmd_send() {
 	(($#)) || die "send: need something to type"
 	pane=$(resolve "$target") || exit 1
 	$force || refuse_cold "$pane" || exit 1
-	wezterm cli send-text --pane-id "$pane" -- "$*"
+	wzcli send-text --pane-id "$pane" -- "$*"
 	if $enter; then
-		printf '\r' | wezterm cli send-text --pane-id "$pane" --no-paste
+		printf '\r' | wzcli send-text --pane-id "$pane" --no-paste
 	fi
 }
 
@@ -465,12 +468,26 @@ cmd_key() {
 	$force || refuse_cold "$pane" || exit 1
 	for k in "$@"; do
 		bytes=$(key_bytes "$k") || exit 1
-		printf '%s' "$bytes" | wezterm cli send-text --pane-id "$pane" --no-paste
+		printf '%s' "$bytes" | wzcli send-text --pane-id "$pane" --no-paste
 	done
 }
 
 # Written beside the dir and renamed in, so the drain never reads half a file. A tab or a
 # newline inside a field would be read as a field or a verb of its own.
+# Wakes the GUI to drain the queue now rather than on its next 0.1s tick: a SetUserVar on
+# the focused pane's tty fires user-var-changed, which only a pane on screen does. Lost or
+# not, the file is still there for the tick, and claiming it by rename runs it once
+poke_lua() {
+	local focused=${1:-} tty
+	[[ $focused =~ ^[0-9]+$ ]] || return 0
+	load
+	tty=$(printf '%s\n' "$PANES" | awk -F'\t' -v p="$focused" '$4 == p { print $7; exit }')
+	[[ -n $tty && -w /dev/$tty ]] || return 0
+	printf '\033]1337;SetUserVar=wz_poke=%s\007' \
+		"$(printf '%s' "$$.$RANDOM" | base64)" >"/dev/$tty" 2>/dev/null
+	return 0
+}
+
 queue_action() {
 	local a=${1:-} b=${2:-} c=${3:-} tmp
 	a=${a//[$'\t\n\r']/ }
@@ -487,18 +504,22 @@ queue_action() {
 cmd_go() {
 	(($#)) || die "go: need a target"
 	local pane target_ws here
+	local focused=""
 	pane=$(resolve "$1") || exit 1
 	load
 	target_ws=$(printf '%s\n' "$PANES" | awk -F'\t' -v p="$pane" '$4 == p { print $1; exit }')
-	here=$(wezterm cli list-clients --format json 2>/dev/null |
-		jq -r '.[0].workspace // empty' 2>/dev/null)
+	# the client touched last is the one Jacob is at, if a second is ever attached
+	IFS=$'\t' read -r here focused < <(wzcli list-clients --format json 2>/dev/null |
+		jq -r 'min_by(.idle_time.secs) | [.workspace // "-", .focused_pane_id // "-"] | @tsv' \
+			2>/dev/null)
 
-	if [[ -n $target_ws && -n $here && $target_ws != "$here" ]]; then
+	if [[ -n $target_ws && -n $here && $here != - && $target_ws != "$here" ]]; then
 		queue_action goto "$pane" "$target_ws"
+		poke_lua "$focused"
 		echo "switching to $target_ws, pane $pane"
 		return
 	fi
-	wezterm cli activate-pane --pane-id "$pane"
+	wzcli activate-pane --pane-id "$pane"
 }
 
 # split-pane --move-pane-id is join-pane: across tabs and windows; `wz break` undoes it.
@@ -519,7 +540,7 @@ cmd_join() {
 	s=$(resolve "$src") || exit 1
 	t=$(resolve "$target") || exit 1
 	[[ $s != "$t" ]] || die "join: source and target are the same pane"
-	wezterm cli split-pane --pane-id "$t" --move-pane-id "$s" "$dir" >/dev/null
+	wzcli split-pane --pane-id "$t" --move-pane-id "$s" "$dir" >/dev/null
 	echo "moved pane $s beside $t (${dir#--})"
 }
 
@@ -527,7 +548,7 @@ cmd_break() {
 	(($#)) || die "break: need a target"
 	local pane
 	pane=$(resolve "$1") || exit 1
-	wezterm cli move-pane-to-new-tab --pane-id "$pane" >/dev/null
+	wzcli move-pane-to-new-tab --pane-id "$pane" >/dev/null
 	echo "pane $pane is on its own tab"
 }
 
@@ -566,12 +587,13 @@ notify_log() {
 }
 
 cmd_notify() {
-	local sound=true speak=false secs=20 pane="" rank="" sticky=false
+	local sound=true speak=false secs=20 pane="" rank="" sticky=false compact=false
 	while (($#)); do
 		case ${1:-} in
 		--quiet) sound=false; shift ;;
 		--say) speak=true; shift ;;
 		--sticky) sticky=true; shift ;;
+		--compact) compact=true; shift ;;
 		--for) secs=${2:-}; shift 2 || shift
 			[[ $secs =~ ^[0-9]+$ ]] || die "notify: --for needs whole seconds" ;;
 		--pane) pane=${2:-}; shift 2 || shift
@@ -597,6 +619,8 @@ cmd_notify() {
 		args=(--title "$title" --body "$body" --seconds "$secs")
 		[[ -n $pane ]] && args+=(--pane "$pane")
 		$sticky && args+=(--sticky)
+		$compact && args+=(--compact)
+		[[ -n $rank ]] && args+=(--rank "$rank")
 		local colour
 		colour=$(pane_hue "$pane")
 		[[ -n $colour ]] && args+=(--colour "$colour")
@@ -606,7 +630,7 @@ cmd_notify() {
 	elif [[ $OSTYPE == darwin* ]]; then
 		osascript -e "display notification \"$(osa_quote "$body")\" \
 			with title \"$(osa_quote "$title")\"" 2>/dev/null
-	elif wezterm cli list --format json >/dev/null 2>&1; then
+	elif wzcli list --format json >/dev/null 2>&1; then
 		queue_action toast "$title" "$body"
 	else
 		notify-send -- "$title" "$body" 2>/dev/null
@@ -781,7 +805,7 @@ ensure_daemon() {
 		pid=$(<"$EVENT_PID")
 		kill -0 "$pid" 2>/dev/null && return 0
 	fi
-	wezterm cli list --format json >/dev/null 2>&1 ||
+	wzcli list --format json >/dev/null 2>&1 ||
 		die "events: the daemon is not running and there is no wezterm mux to start it on"
 	mkdir -p "$CACHE"
 	nohup "$HOME/.claude/bin/wz" events --daemon </dev/null >/dev/null 2>&1 &
@@ -909,10 +933,10 @@ cmd_wait() {
 
 pipe_loop() {
 	local pane=$1 interval=$2 lines=$3 prev cur
-	prev=$(wezterm cli get-text --pane-id "$pane" --start-line "-$lines" 2>/dev/null)
+	prev=$(wzcli get-text --pane-id "$pane" --start-line "-$lines" 2>/dev/null)
 	while :; do
 		sleep "$interval"
-		cur=$(wezterm cli get-text --pane-id "$pane" --start-line "-$lines" 2>/dev/null)
+		cur=$(wzcli get-text --pane-id "$pane" --start-line "-$lines" 2>/dev/null)
 		[[ $cur == "$prev" ]] && continue
 		diff <(printf '%s\n' "$prev") <(printf '%s\n' "$cur") | sed -n 's/^> //p'
 		prev=$cur

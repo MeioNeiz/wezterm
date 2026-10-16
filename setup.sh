@@ -37,6 +37,10 @@ for f in "$repo"/bin/*; do
 	link "$f" "$HOME/.claude/bin/${f##*/}"
 	link "$HOME/.claude/bin/${f##*/}" "$HOME/.local/bin/${f##*/}"
 done
+# Every other account's config folder is links back into ~/.claude (cc-account); new
+# entries Claude has made there since are linked on each run. Nothing without
+# ~/.claude/accounts
+"$HOME/.claude/bin/cc-account" link
 
 for cmd in jq python3 git wezterm claude; do
 	command -v "$cmd" >/dev/null || echo "missing: $cmd"
@@ -53,7 +57,8 @@ command -v jq >/dev/null || {
 [ -f "$settings" ] || echo '{}' >"$settings"
 
 # Per command: one an event already runs (however its path is spelt) is left alone, and
-# only the missing ones are added, as a group of their own
+# only the missing ones are added, as a group of their own. A matcher is rewritten on any
+# group holding one of these commands, or an edit here would never reach settings.json
 tmp=$(mktemp)
 jq --arg home "$HOME" '
 def hook($arg): { type: "command", command: ("\"$HOME/.claude/hooks/wezterm-pane-state.sh\" " + $arg) };
@@ -64,7 +69,7 @@ def norm: gsub("\""; "") | sub("^~"; "$HOME") | split($home) | join("$HOME");
 		{ type: "command", command: "\"$HOME/.claude/bin/cc-tint\"", timeout: 5 }
 	] },
 	UserPromptSubmit: { hooks: [hook("working")] },
-	Notification: { matcher: "permission_prompt|push_notification|worker_permission_prompt|model_refusal_fallback", hooks: [hook("notify")] },
+	Notification: { matcher: "permission_prompt|push_notification|worker_permission_prompt|model_refusal_fallback|quota_auto_resume_stale|quota_auto_resume_disabled|auth_storage_failure", hooks: [hook("notify")] },
 	Stop: { hooks: [hook("done")] },
 	SessionEnd: { hooks: [hook("ended")] },
 	StopFailure: { hooks: [hook("errored")] },
@@ -74,8 +79,15 @@ def norm: gsub("\""; "") | sub("^~"; "$HOME") | split($home) | join("$HOME");
 	([.hooks[$e.key][]?.hooks[]?.command | norm]) as $got
 	| [$e.value.hooks[] | select((.command | norm) as $c | $got | any(.[]; . == $c) | not)] as $missing
 	| if ($missing | length) == 0 then .
-	  else .hooks[$e.key] = ((.hooks[$e.key] // []) + [$e.value + { hooks: $missing }]) end)
+	  else .hooks[$e.key] = ((.hooks[$e.key] // []) + [$e.value + { hooks: $missing }]) end
+	| if ($e.value | has("matcher")) then
+		[$e.value.hooks[].command | norm] as $mine
+		| .hooks[$e.key] |= map(if any(.hooks[]?.command | norm; IN($mine[]))
+			then .matcher = $e.value.matcher else . end)
+	  else . end)
 | .statusLine //= { type: "command", command: "\"$HOME/.claude/statusline.sh\"" }
+# !ccx after a gather (and !cd) would otherwise cost a turn replying to its output
+| if has("respondToBashCommands") then . else .respondToBashCommands = false end
 ' "$settings" >"$tmp"
 
 if cmp -s "$tmp" "$settings"; then

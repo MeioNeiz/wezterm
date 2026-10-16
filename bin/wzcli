@@ -1,0 +1,16 @@
+#!/bin/bash
+# `wezterm cli --no-auto-start "$@"` with a deadline; every script's CLI call goes here.
+# A call wezterm never answers keeps a mux subscription open whose queue grows without
+# bound: ~400 of them took the GUI to 18GB and wedged it. `timeout` around a caller does
+# not help, it kills the caller and orphans the cli. WZCLI_TIMEOUT overrides the 5s.
+# --no-auto-start: a cli that finds no GUI must not start a headless mux server.
+PATH="$PATH:/opt/homebrew/bin:/Applications/WezTerm.app/Contents/MacOS"
+me=$$
+(
+	sleep "${WZCLI_TIMEOUT:-5}"
+	# by now the pid may be reused: kill only if it is still the cli
+	case $(ps -o command= -p "$me" 2>/dev/null) in
+	*"cli --no-auto-start"*) kill "$me" ;;
+	esac
+) </dev/null >/dev/null 2>&1 &
+exec wezterm cli --no-auto-start "$@"

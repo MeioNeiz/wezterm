@@ -41,6 +41,10 @@ for a monitor (`PARKED_MONITOR_MAX`) and 4h for anything else (`PARKED_MAX`).
 level-triggered version of the same fact and should win over either timer when present.
 Effort: three constants and one `case` per reader, plus the CLAUDE.md line.
 
+**Superseded by 2.1.288** for the shell half: the time limit now "applies only in
+unattended sessions (`-p`, Agent SDK, CI, cloud); terminal, desktop app and VS Code
+sessions have no limit". The shell cap was removed again; a shell falls back to 4h.
+
 ### 2. Background jobs say what they want from you: `needs` in `state.json`
 
 VERIFIED. `~/.claude/jobs/<id>/state.json` carries far more than `claude agents --json`.

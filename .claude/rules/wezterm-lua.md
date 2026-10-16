@@ -53,4 +53,5 @@ It is a precedence over two sources, so test it, without the GUI: lift its block
 locals at a temp dir, and drive it under luajit from planted digest rows and state files
 (21 cases at last count: Esc after an ask, `shell`, parked with finished tasks, cold by a
 5-minute expiry, an old three-field context file). Fixtures are time-relative: regenerate
-them each run.
+them each run. `strip_resume_flags` and `rate.resume_at` lift the same way, alone: the
+restore must drop everything from `--` and cc-spawn's `--session-id`/`--fork-session`

@@ -75,9 +75,9 @@ config.hide_tab_bar_if_only_one_tab = false
 -- Deliberately loose: format-tab-title only sees this config value, not the room left.
 -- Real sharing is in label_width; this must just never bind first.
 config.tab_max_width = 320
--- Fancy bar draws in window_frame.font, NOT terminal cells; label_width converts via
--- FRAME_CELLS. Pinned so an upgrade cannot move the default. Smaller = more chars per tab
--- (per-tab cap is pixels) but below 12 is unreadable here.
+-- Fancy bar draws in window_frame.font, NOT terminal cells; `frame` measures in it. Pinned
+-- so an upgrade cannot move the advances below. Smaller = more chars per tab (per-tab cap
+-- is pixels) but below 12 is unreadable here.
 local FRAME_FONT_SIZE = 12.0
 config.window_frame = {
 	font = wezterm.font({ family = "Roboto", weight = "Bold" }),
@@ -86,17 +86,94 @@ config.window_frame = {
 	active_titlebar_bg = "#11111b",
 	inactive_titlebar_bg = "#11111b",
 }
--- Frame chars per terminal cell: point-size ratio x advance (Roboto Bold ~0.52em avg vs
--- JetBrains Mono 0.586em = 1.13). MARGIN shades down since proportional widths vary and
--- overshoot makes wezterm clip. Monospace frame font: both become 1.0.
-local FRAME_ADVANCE = 1.13
-local FRAME_MARGIN = 0.9
 -- retro bar draws in terminal font: a cell is a cell
 local FANCY = config.use_fancy_tab_bar == true
-local FRAME_CELLS = FANCY and ((config.font_size / FRAME_FONT_SIZE) * FRAME_ADVANCE * FRAME_MARGIN)
-	or 1.0
+
+-- Tab bar widths in the unit it draws in: Roboto Bold font units (1/2048 em) on the fancy
+-- bar, terminal cells on the retro one. Exact, so a label can fill its tab to the letter;
+-- checked against a screenshot to 2px (docs/cc-board.md).
+local frame = {}
+do
+	-- hmtx advances of wezterm's bundled Roboto-Bold.ttf, ASCII 32..126
+	local ROBOTO = {
+		510, 557, 657, 1220, 1175, 1512, 1344, 331, 719, 722, 928, 1118, 500, 794, 595, 765,
+		1175, 1175, 1175, 1175, 1175, 1175, 1175, 1175, 1175, 1175, 578, 537, 1042, 1172,
+		1058, 1019, 1833, 1378, 1307, 1340, 1331, 1152, 1122, 1395, 1447, 597, 1144, 1300,
+		1109, 1794, 1446, 1414, 1321, 1414, 1307, 1259, 1267, 1348, 1339, 1791, 1301, 1266,
+		1241, 569, 864, 569, 895, 914, 677, 1098, 1153, 1068, 1154, 1107, 734, 1169, 1146,
+		543, 532, 1094, 543, 1773, 1147, 1158, 1153, 1157, 747, 1053, 692, 1146, 1035, 1505,
+		1042, 1028, 1042, 676, 518, 676, 1328,
+	}
+	-- ●◆✓│ and friends are not in Roboto and fall back to JetBrains Mono's 0.6 em
+	local OTHER = 1229
+	local ELLIPSIS = FANCY and 1515 or 1
+
+	local function advance(code)
+		if not FANCY then
+			return 1
+		end
+		-- the status heartbeat swaps a space for NBSP: same width, or every label reflows
+		if code == 0xA0 then
+			code = 32
+		end
+		return ROBOTO[code - 31] or (code == 0x2026 and ELLIPSIS) or OTHER
+	end
+
+	-- wezterm's cell for a proportional font is its widest ASCII advance, "@"
+	frame.cell = FANCY and 1833 or 1
+	-- a typical lowercase letter: for thresholds counted in letters
+	frame.char = FANCY and 1100 or 1
+
+	function frame.width(text)
+		if not utf8.len(text) then
+			return #text * (FANCY and OTHER or 1)
+		end
+		local units = 0
+		for _, code in utf8.codes(text) do
+			units = units + advance(code)
+		end
+		return units
+	end
+
+	---Longest prefix of text that fits budget with "…", on a word boundary if that costs
+	---under a tenth: at a dozen letters a tab, letters beat tidy cuts
+	function frame.fit(text, budget)
+		if frame.width(text) <= budget then
+			return text
+		end
+		if not utf8.len(text) then
+			return "…"
+		end
+		local used, cut, last_space = ELLIPSIS, 0, nil
+		for at, code in utf8.codes(text) do
+			used = used + advance(code)
+			if used > budget then
+				break
+			end
+			if code == 32 then
+				last_space = { at = at, used = used }
+			end
+			cut = at + #utf8.char(code) - 1
+		end
+		if last_space and last_space.used > budget * 0.9 then
+			cut = last_space.at - 1
+		end
+		return text:sub(1, cut) .. "…"
+	end
+
+	-- status dot, and the divider between panes: both fall back to the same 0.6 em
+	frame.glyph = frame.width("●")
+	frame.space = frame.width(" ")
+
+	---Bar pixels in frame units
+	function frame.units(pixels, dpi)
+		return FANCY and pixels * 2048 * 72 / (FRAME_FONT_SIZE * dpi) or pixels
+	end
+end
 -- try_set: field name differs across versions and a wrong one discards the whole config
 try_set("show_close_tab_button_in_tabs", false)
+
+-- tab, divider and picker colours: frame_colours, after the identity palette
 -- also the tab bar's pane-state re-read rate, see update-right-status
 config.status_update_interval = 1000
 
@@ -268,14 +345,19 @@ local function live_claude_panes()
 end
 
 -- a resumed pane's --resume id may be superseded; drop old flags before adding current
+-- (cc-spawn's --session-id and --fork-session with them: either beside --resume forks).
+-- Everything from `--` goes too: cc-spawn puts the prompt there, and kept it would be
+-- replayed as the next turn on a resume, or shadow the fresh brief on a cold restore
 local function strip_resume_flags(argv)
 	local out, skip = {}, false
 	for _, arg in ipairs(argv) do
-		if skip then
+		if arg == "--" then
+			break
+		elseif skip then
 			skip = false
-		elseif arg == "--resume" or arg == "-r" then
+		elseif arg == "--resume" or arg == "-r" or arg == "--session-id" then
 			skip = true
-		elseif arg ~= "--continue" and arg ~= "-c" then
+		elseif arg ~= "--continue" and arg ~= "-c" and arg ~= "--fork-session" then
 			table.insert(out, arg)
 		end
 	end
@@ -396,8 +478,34 @@ end
 -- resumed (Jacob's rule): that pays for its whole context again, so it arms a fresh
 -- session seeded with cc-handover's brief, which reads the old one from disk. Unknown
 -- warmth counts as cold.
+-- Typed the moment the pane exists, the line beat zsh: the tty echoed it raw, ZLE drew
+-- it again, and resurrect's resizes redrew it as prompt fragments. So it waits for a
+-- prompt and a size that held three polls (3s at most), then zsh clears the screen,
+-- prints the brief and pre-fills the line itself (`print -z`), in that order.
 local function on_pane_restore(pane_tree)
 	local pane = pane_tree.pane
+
+	local function when_settled(fn)
+		local last, steady, tries = nil, 0, 0
+		local function poll()
+			tries = tries + 1
+			local ok, size, text = pcall(function()
+				local d = pane:get_dimensions()
+				return d.cols .. "x" .. d.viewport_rows, pane:get_lines_as_text(d.viewport_rows)
+			end)
+			if not ok then
+				return
+			end
+			steady = (size == last and text:match("%S")) and steady + 1 or 0
+			last = size
+			if steady >= 2 or tries >= 30 then
+				pcall(fn)
+			else
+				wezterm.time.call_after(0.1, poll)
+			end
+		end
+		wezterm.time.call_after(0.1, poll)
+	end
 
 	if pane_tree.alt_screen_active and pane_tree.process then
 		local cmd = wezterm.shell_join_args(pane_tree.process.argv)
@@ -412,18 +520,25 @@ local function on_pane_restore(pane_tree)
 				-- No transcript, no brief: then it is just a fresh session
 				local glob = "/.claude/projects/*/" .. sid .. ".jsonl"
 				if #wezterm.glob(wezterm.home_dir .. glob) > 0 then
-					cmd = cmd .. ' "$(PATH="$HOME/.claude/bin:$HOME/.local/bin:$PATH" cc-handover '
+					cmd = cmd .. ' -- "$(PATH="$HOME/.claude/bin:$HOME/.local/bin:$PATH" cc-handover '
 						.. sid .. ')"'
 				end
 			end
-			local ok, ran, stdout = pcall(wezterm.run_child_process, {
-				"/usr/bin/python3", brief_script, sid,
-				warm and "warm" or "cold", tostring(cold_at or 0),
-			})
-			if ok and ran and stdout ~= "" then
-				pane:inject_output(stdout)
-			end
-			pane:send_text(cmd)
+			local brief = { "/usr/bin/python3", brief_script, sid,
+				warm and "warm" or "cold", tostring(cold_at or 0) }
+			when_settled(function()
+				if (pane:get_foreground_process_name() or ""):match("zsh$") then
+					-- leading space: hist_ignore_space keeps it out of history
+					pane:send_text(" clear; " .. wezterm.shell_join_args(brief)
+						.. "; print -rz -- " .. wezterm.shell_quote_arg(cmd) .. "\r")
+					return
+				end
+				local ok, ran, stdout = pcall(wezterm.run_child_process, brief)
+				if ok and ran and stdout ~= "" then
+					pane:inject_output(stdout)
+				end
+				pane:send_text(cmd)
+			end)
 		else
 			pane:send_text(cmd .. "\r\n")
 		end
@@ -546,11 +661,7 @@ config.keys = {
 	{ key = "\\", mods = "LEADER", action = act.SplitHorizontal({ domain = "CurrentPaneDomain" }) }, -- right
 	{ key = "-", mods = "LEADER", action = act.SplitVertical({ domain = "CurrentPaneDomain" }) }, -- down
 
-	-- ---- Panes: move focus (vim hjkl) ----
-	{ key = "h", mods = "LEADER", action = act.ActivatePaneDirection("Left") },
-	{ key = "j", mods = "LEADER", action = act.ActivatePaneDirection("Down") },
-	{ key = "k", mods = "LEADER", action = act.ActivatePaneDirection("Up") },
-	{ key = "l", mods = "LEADER", action = act.ActivatePaneDirection("Right") },
+	-- ---- Panes: move focus (vim hjkl): LEADER+hjkl, defined with the nvim helpers ----
 
 	-- ---- Panes: manage ----
 	{ key = "z", mods = "LEADER", action = act.TogglePaneZoomState },
@@ -654,8 +765,8 @@ for i = 1, 9 do
 	})
 end
 
--- LEADER+Tab flips to the tab you were last on; closing a tab lands there too
-config.switch_to_last_active_tab_when_closing_tab = true
+-- LEADER+Tab flips to the tab you were last on; closing a tab lands on its right neighbour
+config.switch_to_last_active_tab_when_closing_tab = false
 table.insert(config.keys, { key = "Tab", mods = "LEADER", action = act.ActivateLastTab })
 
 -- Open a URL on screen from the keyboard: labels every link, the letter opens it
@@ -728,14 +839,161 @@ config.key_tables = {
 	},
 }
 
+-- nvim and the panes around it
+do
+	local function is_nvim(p)
+		local ok, name = pcall(function()
+			return p:get_foreground_process_name()
+		end)
+		return ok and name and name:match("[/\\]n?vim%.?e?x?e?$") ~= nil
+	end
+
+	-- LEADER+hjkl: in nvim it becomes CTRL+hjkl, which smart-splits.nvim moves across nvim
+	-- windows and hands back to wezterm at the edge (IS_NVIM, its own test, is dead here)
+	for key, dir in pairs({ h = "Left", j = "Down", k = "Up", l = "Right" }) do
+		table.insert(config.keys, {
+			key = key,
+			mods = "LEADER",
+			action = wezterm.action_callback(function(window, pane)
+				if is_nvim(pane) then
+					window:perform_action(act.SendKey({ key = key, mods = "CTRL" }), pane)
+				else
+					window:perform_action(act.ActivatePaneDirection(dir), pane)
+				end
+			end),
+		})
+	end
+
+	if POSIX then
+		-- Runs under `zsh -ic` so nvim gets the shell's PATH (LSPs, rg), not launchd's;
+		-- arguments ride in as $0 and $1, so nothing is quoted
+		local function nvim_split(window, pane, script, ...)
+			local cwd = pane:get_current_working_dir()
+			window:perform_action(act.SplitPane({
+				direction = "Right",
+				command = {
+					args = { "zsh", "-ic", script, ... },
+					cwd = cwd and cwd.file_path or nil,
+				},
+			}), pane)
+		end
+
+		-- Into the tab's nvim if it serves /tmp/nvim-wez-<pane>.sock (nvim's options.lua),
+		-- else a new split. False when it is not a file, so the caller can pass it on
+		local function open_file(window, pane, file, line)
+			file = file:gsub("^~", wezterm.home_dir)
+			local cwd = pane:get_current_working_dir()
+			if file:sub(1, 1) ~= "/" and cwd then
+				file = cwd.file_path:gsub("/$", "") .. "/" .. file
+			end
+			local probe = io.open(file, "r")
+			if not probe then
+				return false
+			end
+			-- a directory opens for reading too, then fails to read
+			local _, dir_err = probe:read(0)
+			probe:close()
+			if dir_err then
+				return false
+			end
+			line = line or "1"
+			for _, p in ipairs(pane:tab():panes()) do
+				local sock = "/tmp/nvim-wez-" .. p:pane_id() .. ".sock"
+				if is_nvim(p) and wezterm.glob(sock)[1] then
+					-- nvim config's lazygit-smart: a free window, else a new nvim tab
+					local expr = string.format("v:lua.LazygitSmartEdit('%s', %s)",
+						file:gsub("'", "''"), line)
+					wezterm.background_child_process({ "/opt/homebrew/bin/nvim", "--server",
+						sock, "--remote-expr", expr })
+					p:activate()
+					return true
+				end
+			end
+			nvim_split(window, pane, 'exec nvim "+$1" "$0"', file, line)
+			return true
+		end
+
+		local FILE_LINE = "[\\w./~-]+\\.\\w{1,6}:\\d+"
+		-- file:// links open in their app as before
+		local NOT_TEXT = { png = 1, jpg = 1, jpeg = 1, gif = 1, webp = 1, pdf = 1, mov = 1,
+			mp4 = 1, zip = 1, dmg = 1, app = 1 }
+
+		-- CMD+click: a rule turns bare path:line into nvim://; Claude's links are file://
+		config.hyperlink_rules = wezterm.default_hyperlink_rules()
+		table.insert(config.hyperlink_rules,
+			{ regex = FILE_LINE .. "\\b", format = "nvim://$0" })
+		wezterm.on("open-uri", function(window, pane, uri)
+			local ref = uri:match("^nvim://(.+)$")
+			if ref then
+				local file, line = ref:match("^(.-):(%d+)")
+				if file then
+					open_file(window, pane, file, line)
+				end
+				return false
+			end
+			local path = uri:match("^file://[^/]*(/[^#?]*)")
+			if path then
+				path = path:gsub("%%(%x%x)", function(hex)
+					return string.char(tonumber(hex, 16))
+				end)
+				local file, line = path:match("^(.-):(%d+)$")
+				file = file or path
+				line = line or uri:match("#L?(%d+)")
+				local ext = (file:match("%.(%w+)$") or ""):lower()
+				if not NOT_TEXT[ext] and open_file(window, pane, file, line) then
+					return false
+				end
+			end
+		end)
+
+		-- LEADER+e: label every path:line on screen, the letter opens it
+		table.insert(config.keys, {
+			key = "e",
+			mods = "LEADER",
+			action = act.QuickSelectArgs({
+				label = "open in nvim",
+				patterns = { FILE_LINE },
+				action = wezterm.action_callback(function(window, pane)
+					local ref = window:get_selection_text_for_pane(pane)
+					local file, line = ref:match("^(.-):(%d+)")
+					if file then
+						open_file(window, pane, file, line)
+					end
+				end),
+			}),
+		})
+
+		-- LEADER+v: the whole scrollback in nvim, cursor at the bottom; Claude panes too
+		table.insert(config.keys, {
+			key = "v",
+			mods = "LEADER",
+			action = wezterm.action_callback(function(window, pane)
+				local path = os.tmpname()
+				local file = io.open(path, "w")
+				if not file then
+					return
+				end
+				file:write(pane:get_lines_as_text(pane:get_dimensions().scrollback_rows))
+				file:close()
+				nvim_split(window, pane, 'nvim + "$0"; rm -f "$0"', path)
+			end),
+		})
+	end
+end
+
 -- ============================================================
 -- Status bar: LEADER, resize mode, workspace.
 -- Also the tab bar's heartbeat: format-tab-title only reruns on invalidation, and hook
 -- writes or ageing past FRESH_SECONDS have no wezterm event. Status only invalidates when
 -- the string changes, so the trailing blank toggles space/NBSP: same cell, new bytes.
+-- Toggled by the clock, not per call: every title alert from any pane in any workspace
+-- also runs this handler (~30/s with a dozen busy sessions), and a per-call toggle made
+-- each one rebuild the whole tab bar a second time. For the same reason the work runs
+-- once a second per window; a repeat call re-sends the last string, which wezterm needs
+-- to schedule the next tick, unless what you did (LEADER, a key table, focus) changed.
 -- ============================================================
 local tab_geometry = {} -- tab id -> the bar's size; see label_width
-local status_tick = 0
+local status_memo = {} -- window id -> { key, text }
 
 -- Forward decls, assigned in the fleet section (they need things defined later)
 local attention_elsewhere
@@ -762,17 +1020,20 @@ local fast_tick_start
 local pick_note
 
 ---Shell -> Lua action queue: the CLI cannot switch workspace (activate-pane leaves the GUI
----where it was) and SetUserVar is dead on this build (CLAUDE.md). One file per action in
----ACTION_DIR, each one tab-separated line, written whole and renamed in by `wz`; claimed by
----atomic rename so exactly one window runs it. ACTION_FILE is the older single-file queue,
----still drained: a line appended to it after the claim could be lost, which is why it went.
+---where it was), and SetUserVar's event fires only for the pane on screen, so it cannot
+---carry the action itself (dead-ends.md); `wz` pokes with it to drain at once. One file
+---per action in ACTION_DIR, each one tab-separated line, written whole and renamed in by
+---`wz`; claimed by atomic rename so exactly one window runs it. ACTION_FILE is the older
+---single-file queue, still drained: a line appended to it after the claim could be lost,
+---which is why it went.
 local ACTION_FILE = "/.claude/fleet/actions"
 local ACTION_DIR = "/.claude/fleet/actions.d"
 
 -- Functions the action queue calls that are defined further down, filled in there. A
 -- table rather than one local each: the main chunk is at Lua's 200-local limit.
 -- jump: fleet_jump, for a toast click (in-process, not wz go's CLI round trips).
--- pick: LEADER+t's ranking written to PICK_FILE without moving, to see what it would do
+-- pick: LEADER+t's ranking written to PICK_FILE without moving: cc-toast's order, and a
+-- way to see what LEADER+t would do. publish_pick: the same, kept fresh while toasts are up
 local late = {}
 
 local function perform_action_line(window, pane, verb, a, b)
@@ -855,12 +1116,55 @@ local function drain_actions(window, pane)
 	end
 end
 
--- Rate limits, from the statusLine: per account, so one figure for the machine. Written by
--- statusline.sh as `epoch\t5h_pct\t5h_resets\t7d_pct\t7d_resets\tspend`, `-` when absent
-local RATE_FILE = wezterm.home_dir .. "/.claude/cache/rate-limits"
+-- wz's poke (poke_lua): drain now instead of on the next fast tick
+wezterm.on("user-var-changed", function(window, pane, name)
+	if name == "wz_poke" then
+		drain_actions(window, pane)
+	end
+end)
+
+-- Rate limits, from the statusLine: per account, a file each (cc-account): rate-limits for
+-- ~/.claude's login, rate-limits-<name> for another. Written by statusline.sh as
+-- `epoch\t5h_pct\t5h_resets\t7d_pct\t7d_resets\tspend`, `-` when absent
+-- Members, not locals: the main chunk is at Lua's 200-local limit
+local rate = {
+	read_at = 0,
+	globbed_at = 0,
+	DIR = wezterm.home_dir .. "/.claude/cache/",
+	GLOB_EVERY = 30,
+}
+
+---{ { path, name } }, name nil for the default account. A dot is a write in progress
+function rate.list()
+	local now = os.time()
+	if rate.files and now - rate.globbed_at < rate.GLOB_EVERY then
+		return rate.files
+	end
+	rate.globbed_at, rate.files = now, {}
+	local ok, paths = pcall(wezterm.glob, rate.DIR .. "rate-limits*")
+	for _, path in ipairs(ok and paths or {}) do
+		local base = path:match("[^/]+$")
+		local name = base:match("^rate%-limits%-([%w_]+)$")
+		if base == "rate-limits" or name then
+			table.insert(rate.files, { path = path, name = name })
+		end
+	end
+	return rate.files
+end
+
+---The first line of a rate file, or ""
+function rate.line(path)
+	local file = io.open(path, "r")
+	if not file then
+		return ""
+	end
+	local line = file:read("*line") or ""
+	file:close()
+	return line
+end
+
 local RATE_MAX_AGE = 600 -- older than this, no pane has rendered and the figure may be wrong
 local RATE_WEEK_SHOWN = 75 -- the 7d window joins only once it is the one closing in
-local rate = { read_at = 0 }
 
 local function rate_colour(pct)
 	if pct >= 90 then
@@ -877,37 +1181,34 @@ end
 -- reads as a runaway, so nothing is said before PACE_FROM of it has passed
 local PACE_FROM = 0.1
 local PACE_AHEAD = 10 -- points over an even burn before it is worth a mark
+-- Late in a window a few points ahead already runs out before the reset (93% with 88% gone
+-- is out 15 minutes early), so from here any burn that runs out gets a mark
+rate.PACE_CLOSE = 75
 
----"▲ out <when>" once PACE_AHEAD over an even burn, which at this rate always runs out
----before the reset: yellow, red when that is under a quarter of the window away
+---"▲ out <when>" once PACE_AHEAD over an even burn, or from rate.PACE_CLOSE once the burn
+---runs out before the reset: yellow, red when that is under a quarter of the window away
 local function pace(pct, resets, span, now, fmt)
 	local gone = span - (resets - now)
-	if gone < span * PACE_FROM or pct <= 0 or pct - 100 * gone / span < PACE_AHEAD then
+	local ahead = pct - 100 * gone / span
+	local early = gone < span * PACE_FROM or ahead < PACE_AHEAD
+	if pct <= 0 or pct >= 100 or ahead <= 0 or (early and pct < rate.PACE_CLOSE) then
 		return nil
 	end
 	local out_at = now + (100 - pct) * gone // pct
 	local colour = out_at - now < span / 4 and "#f38ba8" or "#f9e2af"
-	return { text = " ▲ out " .. os.date(fmt, out_at), colour = colour }
+	return { text = "▲ out " .. os.date(fmt, out_at), colour = colour, joins = true }
 end
 
----{ text, colour } per window worth showing, or {}
+---{ text, colour, joins } per window worth showing, or {}; a pace mark joins its window
 local function rate_parts()
 	local now = os.time()
 	if rate.read_at == now then
 		return rate.parts
 	end
 	rate.read_at, rate.parts = now, {}
-	local file = io.open(RATE_FILE, "r")
-	if not file then
-		return rate.parts
-	end
-	local line = file:read("*line") or ""
-	file:close()
-	local at, p5, r5, p7, r7 = line:match("^(%d+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)")
-	if not at or now - tonumber(at) > RATE_MAX_AGE then
-		return rate.parts
-	end
-	-- a window past its reset has rolled over, and its percentage belongs to the last one
+	-- a window past its reset has rolled over, and its percentage belongs to the last one.
+	-- The first part of another account's figures carries its name
+	local prefix
 	local function add(label, pct, resets, span, fmt, always)
 		pct, resets = tonumber(pct), tonumber(resets)
 		if not (pct and resets and resets > now) then
@@ -918,21 +1219,71 @@ local function rate_parts()
 			return
 		end
 		table.insert(rate.parts, {
-			text = string.format(" %s %d%% %s", label, pct, os.date(fmt, resets)),
+			text = string.format("%s%s %d%% %s", prefix, label, pct, os.date(fmt, resets)),
 			colour = rate_colour(pct),
 		})
+		prefix = ""
 		if mark then
 			table.insert(rate.parts, mark)
 		end
 	end
-	add("5h", p5, r5, 5 * 3600, "%H:%M", true)
-	add("7d", p7, r7, 7 * 86400, "%a %H:%M", false)
+	for _, f in ipairs(rate.list()) do
+		local line = rate.line(f.path)
+		local at, p5, r5, p7, r7 =
+			line:match("^(%d+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)")
+		if at and now - tonumber(at) <= RATE_MAX_AGE then
+			prefix = f.name and (f.name .. " ") or ""
+			add("5h", p5, r5, 5 * 3600, "%H:%M", true)
+			add("7d", p7, r7, 7 * 86400, "%a %H:%M", false)
+		end
+	end
 	return rate.parts
+end
+
+-- A turn killed by the usage limit resumes itself at the reset (autoContinueAtUsageLimit,
+-- on by default), so it is parked, not dead. RESUME_GRACE past the reset with no new turn
+-- and it is errored after all. Must match cc-roster and cc-board
+rate.RESUME_GRACE = 300
+
+---The reset a `rate_limit` errored record at `died_at` waits for, or nil: the 7d window's
+---when that is the full one, else the 5h's, and only the first reset after the death.
+---A later window's reset would make a pane that never resumed read as resuming forever.
+---The record does not say which account died, so the earliest reset of any that fits
+function rate.resume_at(died_at)
+	local now = os.time()
+	if rate.resume_read ~= now then
+		rate.resume_read, rate.resume = now, {}
+		for _, f in ipairs(rate.list()) do
+			local p5, r5, p7, r7 =
+				rate.line(f.path):match("^%d+\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)")
+			if tonumber(p7) and tonumber(p7) >= 100 and tonumber(r7) then
+				table.insert(rate.resume, { at = tonumber(r7), span = 7 * 86400 })
+			elseif tonumber(r5) then
+				table.insert(rate.resume, { at = tonumber(r5), span = 5 * 3600 })
+			end
+		end
+	end
+	local best
+	for _, r in ipairs(rate.resume) do
+		if r.at > died_at and r.at <= died_at + r.span
+			and now <= r.at + rate.RESUME_GRACE and (not best or r.at < best)
+		then
+			best = r.at
+		end
+	end
+	return best
 end
 
 wezterm.on("update-right-status", function(window, pane)
 	if fast_tick_start then
 		fast_tick_start()
+	end
+	local memo_key = table.concat({ os.time(), tostring(window:leader_is_active()),
+		tostring(window:active_key_table()), window:active_workspace(), pane:pane_id() }, "|")
+	local memo = status_memo[window:window_id()]
+	if memo and memo.key == memo_key then
+		window:set_right_status(memo.text)
+		return
 	end
 	drain_actions(window, pane)
 	digest_refresh()
@@ -943,57 +1294,51 @@ wezterm.on("update-right-status", function(window, pane)
 		pcall(chime_overdue, window)
 	end
 
-	local parts = {}
-	local width = 0
-
-	if window:active_key_table() == "resize_pane" then
-		table.insert(parts, { Foreground = { Color = "#fab387" } })
-		table.insert(parts, { Text = " RESIZE (hjkl, Esc) " })
-		width = width + 20
+	-- groups sit apart behind a rule; items inside one stay a space apart
+	local groups = {}
+	local function group()
+		local g = {}
+		table.insert(groups, g)
+		return g
 	end
 
+	local mode = group()
+	if window:active_key_table() == "resize_pane" then
+		table.insert(mode, { "#fab387", "RESIZE (hjkl, Esc)" })
+	end
 	if window:leader_is_active() then
-		table.insert(parts, { Foreground = { Color = "#f38ba8" } })
-		table.insert(parts, { Text = " ⌨ LEADER " })
-		width = width + 10
+		table.insert(mode, { "#f38ba8", "⌨ LEADER" })
 	end
 
 	-- what wants you in other workspaces
 	if attention_elsewhere then
 		local away = attention_elsewhere(window)
+		local g = group()
 		-- first: the one channel no notification permission can drop
 		if (away.needs or 0) > 0 then
-			table.insert(parts, { Foreground = { Color = "#f38ba8" } })
-			table.insert(parts, { Text = string.format(" ●%d needs you", away.needs) })
-			width = width + 12
+			table.insert(g, { "#f38ba8", string.format("●%d needs you", away.needs) })
 		end
 		if away.errored > 0 then
-			table.insert(parts, { Foreground = { Color = "#f38ba8" } })
-			table.insert(parts, { Text = string.format(" !%d", away.errored) })
-			width = width + 4
+			table.insert(g, { "#f38ba8", string.format("!%d", away.errored) })
 		end
 		if away.asking > 0 then
-			table.insert(parts, { Foreground = { Color = "#cba6f7" } })
-			table.insert(parts, { Text = string.format(" ⚠%d", away.asking) })
-			width = width + 4
+			table.insert(g, { "#cba6f7", string.format("⚠%d", away.asking) })
 		end
 		if away.fresh > 0 then
-			table.insert(parts, { Foreground = { Color = "#f9e2af" } })
-			table.insert(parts, { Text = string.format(" ✓%d", away.fresh) })
-			width = width + 4
+			table.insert(g, { "#f9e2af", string.format("✓%d", away.fresh) })
 		end
 	end
 
 	if pick_note and os.time() <= pick_note.until_at then
-		table.insert(parts, { Foreground = { Color = "#cba6f7" } })
-		table.insert(parts, { Text = pick_note.text })
-		width = width + utf8.len(pick_note.text)
+		table.insert(group(), { "#cba6f7", (pick_note.text:gsub("^%s+", ""):gsub("%s+$", "")) })
 	end
 
+	local window_group
 	for _, r in ipairs(rate_parts()) do
-		table.insert(parts, { Foreground = { Color = r.colour } })
-		table.insert(parts, { Text = r.text })
-		width = width + utf8.len(r.text)
+		if not (r.joins and window_group) then
+			window_group = group()
+		end
+		table.insert(window_group, { r.colour, r.text })
 	end
 
 	-- LEADER+w must not wait on git, so its branch snapshot is kept warm here (throttled)
@@ -1010,9 +1355,6 @@ wezterm.on("update-right-status", function(window, pane)
 		end
 	end
 
-	local workspace = window:active_workspace()
-	status_tick = status_tick + 1
-	local blank = (status_tick % 2 == 0) and " " or "\u{00a0}"
 	local ws_colour = "#89b4fa"
 	if focused_identity then
 		local ok_pane, tint = pcall(function()
@@ -1022,23 +1364,44 @@ wezterm.on("update-right-status", function(window, pane)
 			ws_colour = tint
 		end
 	end
-	table.insert(parts, { Foreground = { Color = ws_colour } })
-	table.insert(parts, { Text = "  " .. workspace .. " " .. blank })
-	width = width + #workspace + 4
+	table.insert(group(), { ws_colour, window:active_workspace() })
+	table.insert(group(), { "#bac2de", os.date("%H:%M") })
+
+	local parts = {}
+	local width = 0
+	local function put(colour, text)
+		table.insert(parts, { Foreground = { Color = colour } })
+		table.insert(parts, { Text = text })
+		width = width + frame.width(text)
+	end
+	for _, g in ipairs(groups) do
+		if #g > 0 then
+			put("#585b70", width == 0 and "  " or "  │  ")
+			for i, item in ipairs(g) do
+				put(item[1], (i > 1 and " " or "") .. item[2])
+			end
+		end
+	end
+	put("#585b70", (os.time() % 2 == 0) and "  " or " \u{00a0}")
 
 	-- format-tab-title cannot see the real bar width, so measure it here
 	local ok, size = pcall(function()
 		return window:active_tab():get_size()
 	end)
+	local dims = window:get_dimensions()
 	if ok and size and size.cols then
 		local tabs = window:mux_window():tabs()
-		local geom = { cols = size.cols, tabs = #tabs, reserve = width }
+		-- in frame units, as is reserve
+		local bar = FANCY and frame.units(dims.pixel_width, dims.dpi) or size.cols
+		local geom = { bar = bar, tabs = #tabs, reserve = width }
 		for _, mux_tab in ipairs(tabs) do
 			tab_geometry[mux_tab:tab_id()] = geom
 		end
 	end
 
-	window:set_right_status(wezterm.format(parts))
+	local text = wezterm.format(parts)
+	status_memo[window:window_id()] = { key = memo_key, text = text }
+	window:set_right_status(text)
 end)
 
 -- ============================================================
@@ -1049,15 +1412,18 @@ end)
 local SOLO_BUDGET = 96
 local MIN_LABEL = 10 -- a label with room for a subject, not just a verb
 local TERSE_LABEL = 5 -- squeezed, but still names something
+-- a split below this, dot included, is dots plus one whole-ish topic: "●● CPU, GPU and…"
+-- says more than "● CP… │ ● we…"
+local SPLIT_LABEL = 8
 local GROUP_LABEL = 14 -- a tab's own name, the part before TAB_GROUP_SEP
--- fancy bar padding+border per tab: 0.5 cells each side + 1px, in *terminal* cells, hence
--- the conversion. Raise if tabs clip.
-local TAB_CHROME = math.ceil(1.3 * FRAME_CELLS)
--- retro bar: the " + " button; plus one separator cell per tab gap
-local NEW_TAB_CELLS = 3
--- integrated buttons share the row but wezterm omits them from the per-tab divisor, so
--- take them off first. Estimated.
-local WINDOW_BUTTON_CELLS = 10
+-- Frame units from here on (`frame`). Fancy tab: 0.5 cell padding each side and a 1px
+-- border; measured 30px a tab at 2x, so wezterm's cell runs wider than "@"
+local TAB_CHROME = 1.4 * frame.cell
+-- the + button: fancy is 0.5 cell margin, 1 cell padding and a half-height glyph
+local NEW_TAB_CELLS = FANCY and 2.5 * frame.cell or 3
+-- integrated buttons share the row but wezterm omits them from the per-tab divisor.
+-- Fancy macOS reserves 4 cells (fancy_tab_bar.rs); the retro figure is estimated
+local WINDOW_BUTTON_CELLS = FANCY and 4 * frame.cell or 10
 
 -- program names, not tasks
 local UNINFORMATIVE = {
@@ -1190,10 +1556,10 @@ end
 
 local FRESH_SECONDS = 90 -- how long a finished turn still reads as just-finished
 -- How long parked can stand with no writer, by the task type in its detail. Must match
--- cc-roster and cc-board. A Monitor is capped at 30 min (2.1.271), a background shell at 2h
--- (2.1.285); a subagent or workflow has no cap, so 4h is a guess
+-- cc-roster and cc-board. The Monitor tool reaches Stop as `shell`, so `monitor` is an
+-- MCP or WebSocket one, capped at 30 min (2.1.271); a terminal session's background shell
+-- (2.1.288), a subagent or a workflow has no cap, so 4h is a guess
 local PARKED_MONITOR_MAX = 1800
-local PARKED_SHELL_MAX = 7200
 local PARKED_MAX = 4 * 3600
 
 ---Last hook record for a pane: state, epoch, detail, writing sid
@@ -1233,13 +1599,15 @@ end)
 ---Registry + hook record, most decisive first:
 --- 1. registry `waiting`: clears when answered, which no hook can do
 --- 2. hook `errored`: registry reads idle after an API death. Cleared only by registry
----    busy (a new turn), not idle and not the spinner, which keeps its turn-start glyph
+---    busy (a new turn), not idle and not the spinner, which keeps its turn-start glyph.
+---    A usage limit one reads parked "resumes HH:MM" until its reset (rate.resume_at)
 --- 3. hook `asking`: beats the registry by seconds; dropped once the title spins again, or
 ---    once the registry has stopped since the ask (Esc on a dialog fires no Stop)
 --- 4. spinner or registry busy: each catches what the other misses
 --- 5. registry `shell`: turn over, its background shell still running. Level-triggered,
 ---    so unlike the hook's parked it needs no expiry
---- 6. hook `parked`: registry also calls it idle
+--- 6. hook `parked`: registry also calls it idle. Not for a `shell` one the registry has
+---    called idle since: it tracks shells (5), so they ended
 --- 7. age since the later of the two clocks; cold by the cache's own expiry when known
 ---@return string status working|asking|errored|parked|fresh|waiting|stale, string detail
 local function pane_status(pane, spinning)
@@ -1254,6 +1622,10 @@ local function pane_status(pane, spinning)
 		return "asking", reg.detail
 	end
 	if rec ~= nil and rec.state == "errored" and not busy then
+		local resumes = rec.detail == "rate_limit" and rate.resume_at(rec.at)
+		if resumes then
+			return "parked", "resumes " .. os.date("%H:%M", resumes)
+		end
 		return "errored", rec.detail
 	end
 	if rec ~= nil and rec.state == "asking" and not busy and not spinning
@@ -1271,10 +1643,12 @@ local function pane_status(pane, spinning)
 	local parked_max = PARKED_MAX
 	if rec ~= nil and rec.detail == "monitor" then
 		parked_max = PARKED_MONITOR_MAX
-	elseif rec ~= nil and rec.detail == "shell" then
-		parked_max = PARKED_SHELL_MAX
 	end
-	if rec ~= nil and rec.state == "parked" and os.time() - rec.at <= parked_max then
+	local shell_gone = rec ~= nil and rec.detail == "shell"
+		and reg ~= nil and reg.status == "idle" and reg.seen > rec.at
+	if rec ~= nil and rec.state == "parked" and not shell_gone
+		and os.time() - rec.at <= parked_max
+	then
 		return "parked", rec.detail
 	end
 	if rec ~= nil and rec.state == "ended" then
@@ -1435,9 +1809,15 @@ local function fast_tick()
 				drainer = w
 			end
 			pcall(unread_tick, w)
+			if late.tab_ground then
+				pcall(late.tab_ground, w)
+			end
 		end
 		if drainer then
 			drain_actions(drainer, drainer:active_pane())
+			if late.publish_pick then
+				late.publish_pick(drainer:active_pane())
+			end
 		end
 	end)
 end
@@ -1491,7 +1871,8 @@ local TAB_COLOURS = {
 	divider = "#45475a",
 	active = "#87d7ff", -- focused, nothing else to say
 	asking = "#cba6f7", -- blocked on a permission or plan prompt
-	errored = "#f38ba8", -- the turn died on an API error and will not resume itself
+	errored = "#f38ba8", -- the turn died on an API error and will not resume itself (a usage
+	-- limit one that will is parked until its reset, pane_status)
 	fresh = "#f9e2af", -- finished in the last FRESH_SECONDS
 	waiting = "#ffd7af", -- stopped, waiting on you
 	working = "#a6e3a1", -- busy
@@ -1604,6 +1985,70 @@ end
 
 focused_identity = pane_identity
 
+do
+	-- Inactive tabs sit on the bar itself; the active one is lifted in its pane's hue
+	-- (tab_ground sets it per window). RULE for every line that is not text, as in
+	-- screen.md
+	local MOCHA = {
+		crust = "#11111b", mantle = "#181825", base = "#1e1e2e", surface0 = "#313244",
+		rule = "#585b70",
+		faint = "#7f849c", text = "#cdd6f4", mauve = "#cba6f7",
+	}
+	local function frame_colours(ground)
+		return {
+			split = MOCHA.rule,
+			tab_bar = {
+				active_tab = { bg_color = ground, fg_color = MOCHA.text },
+				inactive_tab = { bg_color = MOCHA.crust, fg_color = MOCHA.faint },
+				inactive_tab_hover = { bg_color = MOCHA.mantle, fg_color = MOCHA.text },
+				inactive_tab_edge = MOCHA.rule,
+				new_tab = { bg_color = MOCHA.crust, fg_color = MOCHA.faint },
+				new_tab_hover = { bg_color = MOCHA.mantle, fg_color = MOCHA.text },
+			},
+		}
+	end
+	config.colors = frame_colours(MOCHA.surface0)
+	-- the pickers in the same surfaces as the bar, not wezterm's own greys
+	try_set("command_palette_bg_color", MOCHA.mantle)
+	try_set("command_palette_fg_color", MOCHA.text)
+	try_set("char_select_bg_color", MOCHA.mantle)
+	try_set("char_select_fg_color", MOCHA.text)
+	try_set("pane_select_bg_color", MOCHA.crust)
+	try_set("pane_select_fg_color", MOCHA.mauve)
+	try_set("pane_select_font", wezterm.font({ family = "JetBrains Mono", weight = "Bold" }))
+
+	-- The pane's identity hue, LIFT of it over base: clear of the bar, and the label (the
+	-- same hue) keeps 5.4:1 at worst. No identity, a plain shell: surface0
+	local LIFT = 0.18
+	local function pane_ground(pane_id)
+		local hue = pane_identity(pane_id)
+		if not hue then
+			return MOCHA.surface0
+		end
+		local mixed = "#"
+		for i = 2, 6, 2 do
+			local over = tonumber(hue:sub(i, i + 1), 16)
+			local under = tonumber(MOCHA.base:sub(i, i + 1), 16)
+			mixed = mixed .. string.format("%02x", math.floor(under + (over - under) * LIFT + 0.5))
+		end
+		return mixed
+	end
+
+	-- format-tab-title paints the ground as the title's Background. Never a window
+	-- override: set_config_overrides re-evaluates this whole file on the GUI thread
+	-- (100-170ms), a visible freeze on every switch to a pane of another hue
+	late.pane_ground = pane_ground
+
+	-- clears the override older versions left on a window; once, then a table read
+	late.tab_ground = function(window)
+		local overrides = window:get_config_overrides()
+		if overrides and overrides.colors then
+			overrides.colors = nil
+			window:set_config_overrides(overrides)
+		end
+	end
+end
+
 -- Status is a ●; only the states you act on (asking, errored, unread) get their own shape.
 -- Label text belongs to identity.
 
@@ -1624,6 +2069,11 @@ local function status_style(status, detail, active, budget, unread)
 		end
 		return TAB_COLOURS.errored, "!", 1
 	end
+	-- a usage limit turn waiting for its reset: say when it carries on
+	if status == "parked" and budget >= 20 and detail:find("^resumes ") then
+		local when = "◌" .. detail:sub(9) .. " "
+		return TAB_COLOURS.parked, when, utf8.len(when)
+	end
 	-- ✓ is a reply you have not read: yellow while fresh, then warm amber or cold grey
 	if status == "fresh" then
 		if unread then
@@ -1642,16 +2092,79 @@ local function status_style(status, detail, active, budget, unread)
 end
 
 -- " 10: " not " 1: ", so a tenth tab cannot push every label one cell over
-local PREFIX_CELLS = 5
+-- Fancy padding already spaces a tab from its neighbours, so no blanks around the label
+-- and no colon: "5 ●✓" not " 5: ●✓ ". Retro has no padding and keeps them.
+local function tab_prefix(index)
+	return FANCY and (index .. " ") or (" " .. index .. ": ")
+end
+local TAB_TRAILER = FANCY and "" or " "
 
----Cells one pane wants: label + shape + space. Nil = no topic (costs a `+N` instead).
----Over-estimate is the safe direction.
-local function pane_demand(pane, terse)
+-- Words most of a window's topics share (the project name, "handover") tell no tab from
+-- another, so the bar drops them; the pane's statusLine keeps the whole topic
+local shared_words = {}
+do
+	local STOP = {}
+	for word in ("the and for with from into onto your our you are was not but how why what"
+		.. " when who via per its out off new all any can has had have this that than then"
+		.. " them they over under about after before"):gmatch("%S+") do
+		STOP[word] = true
+	end
+
+	local function core(word)
+		return (word:lower():gsub("^%p+", ""):gsub("%p+$", ""))
+	end
+
+	---@return table<string, true> words in at least 3 labels and a quarter of them
+	function shared_words.of(tabs)
+		local seen, labels = {}, 0
+		for _, tab in ipairs(tabs or {}) do
+			for _, pane in ipairs(tab.panes or { tab.active_pane }) do
+				local label = pane_label(pane)
+				if label then
+					labels = labels + 1
+					local mine = {}
+					for word in label:gmatch("%S+") do
+						local c = core(word)
+						if #c >= 3 and not STOP[c] and not mine[c] then
+							mine[c] = true
+							seen[c] = (seen[c] or 0) + 1
+						end
+					end
+				end
+			end
+		end
+		local shared = {}
+		for word, n in pairs(seen) do
+			if n >= 3 and n * 4 >= labels then
+				shared[word] = true
+			end
+		end
+		return shared
+	end
+
+	---label without the shared words; whole if nothing else would be left
+	function shared_words.drop(label, shared)
+		if shared == nil or next(shared) == nil then
+			return label
+		end
+		local kept = {}
+		for word in label:gmatch("%S+") do
+			if not shared[core(word)] then
+				table.insert(kept, word)
+			end
+		end
+		return #kept > 0 and table.concat(kept, " ") or label
+	end
+end
+
+---Frame units one pane wants: dot + space + label. Nil = no topic (costs a `+N`).
+local function pane_demand(pane, terse, shared)
 	local label = pane_label(pane)
 	if label == nil then
 		return nil
 	end
-	return #(terse and strip_filler(label) or label) + 2
+	label = shared_words.drop(label, shared)
+	return frame.width(terse and strip_filler(label) or label) + frame.glyph + frame.space
 end
 
 ---Largest cap W with sum(min(demand, W)) <= budget (water-fill). One cap per tab so
@@ -1667,17 +2180,21 @@ local function fill_cap(demands, budget)
 		budget = budget - want
 		left = left - 1
 	end
-	return SOLO_BUDGET -- every topic in the tab fits whole
+	return SOLO_BUDGET * frame.char -- every topic in the tab fits whole
 end
 
----wezterm's per-tab ceiling in frame cells: fancy_tab_bar.rs `pixel_width / num_tabs -
----1.5 cells`, num_tabs including the new-tab button, whether or not the bar is full.
----tab_max_width does not affect it in fancy mode.
----@return integer frame cells for one tab's whole row, chrome and prefix included
+---Room for one tab's title, prefix included. Two limits: wezterm's cap, fancy_tab_bar.rs
+---`pixel_width / num_tabs - 1.5 cells` (num_tabs counts the + button, binds whether or not
+---the bar is full, ignores tab_max_width), and an even share of what the row has left
+---after buttons and the right status; past that wezterm clips the last tabs.
+---@return integer frame units
 local function tab_ceiling(geom, ntabs)
-	local bar = geom.cols * FRAME_CELLS - WINDOW_BUTTON_CELLS
-	-- +1 for the new-tab button: counted in wezterm's divisor, not capped by it
-	return math.floor(bar / (ntabs + 1) - 1.5 * FRAME_CELLS)
+	-- box_model.rs takes padding and border out of that cap too: 3 cells in all, measured
+	-- against where wezterm cut the text (192px of a 257px share at 2x)
+	local cap = geom.bar / (ntabs + 1) - 3 * frame.cell
+	local row = geom.bar - WINDOW_BUTTON_CELLS - NEW_TAB_CELLS - geom.reserve
+	-- slack for wezterm rounding the cell to whole pixels
+	return math.floor(math.min(cap, row / ntabs - TAB_CHROME) - 0.3 * frame.cell)
 end
 
 ---Tab's own name: text before TAB_GROUP_SEP, or a hand-typed title. "" for a save-layer
@@ -1700,12 +2217,12 @@ end
 ---What a tab spends before any label: its name, and the divider after it.
 local function group_cost(pinned)
 	local group = tab_group(pinned)
-	return group ~= "" and (#shorten(group, GROUP_LABEL) + 2) or 0
+	return group ~= "" and frame.width(shorten(group, GROUP_LABEL) .. " │") or 0
 end
 
 ---Every label a tab will draw, in cells it would like to have.
 ---@return integer[] demands
-local function tab_demands(tab)
+local function tab_demands(tab, shared)
 	local panes = tab.panes or { tab.active_pane }
 	if tab.active_pane ~= nil and tab.active_pane.is_zoomed then
 		panes = { tab.active_pane } -- a zoomed tab draws one label whatever it contains
@@ -1713,7 +2230,7 @@ local function tab_demands(tab)
 	local demands = {}
 	local terse = #panes > 1 -- format-tab-title drops filler verbs in a split
 	for _, pane in ipairs(panes) do
-		local want = pane_demand(pane, terse)
+		local want = pane_demand(pane, terse, shared)
 		if want ~= nil then
 			table.insert(demands, want)
 		end
@@ -1724,33 +2241,36 @@ end
 ---One label width for this tab's panes. fancy: share within the tab, capped by
 ---tab_ceiling. retro: share across the window; overshoot by one cell and wezterm clamps
 ---every tab to `available / ntabs` at once. Both water-fill. See docs/cc-board.md.
----@param overhead integer cells this row spends before any label: group name, +N, zoom
----@return integer cells per label, 0 when not even a terse row fits
-local function label_width(tab, tabs, overhead)
+---@param overhead integer frame units this row spends before any label: name, +N, zoom
+---@return integer frame units per label, dot included; 0 when not even a terse row fits
+---@param shared table<string, true>|nil shared_words.of(tabs)
+local function label_width(tab, tabs, overhead, shared)
 	local geom = tab_geometry[tab.tab_id]
 	if geom == nil then
 		-- first paint after reload precedes any status tick; claim room, not a bar of dots
-		return SOLO_BUDGET
+		return SOLO_BUDGET * frame.char
 	end
 	local ntabs = (tabs ~= nil and #tabs > 0) and #tabs or math.max(1, geom.tabs or 1)
 	local demands, room
 
 	if FANCY then
-		demands = tab_demands(tab)
+		demands = tab_demands(tab, shared)
 		local mine = math.max(1, #demands)
-		room = tab_ceiling(geom, ntabs) - TAB_CHROME - PREFIX_CELLS - (mine - 1) - (overhead or 0)
-		if room < mine then
+		local frame_text = frame.width(tab_prefix(tab.tab_index + 1) .. TAB_TRAILER)
+		room = tab_ceiling(geom, ntabs) - frame_text - (mine - 1) * frame.glyph - (overhead or 0)
+		if room < mine * frame.glyph then
 			return 0
 		end
 	else
 		-- every pane on the bar; this tab's overhead is already inside the sum
 		demands = {}
 		local npanes = 0
-		room = geom.cols - geom.reserve - NEW_TAB_CELLS - WINDOW_BUTTON_CELLS - (ntabs - 1)
+		room = geom.bar - geom.reserve - NEW_TAB_CELLS - WINDOW_BUTTON_CELLS - (ntabs - 1)
 		for _, other in ipairs(tabs or {}) do
-			local want = tab_demands(other)
+			local want = tab_demands(other, shared)
 			npanes = npanes + math.max(1, #want)
-			room = room - PREFIX_CELLS - group_cost(other.tab_title) - math.max(0, #want - 1)
+			room = room - frame.width(tab_prefix(other.tab_index + 1) .. TAB_TRAILER)
+				- group_cost(other.tab_title) - math.max(0, #want - 1) * frame.glyph
 			for _, cells in ipairs(want) do
 				table.insert(demands, cells)
 			end
@@ -1761,13 +2281,13 @@ local function label_width(tab, tabs, overhead)
 	end
 
 	if #demands == 0 then
-		return math.max(1, math.min(SOLO_BUDGET, room))
+		return math.max(1, math.min(SOLO_BUDGET * frame.char, room))
 	end
-	return math.max(1, math.min(SOLO_BUDGET, fill_cap(demands, room)))
+	return math.max(1, math.min(SOLO_BUDGET * frame.char, fill_cap(demands, room)))
 end
 
-wezterm.on("format-tab-title", function(tab, tabs)
-	local prefix = " " .. (tab.tab_index + 1) .. ": "
+late.format_tab = function(tab, tabs)
+	local prefix = tab_prefix(tab.tab_index + 1)
 	local pinned = tab.tab_title or ""
 	local sep = pinned:find(TAB_GROUP_SEP, 1, true)
 	-- a typed name without the separator still becomes the group
@@ -1776,6 +2296,7 @@ wezterm.on("format-tab-title", function(tab, tabs)
 	local ok, formatted = pcall(function()
 		-- is_active is only within its tab; calm colour and bold are for the pane on screen
 		local on_screen = tab.is_active == true
+		local shared = shared_words.of(tabs)
 		local labels = {}
 		local silent = 0
 		for _, pane in ipairs(tab.panes or { tab.active_pane }) do
@@ -1784,7 +2305,7 @@ wezterm.on("format-tab-title", function(tab, tabs)
 				local status, detail = pane_status(pane, working)
 				local fg = pane_identity(pane.pane_id)
 				table.insert(labels, {
-					text = label,
+					text = shared_words.drop(label, shared),
 					active = on_screen and pane.is_active,
 					status = status,
 					detail = detail,
@@ -1806,7 +2327,7 @@ wezterm.on("format-tab-title", function(tab, tabs)
 			local zfg = pane_identity(tab.active_pane.pane_id)
 			labels = {
 				{
-					text = label or tab.active_pane.title or "",
+					text = label and shared_words.drop(label, shared) or tab.active_pane.title or "",
 					active = on_screen,
 					status = status,
 					detail = detail,
@@ -1817,21 +2338,27 @@ wezterm.on("format-tab-title", function(tab, tabs)
 		end
 
 		local count = #labels
-		local marks = (silent > 0 and not zoomed) and #(" +" .. silent) or 0
+		local marks = (silent > 0 and not zoomed) and frame.width(" +" .. silent) or 0
 		-- +N, name and zoom arrow come off the ceiling before water-filling, not per label
 		local named = shorten(group, GROUP_LABEL)
-		local overhead = marks + (zoomed and 2 or 0) + (group ~= "" and (#named + 2) or 0)
-		local per = label_width(tab, tabs, overhead)
+		local overhead = marks + (zoomed and frame.width("⤢ ") or 0) + group_cost(pinned)
+		local per = label_width(tab, tabs, overhead, shared)
 		-- a name must not turn a zero budget into a one-cell label
 		local name = (group ~= "" and per > 0) and named or ""
-		-- terse row's leftover after one dot per pane; off the row's budget, not the bar's
-		local spare = per * count - count
+		-- terse row's leftover after one dot per pane and the space before a topic; it draws
+		-- no dividers, so it gets back what label_width set aside for them
+		local spare = per * count - count * frame.glyph - frame.space + (count - 1) * frame.glyph
 
 		local items = {
 			{ Attribute = { Intensity = "Normal" } },
-			{ Foreground = { Color = TAB_COLOURS.index } },
+			-- the lifted tab drops the index grey to 2:1, so DIM there
+			{ Foreground = { Color = on_screen and "#9399b2" or TAB_COLOURS.index } },
 			{ Text = zoomed and (prefix .. "⤢ ") or prefix },
 		}
+		if on_screen and late.pane_ground then
+			table.insert(items, 1, { Background = {
+				Color = late.pane_ground(tab.active_pane.pane_id) } })
+		end
 
 		if name ~= "" then
 			-- index grey, bold: chrome, not one more pane
@@ -1842,7 +2369,7 @@ wezterm.on("format-tab-title", function(tab, tabs)
 			table.insert(items, { Text = " │" })
 		end
 
-		if per == 0 or (count > 1 and per < TERSE_LABEL) then
+		if per == 0 or (count > 1 and per < SPLIT_LABEL * frame.char) then
 			-- too tight: one glyph per pane
 			for _, label in ipairs(labels) do
 				local colour, marker =
@@ -1851,7 +2378,7 @@ wezterm.on("format-tab-title", function(tab, tabs)
 				table.insert(items, { Foreground = { Color = colour } })
 				table.insert(items, { Text = marker ~= "" and marker or (label.active and "◆" or "●") })
 			end
-			if spare >= TERSE_LABEL then
+			if spare >= TERSE_LABEL * frame.char then
 				-- one topic fits: name the pane that wants you most
 				local pick = labels[1]
 				for _, label in ipairs(labels) do
@@ -1861,7 +2388,7 @@ wezterm.on("format-tab-title", function(tab, tabs)
 				end
 				table.insert(items, { Attribute = { Intensity = pick.active and "Bold" or "Normal" } })
 				table.insert(items, { Foreground = { Color = pick.identity or TAB_COLOURS.waiting } })
-				table.insert(items, { Text = " " .. shorten(strip_filler(pick.text), spare) })
+				table.insert(items, { Text = " " .. frame.fit(strip_filler(pick.text), spare) })
 			end
 		else
 			for i, label in ipairs(labels) do
@@ -1870,18 +2397,19 @@ wezterm.on("format-tab-title", function(tab, tabs)
 					table.insert(items, { Foreground = { Color = TAB_COLOURS.divider } })
 					table.insert(items, { Text = "│" })
 				end
-				local text = (count > 1 or per < MIN_LABEL) and strip_filler(label.text) or label.text
-				local colour, marker, marker_width =
-					status_style(label.status, label.detail, label.active, per, label.unread)
+				local text = (count > 1 or per < MIN_LABEL * frame.char) and strip_filler(label.text)
+					or label.text
+				local colour, marker =
+					status_style(label.status, label.detail, label.active, per / frame.char, label.unread)
 				if marker == "" then
-					marker, marker_width = label.active and "◆" or "●", 1
+					marker = label.active and "◆" or "●"
 				end
 				-- dot = status colour, name = identity colour
 				table.insert(items, { Attribute = { Intensity = label.active and "Bold" or "Normal" } })
 				table.insert(items, { Foreground = { Color = colour } })
 				table.insert(items, { Text = marker .. " " })
 				table.insert(items, { Foreground = { Color = label.identity or TAB_COLOURS.waiting } })
-				table.insert(items, { Text = shorten(text, math.max(1, per - marker_width - 1)) })
+				table.insert(items, { Text = frame.fit(text, per - frame.width(marker .. " ")) })
 			end
 		end
 
@@ -1891,7 +2419,7 @@ wezterm.on("format-tab-title", function(tab, tabs)
 			table.insert(items, { Foreground = { Color = TAB_COLOURS.divider } })
 			table.insert(items, { Text = " +" .. silent })
 		end
-		table.insert(items, { Text = " " })
+		table.insert(items, { Text = TAB_TRAILER })
 		return wezterm.format(items)
 	end)
 
@@ -1905,9 +2433,51 @@ wezterm.on("format-tab-title", function(tab, tabs)
 	if title == "" then
 		title = pane_dir(tab.active_pane) or "…"
 	end
-	local room = math.max(TERSE_LABEL, label_width(tab, tabs, 0))
-	return prefix .. shorten(title, room) .. " "
-end)
+	local room = math.max(TERSE_LABEL * frame.char, label_width(tab, tabs, 0))
+	return prefix .. frame.fit(title, room) .. TAB_TRAILER
+end
+
+-- wezterm reruns this for every tab on any title change from any pane in any workspace,
+-- ~30 bar rebuilds a second with a dozen busy sessions, nearly all with nothing to redraw:
+-- a spinner frame flipped (the bar only asks whether it spins) or a hidden pane retitled.
+-- So the result is kept per tab against everything it reads. The second is in the key:
+-- hook state, unread marks and ageing come from files memoised per second anyway, and the
+-- status heartbeat forces a rebuild every second.
+do
+	local memo = {}
+
+	local function title_of(title)
+		return is_working(title) and "~" .. strip_glyph(title) or title
+	end
+
+	local function key_of(tab, tabs)
+		local parts = { os.time(), tab.tab_index, tostring(tab.is_active), #tabs }
+		local geom = tab_geometry[tab.tab_id]
+		if geom then
+			parts[#parts + 1] = geom.bar .. "/" .. geom.reserve .. "/" .. geom.tabs
+		end
+		for _, t in ipairs(tabs) do
+			parts[#parts + 1] = t.tab_id .. "," .. (t.tab_title or "") .. ","
+				.. tostring(t.is_active) .. "," .. tostring(t.active_pane.is_zoomed)
+			for _, p in ipairs(t.panes or { t.active_pane }) do
+				parts[#parts + 1] = p.pane_id .. "," .. tostring(p.is_active) .. ","
+					.. title_of(p.title or "")
+			end
+		end
+		return table.concat(parts, "\31")
+	end
+
+	wezterm.on("format-tab-title", function(tab, tabs)
+		local key = key_of(tab, tabs)
+		local hit = memo[tab.tab_id]
+		if hit and hit.key == key then
+			return hit.title
+		end
+		local title = late.format_tab(tab, tabs)
+		memo[tab.tab_id] = { key = key, title = title }
+		return title
+	end)
+end
 
 -- ============================================================
 -- Claude: address another session
@@ -2414,9 +2984,9 @@ fleet_key({
 
 -- The toasts, after the fact: `wz notify` logs `epoch\tpane\trank\ttitle\tsid\tbody` per
 -- toast (older lines stop at title), rank being Kev's 0-1 of how much it matters.
--- LEADER+t goes to the one that matters most among those whose pane you have not been on
--- since; LEADER+T to the newest, and again within a few seconds to the one before it.
--- Either way the toast closes once you are on its pane
+-- One you have not been on the pane since counts toward LEADER+t's score, which also orders
+-- the toast stack; LEADER+T goes to the newest, and again within a few seconds to the one
+-- before it. Either way the toast closes once you are on its pane
 local NOTIFY_LOG = wezterm.home_dir .. "/.claude/cache/notify-log"
 local NOTIFY_RECENT = 3 * 3600 -- older toasts are history, not news
 local NOTIFY_RANK_DEFAULT = 0.5 -- a toast raised without Kev's say
@@ -2458,11 +3028,13 @@ local function recent_toasts()
 	return out
 end
 
--- LEADER+t, Kev's pick. The unseen toast Kev ranked highest, else the live session that
--- scores best from what is already on disk: the merged pane state, Kev's verdict and rank
--- on its last reply (stop-asks, `verdict\tp\tepoch\tuuid\trank`), unread, age, cache.
--- Nothing is asked of Kev on the keypress, so it is instant and the same state always gives
--- the same pick. Pressing again within PICK_STEP_SECONDS walks down that same list
+-- LEADER+t, Kev's pick, and the order of the toast stack: one score per pane, from what is
+-- already on disk. The merged pane state, Kev's verdict and rank on its last reply
+-- (stop-asks, `verdict\tp\tepoch\tuuid\trank`), unread, an unseen toast's rank, age,
+-- cache. Nothing is asked of Kev, so it is instant and the same state always gives the same
+-- order. Pressing again within PICK_STEP_SECONDS walks down that list. While toasts are up
+-- it is written to PICK_FILE every PICK_PUBLISH_SECONDS, and a new toast asks for it at once
+-- with a `pick` action, so cc-toast stacks in this order
 do
 	local KEV_ASKS = wezterm.home_dir .. "/.cache/kev/asks/"
 	local PICK_STEP_SECONDS = 8
@@ -2484,16 +3056,42 @@ do
 		return { verdict = v, p = tonumber(p) or 0, at = tonumber(at) or 0, rank = tonumber(rank) }
 	end
 
-	---@return table every live session worth a look, best first: { pane, score, why, at }
+	---@return table every pane worth a look, best first: { pane, score, why, at }
 	local function kev_ranking(here)
 		local out, now = {}, os.time()
+		-- the unseen toast that matters most per pane: a push or a usage limit can say more
+		-- than the state does, and one from a pane with no session still counts
+		local toast = {}
+		for _, t in ipairs(recent_toasts()) do
+			local seen = (left_at[tostring(t.pane)] or 0) > t.at
+			if not seen and (toast[t.pane] == nil or t.rank > toast[t.pane].rank) then
+				toast[t.pane] = t
+			end
+		end
+		-- a copy: digest_rows is memoised for every other reader this second
+		local rows = {}
 		for id, reg in pairs(digest_rows()) do
+			rows[id] = reg
+		end
+		-- a pane can need you without being in the registry; so can one with only a toast
+		local needs_panes = late.needs_panes or {}
+		for pane_id in pairs(toast) do
+			rows[tostring(pane_id)] = rows[tostring(pane_id)] or { sid = "", seen = 0 }
+		end
+		for pane_id in pairs(needs_panes) do
+			rows[tostring(pane_id)] = rows[tostring(pane_id)] or { sid = "", seen = 0 }
+		end
+		for id, reg in pairs(rows) do
 			local pane_id = tonumber(id)
-			if pane_id ~= here and wezterm.mux.get_pane(pane_id) then
+			local ok, live = pcall(wezterm.mux.get_pane, pane_id)
+			if pane_id ~= here and ok and live then
 				local status, detail = pane_status({ pane_id = pane_id }, false)
 				local k = reg.sid ~= "" and verdict_of(reg.sid) or nil
 				local score, why
-				if status == "asking" then
+				local needs = needs_panes[pane_id]
+				if needs then
+					score, why = 1.1, needs ~= "" and ("needs you: " .. needs) or "needs you"
+				elseif status == "asking" then
 					score, why = 1.0, detail ~= "" and ("asking: " .. detail) or "asking"
 				elseif status == "errored" then
 					score, why = 0.8, "errored" .. (detail ~= "" and (": " .. detail) or "")
@@ -2506,11 +3104,18 @@ do
 						why = unread and "finished, unread" or "finished"
 					end
 				end
+				local t = toast[pane_id]
+				if t and t.rank > (score or 0) then
+					score, why = t.rank, t.title ~= "" and t.title or "unseen toast"
+				end
 				if score then
-					local at = math.max(reg.seen or 0, k and k.at or 0)
-					-- a day halves it: yesterday's finish should not outrank this hour's
-					score = score / (1 + math.max(0, now - at) / 86400)
-					if status == "stale" then
+					local at = math.max(reg.seen or 0, k and k.at or 0, t and t.at or 0)
+					-- a day halves it: yesterday's finish should not outrank this hour's. Not a
+					-- need: it stands until cleared
+					if not needs then
+						score = score / (1 + math.max(0, now - at) / 86400)
+					end
+					if status == "stale" and not needs then
 						score = score * 0.85 -- cold: as worth reading, dearer to answer
 					end
 					table.insert(out, { pane = pane_id, score = score, why = why, at = at })
@@ -2539,40 +3144,38 @@ do
 		return title ~= "" and title or ("pane " .. pane_id)
 	end
 
-	local function pick_list(here)
-		local list, have = {}, {}
-		local best
-		for _, t in ipairs(recent_toasts()) do
-			local seen = (left_at[tostring(t.pane)] or 0) > t.at
-			if t.pane ~= here and not seen and (best == nil or t.rank > best.rank) then
-				best = t
-			end
-		end
-		if best then
-			table.insert(list, { pane = best.pane, why = "unseen toast", score = best.rank })
-			have[best.pane] = true
-		end
-		for _, r in ipairs(kev_ranking(here)) do
-			if not have[r.pane] then
-				table.insert(list, r)
-			end
-		end
-		return list
-	end
-
+	-- Every pane, the one you are on included: its toast is in the stack until you look.
+	-- `#epoch\tfrom <pane>`, then `i\tpane\tscore\twhy\tname` best first
 	local PICK_FILE = wezterm.home_dir .. "/.claude/cache/kev-pick"
+	local PICK_PUBLISH_SECONDS = 2
+	local TOAST_SLOTS = wezterm.home_dir .. "/.claude/cache/cc-toast"
+	local published = 0
 	late.pick = function(pane)
 		local file = io.open(PICK_FILE .. ".tmp", "w")
 		if not file then
 			return
 		end
-		file:write(string.format("#%d\tfrom %d\n", os.time(), pane:pane_id()))
-		for i, r in ipairs(pick_list(pane:pane_id())) do
-			file:write(string.format("%d\t%d\t%.3f\t%s\t%s\n", i, r.pane, r.score or 0, r.why,
+		published = os.time()
+		file:write(string.format("#%d\tfrom %d\n", published, pane:pane_id()))
+		for i, r in ipairs(kev_ranking(nil)) do
+			local why = r.why:gsub("[\t\n]", " ")
+			file:write(string.format("%d\t%d\t%.3f\t%s\t%s\n", i, r.pane, r.score or 0, why,
 				pick_name(r.pane)))
 		end
 		file:close()
 		os.rename(PICK_FILE .. ".tmp", PICK_FILE)
+	end
+	-- from the fast tick: a read_dir, and the ranking only while a toast is up
+	late.publish_pick = function(pane)
+		if os.time() - published < PICK_PUBLISH_SECONDS then
+			return
+		end
+		local ok, slots = pcall(wezterm.read_dir, TOAST_SLOTS)
+		if ok and type(slots) == "table" and #slots > 0 then
+			late.pick(pane)
+		else
+			published = os.time()
+		end
 	end
 
 	fleet_key({
@@ -2581,7 +3184,7 @@ do
 		action = wezterm.action_callback(function(window, pane)
 			local here, now = pane:pane_id(), os.time()
 			if now - pick.at > PICK_STEP_SECONDS or #pick.list == 0 then
-				pick.list, pick.step = pick_list(here), 0
+				pick.list, pick.step = kev_ranking(here), 0
 			end
 			pick.at = now
 			-- step to the next pane still there that is not the one you are on
@@ -2677,19 +3280,23 @@ local function load_notes()
 		return
 	end
 	notes_at = now
-	local fresh = {}
+	local fresh, needs = {}, {}
 	local file = io.open(wezterm.home_dir .. "/.claude/fleet/notes.tsv", "r")
 	if file then
 		for line in file:lines() do
 			-- sid, updated_at, flags, progress, status
-			local sid, flags = line:match("^([^\t]+)\t[^\t]*\t([^\t]*)")
+			local sid, flags, says = line:match("^([^\t]+)\t[^\t]*\t([^\t]*)\t[^\t]*\t?([^\t]*)")
 			if sid and flags then
 				fresh[sid] = flags
+				if flags:find("needs", 1, true) then
+					needs[sid] = says ~= "-" and says or ""
+				end
 			end
 		end
 		file:close()
 	end
 	notes_flags = fresh
+	late.needs = needs -- sid -> what it needs
 end
 
 ---@return boolean true when this pane's session carries `flag`
@@ -2715,24 +3322,39 @@ local function fleet_scan()
 		return fleet_panes
 	end
 	load_notes()
-	local rows = {}
+	local rows, needs_panes = {}, {}
 	pcall(function()
 		for _, mux_window in ipairs(wezterm.mux.all_windows()) do
 			for _, tab in ipairs(mux_window:tabs()) do
 				for _, p in ipairs(tab:panes()) do
 					local id = p:pane_id()
 					-- via pane_status so counts cannot disagree with the tab bar
+					local status = pane_status({ pane_id = id }, is_working(p:get_title() or ""))
+					-- an error on a cold session can never clear (it is never resumed), so it
+					-- stops alarming from elsewhere; its own tab still shows it. Unknown = cold
+					local stuck = false
+					if status == "errored" then
+						local sid = read_session_id(id)
+						local cold_at = sid and cache_cold_at(sid)
+						stuck = cold_at == nil or now >= cold_at
+					end
+					local needs = pane_flagged(id, "needs")
+					if needs then
+						needs_panes[id] = late.needs[read_session_id(id)] or ""
+					end
 					table.insert(rows, {
 						id = id,
-						needs = pane_flagged(id, "needs"),
-						muted = pane_muted(id),
-						status = pane_status({ pane_id = id }, is_working(p:get_title() or "")),
+						needs = needs,
+						muted = pane_muted(id) or stuck,
+						status = status,
 					})
 				end
 			end
 		end
 	end)
 	fleet_panes = { at = now, rows = rows }
+	-- for LEADER+t, defined above this and so blind to these locals; pane id -> what it needs
+	late.needs_panes = needs_panes
 	return fleet_panes
 end
 

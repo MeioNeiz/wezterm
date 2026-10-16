@@ -19,6 +19,8 @@ Colour channels, the tint and the palette, with the reasoning: `docs/colour.md`.
   1.8:1, and 1.0:1 on a marked row
 - Width counts characters, never bytes: `${#var}` in bash under en_GB.UTF-8, `utf8.len` in
   Lua. Every glyph here is multibyte
+- The fancy tab bar and right status draw in Roboto Bold, not cells: size them with
+  `frame.width`/`frame.fit` in wezterm.lua, never `utf8.len` (`docs/cc-board.md`)
 - `wezterm cli list` reports `tab_id`, not the tab number. The tab bar and LEADER+1..9 count
   positions from one; ascending tab_id within a window is that order
 - No em-dashes or en-dashes in anything on screen

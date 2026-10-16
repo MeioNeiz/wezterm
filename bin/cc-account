@@ -1,0 +1,413 @@
+#!/bin/bash
+# Which claude.ai account a session runs on. Claude Code keeps one login per config folder
+# (CLAUDE_CONFIG_DIR, and the keychain item is named after the folder), so two folders hold
+# two logins at once and a /login in one never moves the other's sessions. ~/.claude is the
+# default account; every other account's folder is links back into it, so all sessions
+# share settings, hooks, skills, transcripts and the registry, and the fleet sees them all.
+#
+# The map is ~/.claude/accounts, kept out of the repo (emails, paths):
+#   <name> <config folder> <login email> <folder>...
+# A session started under one of the folders gets that account; `*` marks the default.
+#
+# Sourced as a library by statusline.sh and cc-spawn, which cannot afford a fork:
+#   source ~/.claude/bin/cc-account --lib
+#   acct_load; acct_for <dir>; acct_current; acct_env <name>; acct_suffix <name>
+
+ACCT_FILE="$HOME/.claude/accounts"
+ACCT_HOME="$HOME/.claude"
+ACCT_NAMES=""
+ACCT_DEFAULT=""
+ACCT=""
+ACCT_ENV=()
+ACCT_LOADED=false
+
+# ACCT_NAMES, ACCT_DEFAULT, and acct_dir_<name>, acct_email_<name>, acct_dirs_<name>.
+# No file means one account and nothing to choose: ACCT_NAMES stays empty
+acct_load() {
+	$ACCT_LOADED && return 0
+	ACCT_LOADED=true
+	[[ -r $ACCT_FILE ]] || return 0
+	local name dir email rest d dirs home_name=""
+	while read -r name dir email rest; do
+		[[ -n $name && $name != \#* && -n $dir ]] || continue
+		[[ $name =~ ^[A-Za-z0-9_]+$ ]] || continue
+		dir=${dir/#\~/$HOME}
+		dir=${dir%/}
+		dirs=""
+		for d in $rest; do
+			if [[ $d == "*" ]]; then
+				ACCT_DEFAULT=$name
+			else
+				d=${d/#\~/$HOME}
+				dirs+=" ${d%/}"
+			fi
+		done
+		printf -v "acct_dir_$name" '%s' "$dir"
+		printf -v "acct_email_$name" '%s' "${email:--}"
+		printf -v "acct_dirs_$name" '%s' "$dirs"
+		ACCT_NAMES+=" $name"
+		[[ $dir == "$ACCT_HOME" ]] && home_name=$name
+	done <"$ACCT_FILE"
+	ACCT_NAMES=${ACCT_NAMES# }
+	[[ -n $ACCT_DEFAULT ]] || ACCT_DEFAULT=${home_name:-${ACCT_NAMES%% *}}
+}
+
+# ACCT: the account a session started in $1 gets. The longest matching folder wins
+acct_for() {
+	local dir=${1%/} name d k best=0
+	ACCT=$ACCT_DEFAULT
+	for name in $ACCT_NAMES; do
+		k="acct_dirs_$name"
+		for d in ${!k}; do
+			if [[ $dir == "$d" || $dir == "$d"/* ]] && ((${#d} > best)); then
+				ACCT=$name
+				best=${#d}
+			fi
+		done
+	done
+}
+
+# ACCT: the account this process runs on, from CLAUDE_CONFIG_DIR
+acct_current() {
+	local dir=${CLAUDE_CONFIG_DIR:-$ACCT_HOME} name k
+	dir=${dir%/}
+	ACCT=""
+	for name in $ACCT_NAMES; do
+		k="acct_dir_$name"
+		[[ ${!k} == "$dir" ]] && { ACCT=$name; return 0; }
+	done
+	if [[ $dir == "$ACCT_HOME" ]]; then
+		ACCT=default
+	else
+		ACCT=${dir##*/}
+		ACCT=${ACCT#.claude-}
+	fi
+}
+
+# ACCT_ENV: the env(1) arguments that start claude on account $1. ~/.claude is reached by
+# leaving CLAUDE_CONFIG_DIR unset: set to it, Claude would look for ~/.claude/.claude.json
+# and a keychain item of another name, which is a third login
+acct_env() {
+	local k="acct_dir_$1"
+	ACCT_ENV=()
+	[[ -n ${!k:-} ]] || return 1
+	if [[ ${!k} == "$ACCT_HOME" ]]; then
+		ACCT_ENV=(-u CLAUDE_CONFIG_DIR)
+	else
+		ACCT_ENV=("CLAUDE_CONFIG_DIR=${!k}")
+	fi
+}
+
+# ACCT_SUFFIX: what tells this account's per-account files apart (cache/rate-limits),
+# empty for the default folder's
+# shellcheck disable=SC2034
+acct_suffix() {
+	local k="acct_dir_$1"
+	ACCT_SUFFIX=""
+	[[ ${!k:-$ACCT_HOME} == "$ACCT_HOME" || $1 == default ]] || ACCT_SUFFIX="-$1"
+}
+
+[[ ${1-} == --lib ]] && return 0
+
+set -u
+export PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
+
+# Never shared between accounts: the login and what Claude caches about it. A dotfile is
+# never linked either (~/.claude.json is per folder, and Linux keeps .credentials.json here)
+own() {
+	case $1 in
+	backups | daemon* | policy-limits.json* | remote-settings.json* | stats-cache.json | \
+		ide | feedback | statsig | settings.json.bak*) return 0 ;;
+	esac
+	return 1
+}
+# Copied into a new folder's .claude.json, so its first start skips onboarding and the
+# trust dialog. Nothing about the account or its org
+readonly SEED='installMethod autoUpdates autoUpdatesProtectedForNative
+	hasCompletedOnboarding lastOnboardingVersion lastReleaseNotesSeen deepLinkTerminal hasSeenTasksHint
+	hasUsedBackslashReturn workflowSizeGuideline mcpServers githubRepoPaths'
+readonly SEED_PROJECT='hasTrustDialogAccepted allowedTools mcpServers enabledMcpjsonServers
+	disabledMcpjsonServers hasClaudeMdExternalIncludesApproved
+	hasClaudeMdExternalIncludesWarningShown'
+readonly CTX_DIR="$HOME/.claude/cache/context"
+# Must match cc-board, cc-fleet, cc-handover
+readonly PROMPT_CACHE_TTL=3600
+# switch waits this long for a turn to end before giving up
+readonly SWITCH_POLL=2
+readonly SWITCH_TRIES=300
+# The session environment a plain shell would not have; as cc-spawn's CLEAN_ENV
+readonly CLEAN=(-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID
+	-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_MESSAGING_SOCKET
+	-u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_EXECPATH -u CLAUDE_PID -u AI_AGENT)
+
+usage() {
+	cat <<'USAGE'
+cc-account - which claude.ai account a session runs on
+
+  cc-account                 this session's account, and the one this folder defaults to
+  cc-account status          every account: its folder and who is signed in there
+  cc-account for [dir]       the account a session started in dir gets
+  cc-account of <T>          the account a live session is on
+  cc-account login <name>    sign that account's folder in (from a shell, not /login)
+  cc-account switch [T] [--to <name>] [--force]
+                             carry on that session (default: this one) on the other
+                             account: once its turn ends it closes and resumes in its
+                             place, whole conversation. The first reply re-reads all of
+                             it at full price, so refused when cold unless --force;
+                             cc-handover --new --account is cheaper for a big one
+  cc-account link            make or repair the account folders' links (setup.sh does)
+  cc-account env [name] [--cwd dir]
+                             env(1) arguments starting claude on that account (default:
+                             the folder's), one per line; the zsh `claude` uses it
+
+T is a session name, a session id or a pane id, as for cc-roster.
+
+The map is ~/.claude/accounts, one account a line:
+  <name> <config folder> <login email> <folder>...
+A session started under one of the folders gets that account, `*` marks the default, and
+~/.claude must be one of the config folders. `claude --<name>` and `cc-spawn --account`
+pick one by hand.
+USAGE
+}
+
+die() {
+	echo "cc-account: $*" >&2
+	exit 1
+}
+
+need_accounts() {
+	acct_load
+	[[ -n $ACCT_NAMES ]] || die "no accounts: write $ACCT_FILE (cc-account --help)"
+}
+
+known() {
+	local k="acct_dir_$1"
+	[[ $1 =~ ^[A-Za-z0-9_]+$ && -n ${!k:-} ]] || die "no account \"$1\" in $ACCT_FILE"
+}
+
+# The account a running claude is on, from its environment: ps -E on macOS, /proc on Linux
+acct_of_pid() {
+	local pid=$1 dir
+	if [[ -r /proc/$pid/environ ]]; then
+		dir=$(tr '\0' '\n' </proc/"$pid"/environ | sed -n 's/^CLAUDE_CONFIG_DIR=//p')
+	else
+		dir=$(ps -E -p "$pid" -o command= 2>/dev/null | tr ' ' '\n' |
+			sed -n 's/^CLAUDE_CONFIG_DIR=//p' | tail -1)
+	fi
+	CLAUDE_CONFIG_DIR=$dir acct_current
+}
+
+# signed-in email of a folder, or "-"
+signed_in() {
+	acct_env "$1"
+	env "${CLEAN[@]}" "${ACCT_ENV[@]}" claude auth status 2>/dev/null |
+		jq -r 'if .loggedIn then .email // "?" else "-" end' 2>/dev/null || echo "-"
+}
+
+link_all() {
+	local name k dir e base made=0
+	for name in $ACCT_NAMES; do
+		k="acct_dir_$name"
+		dir=${!k}
+		[[ $dir == "$ACCT_HOME" ]] && continue
+		mkdir -p "$dir" || die "cannot make $dir"
+		for e in "$ACCT_HOME"/*; do
+			base=${e##*/}
+			own "$base" && continue
+			if [[ -L $dir/$base ]]; then
+				[[ $(readlink "$dir/$base") == "$e" ]] && continue
+				ln -sfn "$e" "$dir/$base"
+				made=$((made + 1))
+			elif [[ ! -e $dir/$base ]]; then
+				ln -s "$e" "$dir/$base"
+				made=$((made + 1))
+			else
+				# Claude replaces settings.json by rename when it writes it, which cuts
+				# the link: the account then runs on a copy that drifts
+				echo "cc-account: $dir/$base is a real file, not a link to $e;" \
+					"merge it into $e, delete it, and rerun" >&2
+			fi
+		done
+		seed "$dir/.claude.json"
+		((made)) && echo "linked $made into $dir"
+		made=0
+	done
+	return 0
+}
+
+# A new folder's .claude.json is empty but for the login: onboarding, trust dialogs and
+# release notes would all come round again. Only before the first real start
+seed() {
+	local file=$1 src="$HOME/.claude.json" tmp
+	[[ -r $src ]] || return 0
+	[[ -f $file ]] && jq -e '.hasCompletedOnboarding' "$file" >/dev/null 2>&1 && return 0
+	tmp=$(mktemp) || return 0
+	# what the folder already has (its login) wins over the seed
+	jq --arg keys "$SEED" --arg pkeys "$SEED_PROJECT" --slurpfile have <(
+		if [[ -s $file ]]; then cat "$file"; else echo '{}'; fi) '
+		($keys | split("\\s+"; null) | map(select(. != ""))) as $k
+		| ($pkeys | split("\\s+"; null) | map(select(. != ""))) as $pk
+		| (with_entries(select(.key as $x | $k | index($x)))
+		   + { projects: ((.projects // {}) | map_values(
+				with_entries(select(.key as $x | $pk | index($x))))) })
+		  * $have[0]
+	' "$src" >"$tmp" 2>/dev/null && [[ -s $tmp ]] && mv -f "$tmp" "$file" &&
+		chmod 600 "$file" && echo "seeded $file"
+	rm -f "$tmp"
+}
+
+# warm or cold, as every reader decides it: expires_at, else last activity + the TTL
+cache_cold() {
+	local sid=$1 seen_ms=$2 exp="-" now
+	now=$(date +%s)
+	[[ -r $CTX_DIR/$sid ]] && IFS=$'\t' read -r _ _ _ exp _ <"$CTX_DIR/$sid"
+	[[ $exp =~ ^[0-9]+$ ]] || exp=$((${seen_ms:-0} / 1000 + PROMPT_CACHE_TTL))
+	((now > exp))
+}
+
+cmd=${1:-}
+(($#)) && shift
+case $cmd in
+"" | which)
+	need_accounts
+	acct_current
+	mine=$ACCT
+	acct_for "$PWD"
+	if [[ -n ${CLAUDECODE:-} || -n ${CLAUDE_CODE_SESSION_ID:-} ]]; then
+		echo "this session: $mine"
+	else
+		echo "this shell: $mine"
+	fi
+	echo "here ($PWD): $ACCT"
+	;;
+status)
+	need_accounts
+	for name in $ACCT_NAMES; do
+		k="acct_dir_$name"
+		e="acct_email_$name"
+		got=$(signed_in "$name")
+		note=""
+		if [[ $got == "-" ]]; then
+			note="not signed in: cc-account login $name"
+		elif [[ ${!e} != "-" && $got != "${!e}" ]]; then
+			note="expected ${!e}"
+		fi
+		mark=""
+		[[ $name == "$ACCT_DEFAULT" ]] && mark=" (default)"
+		printf '%s%s | %s | %s%s\n' "$name" "$mark" "${!k/#$HOME/~}" "$got" \
+			"${note:+ | $note}"
+	done
+	;;
+for)
+	need_accounts
+	acct_for "${1:-$PWD}"
+	echo "$ACCT"
+	;;
+of)
+	[[ -n ${1:-} ]] || die "of needs a session"
+	acct_load
+	row=$(cc-roster --row "$1") || die "no live session \"$1\""
+	pid=$(printf '%s' "$row" | cut -f7)
+	acct_of_pid "$pid"
+	echo "$ACCT"
+	;;
+env)
+	acct_load
+	name="" cwd=$PWD
+	while (($#)); do
+		case $1 in
+		--cwd) shift; cwd=${1:-$PWD} ;;
+		*) name=$1 ;;
+		esac
+		shift
+	done
+	# no map: leave the environment as it is
+	[[ -n $ACCT_NAMES ]] || exit 0
+	if [[ -z $name ]]; then
+		acct_for "$cwd"
+		name=$ACCT
+	fi
+	known "$name"
+	acct_env "$name"
+	printf '%s\n' "${ACCT_ENV[@]}"
+	;;
+link)
+	acct_load
+	link_all
+	;;
+login)
+	need_accounts
+	[[ -n ${1:-} ]] || die "login needs an account: $ACCT_NAMES"
+	known "$1"
+	link_all
+	acct_env "$1"
+	e="acct_email_$1"
+	args=(claude auth login)
+	[[ ${!e} != "-" ]] && args+=(--email "${!e}")
+	echo "signing $1 in; sessions on other accounts are not touched"
+	exec env "${CLEAN[@]}" "${ACCT_ENV[@]}" "${args[@]}"
+	;;
+switch)
+	need_accounts
+	target="" to="" force=false dry=false
+	while (($#)); do
+		case $1 in
+		--to) shift; to=${1:-}; [[ -n $to ]] || die "--to needs an account" ;;
+		--force) force=true ;;
+		--dry-run) dry=true ;;
+		-*) die "unknown option $1" ;;
+		*) target=$1 ;;
+		esac
+		shift
+	done
+	target=${target:-${WEZTERM_PANE:-}}
+	[[ -n $target ]] || die "switch which session? (not in a wezterm pane)"
+	row=$(cc-roster --row "$target") || die "no live session \"$target\""
+	# detail is often empty, and a tab IFS would fold it away
+	IFS=$'\x1f' read -r sid name _ _ pane cwd pid seen _ <<<"${row//$'\t'/$'\x1f'}"
+	[[ $pane =~ ^[0-9]+$ ]] || die "$name has no pane to resume in"
+	acct_of_pid "$pid"
+	from=$ACCT
+	if [[ -z $to ]]; then
+		set -- $ACCT_NAMES
+		(($# == 2)) || die "more than two accounts: say which with --to"
+		to=$1
+		[[ $to == "$from" ]] && to=$2
+	fi
+	known "$to"
+	[[ $to != "$from" ]] || die "$name is already on $to"
+	if ! $force && cache_cold "$sid" "$seen"; then
+		die "$name is cold: resuming re-reads its whole context. cc-handover $sid --new \
+--account $to starts fresh with a brief; --force resumes anyway"
+	fi
+	spawn=(cc-spawn --replace "$pane" --resume "$sid" --account "$to" --cwd "$cwd")
+	# effort is per process and a resume starts at the default; a /effort since is lost
+	effort=$(ps -o command= -p "$pid" 2>/dev/null |
+		sed -n 's/.*--effort[ =]\([a-z]*\).*/\1/p')
+	[[ -n $effort ]] && spawn+=(--effort "$effort")
+	if $dry; then
+		printf '%s -> %s: %s\n' "$from" "$to" "${spawn[*]}"
+		exit 0
+	fi
+	# Run detached: from inside the session, this script is the pane's own child, and the
+	# session has a turn to finish before it can close
+	(
+		trap '' HUP
+		for ((i = 0; i < SWITCH_TRIES; i++)); do
+			status=$(cc-roster --row "$sid" 2>/dev/null | cut -f3)
+			[[ -z $status ]] && exit 0
+			case $status in
+			busy | asking | shell) sleep "$SWITCH_POLL" ;;
+			*) break ;;
+			esac
+		done
+		((i < SWITCH_TRIES)) || exit 0
+		"${spawn[@]}"
+	) </dev/null >/dev/null 2>&1 &
+	disown 2>/dev/null
+	echo "$name moves from $from to $to once its turn ends, resumed in place (pane $pane)"
+	;;
+-h | --help | help) usage ;;
+*) die "unknown command \"$cmd\" (cc-account --help)" ;;
+esac

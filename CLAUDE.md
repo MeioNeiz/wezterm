@@ -1,8 +1,8 @@
 # wezterm + the cc-* fleet scripts
 
-Only this file is always in context. `.claude/rules/` loads itself when you read a file it
-covers; `.claude/context/` and `docs/` load when a task needs them (`docs/INDEX.md`).
-Anything true of one area only belongs there, not here.
+Only this file is always in context. `.claude/rules/` loads itself when you read or edit a
+file it covers; `.claude/context/` and `docs/` load when a task needs them
+(`docs/INDEX.md`). Anything true of one area only belongs there, not here.
 
 ## the map
 
@@ -18,7 +18,9 @@ wezterm.lua and the hooks call the scripts by their `~/.claude/bin` paths.
 | `bin/wz` | same | panes as a queryable surface, the event log, notify |
 | `bin/cc-tint`, `cc-note` | same | paints a pane at SessionStart; what a session says |
 | `bin/cc-spawn`, `cc-handover` | same | starts a session cleanly; moves work to a fresh one |
-| `bin/ccx` | same | closes what a gather (LEADER+G) pulled in, typed `!ccx` |
+| `bin/cc-account` | same | which claude.ai login a session runs on, by folder; switches one |
+| `bin/cc-doctor` | same | drift between copies; new values in a Claude Code binary |
+| `bin/ccx` | same | closes what a handover came from: `--new` itself, a gather on `!ccx` |
 | `bin/cc-sort`, `cc-watch`, `cc-handovers` | same | Kev: topic sort, output watch (off), digest |
 | `bin/cc-toast` | same | built by setup.sh from `toast/`, gitignored |
 | `skills/fleet` | `~/.claude/skills/fleet` | the skill sessions use to drive all of it |
@@ -35,7 +37,8 @@ macOS and Linux run everything; Windows runs the config only (`setup-windows.ps1
   none (an Esc, a turn that died); the registry is level-triggered but reads idle for a
   killed turn exactly as for a finished one. Every reader merges both in the order above
   `pane_status` in wezterm.lua, and **an idle registry never overrules a hook record that
-  says errored or parked**. Never add a third source (`get-text` on a timer buys nothing).
+  says errored or parked** (except parked `shell`: the registry tracks shells). Never add
+  a third source (`get-text` on a timer buys nothing).
   Formats and who reads what: `.claude/context/state-files.md`
 - **A cold session is never woken or resumed.** Cold is past `expires_at` in the context
   file, else `statusUpdatedAt` + `CACHE_TTL` (1h, in wezterm.lua, cc-board, cc-fleet,
@@ -63,7 +66,7 @@ macOS and Linux run everything; Windows runs the config only (`setup-windows.ps1
 | "is there a way to..." before building a bridge | `.claude/context/dead-ends.md` | you read it |
 | colour, the tint, the palette | `docs/colour.md` | you read it |
 | the board and tab bar widths | `docs/cc-board.md` | you read it |
-| wz, cc-note, cc-handover, cc-spawn, notify, Kev's scripts | `docs/tools.md` | you read it |
+| wz, cc-note, cc-handover, cc-spawn, cc-account, notify, Kev's scripts | `docs/tools.md` | you read it |
 | time and token costs, measured | `docs/cost.md` | you read it |
 | what Claude Code and others offer | `docs/findings-2026-09.md`, `docs/research/` | you read it |
 

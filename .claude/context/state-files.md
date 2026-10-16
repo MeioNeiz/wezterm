@@ -5,6 +5,12 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
 
 ## read, written by Claude or by Kev
 
+Every path here is under `~/.claude`, whichever account a session runs on: another
+account's folder (`~/.claude-personal`) is links back into it (cc-account), so readers
+never look anywhere else. **`~/.claude/accounts`** is the map, `<name> <folder> <email>
+<dirs>...`, out of the repo; read by cc-account, and via `--lib` by statusline.sh and
+cc-spawn.
+
 - **`~/.claude/sessions/<pid>.json`**, the registry. name, status, cwd, session id,
   `statusUpdatedAt` (when its last request finished), `waitingFor`, and `formerNames`, the
   addresses it has been renamed away from. A name is not a stable address: cc-roster
@@ -32,14 +38,25 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
   (`wz last <name>` fails, cc-roster shows pane `-`). Each turn takes it back
 - **`~/.claude/wezterm-state/<pane>`** `state\tepoch\tdetail\tsid`, from five hooks:
   - `working` UserPromptSubmit; `done` and `parked` Stop, parked when a `background_tasks`
-    entry is still running; `asking` PermissionRequest, Notification as the backstop;
+    entry is still running, or detail `cron` when `session_crons` has an entry (a /loop
+    or wakeup that starts the next turn itself; 4h cap); `asking` PermissionRequest, Notification as the backstop;
     `errored` StopFailure; `ended` SessionEnd
   - **parked** is a finished turn waiting on its own background work, which since fork mode
     and background subagents is the difference between finished and not. Nothing writes
     when that work ends without a turn, so **every reader expires parked**: 30m for a
-    `monitor`, 2h for a `shell` (their limits since 2.1.271 and 2.1.285), 4h otherwise,
-    constants in wezterm.lua, cc-roster and cc-board
-  - **errored** exists because Stop does not fire when a turn dies on an API error
+    `monitor` (its limit since 2.1.271), 4h otherwise (a terminal session's background
+    shells have no limit since 2.1.288); constants in wezterm.lua, cc-roster, cc-board.
+    The Monitor tool's watch reaches Stop as `shell`, not `monitor` (only MCP and
+    WebSocket ones say monitor). A parked `shell` also ends once the registry reads idle
+    after it: the registry's `shell` status tracks exactly those tasks (seen 2026-10-05:
+    `shell` from the Stop second until the watch ended)
+  - **errored** exists because Stop does not fire when a turn dies on an API error.
+    Detail `rate_limit` reads as parked "resumes HH:MM" in every reader while
+    `cache/rate-limits` holds the first reset after the record, until 5 minutes past it:
+    Claude resumes it then (`autoContinueAtUsageLimit`). Notification writes
+    `rate_limit_stale` (slept through the reset, waits for Enter) or `rate_limit_disabled`
+    when it will not, which stay errored. Rule in wezterm.lua's `rate.resume_at`,
+    cc-roster, cc-board
   - an **asking** record is dropped once the registry has moved past it: Esc on a dialog
     ends the turn with no Stop
   - `detail` is the tool for asking, the error kind for errored, the task type for parked,
@@ -52,16 +69,26 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
 ## written by these scripts
 
 - **`cache/context/<sid>`** `used_pct, window_size, epoch, expires_at, ttl_s,
-  recache_tokens, hit_pct`, by the statusLine on every render. Claude hands these to the
+  recache_tokens, hit_pct, 5h_pct, 5h_resets, 7d_pct, 7d_resets`, by the statusLine on
+  every render; the rate fields are only its own memo for `cache/rate-limits`. Claude hands these to the
   statusLine and nowhere else: not the registry, and a transcript has tokens but not the
   window to divide by. Readers: cc-board, cc-fleet, cc-handover, wz, wezterm.lua, kev-mcp
   stop-asks (field 1). Old files have three fields. cc-board can also scrape the visible
   statusLine, which needs the pane on screen
-- **`cache/rate-limits`** `epoch, 5h_pct, 5h_resets, 7d_pct, 7d_resets, spend`, per account
-  so one file, any statusLine at most every 5s. Right status: `5h N% HH:MM`, hidden once 10
-  minutes old or past its reset; `▲ out <when>` once a window is 10 points ahead of an even
-  burn (not in its first tenth), red when that is under a quarter of the window away; the
-  7d figure only then or past 75%
+- **`cache/rate-limits`** `epoch, 5h_pct, 5h_resets, 7d_pct, 7d_resets, spend`, for
+  `~/.claude`'s login; **`rate-limits-<name>`** the same for each other account
+  (cc-account), the statusLine picking by its `CLAUDE_CONFIG_DIR`. `rate-limits.<pid>` is a
+  write in progress, skipped. A `rate_limit` record does not say whose account died, so a
+  reader takes the earliest reset of any file that fits it. The payload does not name the
+  account, so a statusLine writes when
+  its figures changed since its own last render (a new response), else at most every 5s
+  refreshes the epoch only if it agrees with the file: an idle pane re-renders its last
+  response's, maybe another login's. Never merge on "later reset wins": another account's
+  window can reset later and sticks.
+  Right status: `5h N% HH:MM`, hidden once 10 minutes old or past its reset; `▲ out
+  <when>` once a window is 10 points ahead of an even burn (not in its first tenth) or,
+  from 75%, on any burn that runs out before the reset; red when that is under a quarter
+  of the window away; the 7d figure only then or past 75%
 - **`cache/fleet-digest`** `#<epoch>`, then `pane, sid, status, waitingFor, seen_ms` per
   pane with a live session. `cc-roster --digest` writes it whole and renames it; wezterm.lua
   asks for one when it is over 5s old. It is how the registry reaches Lua, which cannot
@@ -73,13 +100,16 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
   baseline, never unread. Leaving updates `left_at` only after 2s on the pane
   (`READ_DWELL`): passing through is not reading
 - **`cache/kev-pick`** `#<epoch>\tfrom <pane>`, then `n, pane, score, why, name`: LEADER+t's
-  list, written by the `pick` action (dry run, no jump)
+  ranking of every pane, yours included. Written by the `pick` action and every 2s while
+  `cache/cc-toast/` has a slot; cc-toast orders its stack by `score`
 - **`cache/notify-log`** `epoch, pane, rank, title, sid, body` per `wz notify`, `-` when
   absent, trimmed to 200; lines before 2026-10-01 stop at title. What LEADER+t (Kev's top
   unseen) and LEADER+T (newest) jump to, skipping a pane that now holds another session,
   and what `wz toasts` lists
-- **`cache/cc-toast/<slot>`** `<pid> <height> <sticky 0|1> <started_ms>`, space-separated:
-  which toast holds which place, and which the cap of five may not evict
+- **`cache/cc-toast/<slot>`** `<pid> <height> <sticky 0|1> <started_ms> <rank> <pane|->`,
+  space-separated, rewritten when a pill opens. The slot is an id; the stack is ordered by
+  the pane's kev-pick score, else rank, newer first on a tie. Past five the last in that
+  order goes, non-sticky first
 - **`fleet/actions.d/`** the shell -> Lua queue, one file per action, written aside and
   renamed in; Lua drains by name every 0.1s. `jump\t<pane>` is a toast click, run
   in-process like LEADER+t; `goto` is wz go. The old single `fleet/actions` file still drains
@@ -89,7 +119,10 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
 - **`fleet/gathered/<receiver pane>`** `pane\tsid\tname` per source of a gather, written by
   cc-handover, read and pruned by ccx (it keeps what it could not close); reaped with the
   pane by `cc-roster --digest`
-- **`fleet/handover/<name>-<stamp>.md`** cc-handover's briefs; cc-handovers writes
+- **`fleet/handover/<name>-<stamp>.md`** cc-handover's briefs, each source's screen
+  beside it as `<name>-<stamp>.<source>.scrollback.txt` (cc-handovers globs `*.md`, so
+  keep that suffix off it). Reaped by `cc-roster --digest`: screens after 3 days, briefs
+  after 14 (only names matching cc-handover's stamp); cc-handovers writes
   `fleet/handover-days/` (`HANDOVER_DAYS` overrides), read by the vault's /weekly-review
 - **`cache/wz-events.jsonl`** wz's event log, `wz-events.pid` beside it
 - **`session-colours-auto`** hand-pin format, by cc-tint when a new session would reuse the
@@ -106,6 +139,11 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
 - **`cache/reap-stamp`** `cc-roster --digest` reaps at most hourly: state and map files for
   panes wezterm no longer has, maps naming an unknown session after a day, titles and
   context a week after their session is gone. Skipped when wezterm answers nothing
+- **`cache/cc-enums/<version>`** `set\tvalue`, sorted (`LC_ALL=C`): the value sets cc-doctor
+  read from that Claude Code binary. Beside it `<version>.diff`, `#from <prev|->` then
+  `+|-|!|*\tset\tvalue` (`!` a set no longer found, `*` one not read before), and empty
+  markers `<version>.announced` (toasted, or nothing to toast: the digest's fast path) and
+  `<version>.ack` (readers told; the check stops failing). Never pruned; 3KB a version
 
 ## dependencies between them
 
