@@ -27,8 +27,13 @@ cc-spawn - start a Claude session in a new pane, with a task
 
   --cwd <dir>        where it runs (default: this pane's directory)
   --from <target>    the pane to split from (default: this one)
-  --right | --left | --top | --bottom     split (default: right)
+  --right | --left | --top | --bottom     split (default: right). A Claude split
+                     --right or --left that would leave under a third of the tab's width
+                     opens a new tab instead: two across fits, three is too narrow
+  --squeeze          split anyway
   --tab | --window   a new tab in the same window, or a new window
+  --workspace <name> a new tab in that workspace's window; a new window only when the
+                     workspace has none, so it is made if it does not exist
   --shell            a plain shell rather than Claude, for a pane to watch things in
   --ask              leave permission prompts on (default: bypassed)
   --effort <level>   low | medium | high | xhigh | max (default: settings, xhigh). Pick it
@@ -87,6 +92,8 @@ resume=""
 replace=""
 account=""
 print_sid=false
+workspace=""
+squeeze=false
 while (($#)); do
 	case $1 in
 	--cwd) shift; cwd=${1:-}; [[ -n $cwd ]] || die "--cwd needs a directory" ;;
@@ -96,6 +103,8 @@ while (($#)); do
 	--up) where="--top" ;;
 	--tab) where="tab" ;;
 	--window) where="window" ;;
+	--workspace) shift; workspace=${1:-}; where="window"
+		[[ -n $workspace ]] || die "--workspace needs a name" ;;
 	--shell) shell=true ;;
 	--ask) ask=true ;;
 	--effort) shift; effort=${1:-}; [[ -n $effort ]] || die "--effort needs a level" ;;
@@ -107,6 +116,7 @@ while (($#)); do
 	--replace) shift; replace=${1:-}; [[ -n $replace ]] || die "--replace needs a pane" ;;
 	--account) shift; account=${1:-}; [[ -n $account ]] || die "--account needs a name" ;;
 	--print-sid) print_sid=true ;;
+	--squeeze) squeeze=true ;;
 	--dry-run) dry=true ;;
 	-h | --help) usage; exit 0 ;;
 	--) shift; break ;;
@@ -143,15 +153,39 @@ else
 	pane=${WEZTERM_PANE:-}
 fi
 
+split_x=false
+case $where in
+--right | --left) $shell || [[ -n $replace ]] || $squeeze || split_x=true ;;
+esac
+listing=""
+if [[ -n $pane ]] && { [[ -z $cwd ]] || $split_x; }; then
+	listing=$(wzcli list --format json 2>/dev/null)
+fi
+
 if [[ -z $cwd ]]; then
-	if [[ -n $pane ]]; then
-		cwd=$(wzcli list --format json 2>/dev/null |
-			jq -r --arg p "$pane" '.[] | select(.pane_id == ($p | tonumber))
-				| .cwd // "" | sub("^file://[^/]*"; "")' 2>/dev/null | head -1)
+	if [[ -n $listing ]]; then
+		cwd=$(jq -r --arg p "$pane" '.[] | select(.pane_id == ($p | tonumber))
+			| .cwd // "" | sub("^file://[^/]*"; "")' <<<"$listing" 2>/dev/null | head -1)
 	fi
 	[[ -n $cwd ]] || cwd=$PWD
 fi
 [[ -d $cwd ]] || die "no such directory: $cwd"
+
+# A split halves the pane. The tab's width is the window's on whichever screen it is on,
+# so a third of it is the floor there; in practice that is two Claude panes across.
+# Not for --replace: its split is closed again at once
+if $split_x && [[ -n $listing ]]; then
+	cols="" tabw=""
+	read -r cols tabw < <(jq -r --arg p "$pane" '
+		(.[] | select(.pane_id == ($p | tonumber))) as $me
+		| [.[] | select(.tab_id == $me.tab_id) | .left_col + .size.cols] | max
+		| "\($me.size.cols) \(.)"' <<<"$listing" 2>/dev/null)
+	if [[ $cols =~ ^[0-9]+$ && $tabw =~ ^[0-9]+$ ]] && ((cols / 2 * 3 < tabw)); then
+		echo "cc-spawn: a split of pane $pane ($cols of $tabw columns) would leave under" \
+			"a third of the tab; a new tab instead (--squeeze splits anyway)" >&2
+		where="tab"
+	fi
+fi
 
 # Fail here rather than in a new pane nobody is watching.
 if $worktree && ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
@@ -230,8 +264,20 @@ if [[ -n $replace ]]; then
 	fi
 fi
 
+# One window per workspace: the GUI shows every window of the active workspace at once,
+# so a second one is a second OS window over the first
+tab_at=(--pane-id "$pane")
+if [[ -n $workspace ]]; then
+	ws_window=$(wzcli list --format json 2>/dev/null | jq -r --arg ws "$workspace" \
+		'map(select(.workspace == $ws))[0].window_id // empty' 2>/dev/null)
+	if [[ $ws_window =~ ^[0-9]+$ ]]; then
+		where="tab"
+		tab_at=(--window-id "$ws_window")
+	fi
+fi
+
 if $dry; then
-	printf 'would spawn %s in %s%s\n' "$where" "$cwd" "${replace:+, closing pane $pane}"
+	printf 'would spawn %s%s in %s%s\n' "$where" "${workspace:+ in workspace $workspace}" "$cwd" "${replace:+, closing pane $pane}"
 	if $shell; then
 		printf '  %s\n' "$SHELL"
 	else
@@ -251,8 +297,9 @@ if $dry; then
 fi
 
 case $where in
-tab) new=$(wzcli spawn --pane-id "$pane" --cwd "$cwd" -- "${cmd[@]}") ;;
-window) new=$(wzcli spawn --new-window --cwd "$cwd" -- "${cmd[@]}") ;;
+tab) new=$(wzcli spawn "${tab_at[@]}" --cwd "$cwd" -- "${cmd[@]}") ;;
+window) new=$(wzcli spawn --new-window ${workspace:+--workspace "$workspace"} --cwd "$cwd" \
+	-- "${cmd[@]}") ;;
 *) new=$(wzcli split-pane --pane-id "$pane" "$where" --cwd "$cwd" -- "${cmd[@]}") ;;
 esac
 

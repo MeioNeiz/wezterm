@@ -130,6 +130,7 @@ went.
 cc-spawn 'read src/auth.ts and list every path that skips the guard'
 cc-spawn --tab --cwd ~/work/api 'run the failing test and say why'
 cc-spawn --shell                   # a plain pane to watch something in
+cc-spawn --workspace api --cwd ~/work/api '...'   # a tab in that workspace's window
 cc-spawn --ask '...'               # leave permission prompts on
 cc-spawn --worktree=auth-guard '...'    # its own checkout, its own branch
 cc-spawn --dry-run '...'
@@ -145,10 +146,11 @@ place, whole conversation, first reply at full price (refused cold); `cc-handove
 on that login. Signing a folder in is Jacob's: `! cc-account login <name>`.
 
 **Claude panes go side by side, not stacked.** A session reads down: its output, diffs
-and scrollback want height, and width past ~100 columns is wasted. So split `--right`
-(the default) and share the width; to add one more to a column, split it `--right` again
-rather than `--bottom`. Only stack when the panes would otherwise drop under ~80 columns,
-and then prefer a new `--tab`. A `--shell` pane watching a log is the exception.
+and scrollback want height. So split `--right` (the default), never `--bottom`. cc-spawn
+decides the width itself: a split that would leave under a third of the tab's width opens
+a new tab instead and says so on stderr, which in practice means two across. Don't pick
+`--tab` or `--bottom` to second-guess it, and leave `--squeeze` (split anyway) to Jacob.
+A `--shell` pane watching a log is the exception.
 
 **Choose `--effort` when you write the brief.** Effort is per session, so spawn time is
 the only moment it can be set; the default is xhigh. `low` for a lookup, a verifier, a

@@ -207,6 +207,12 @@ Two things that are not obvious and cost a while to find:
   build needs. The only thing added here is the repo check, which happens before the pane
   opens: claude refuses `--worktree` outside a repo and says so in a pane that has just
   scrolled and is not being read.
+- **a split never leaves a Claude pane under a third of the tab's width.** Left to
+  sessions, they kept splitting a half-width pane into quarters. A `--right`/`--left` split
+  of a pane narrower than two thirds of its tab (`wezterm cli list`: the pane's `cols`
+  against the tab's widest `left_col + cols`) becomes a new tab, with a line on stderr;
+  on one screen's window that is two across. `--squeeze` overrides; `--shell` and
+  `--replace` (closed again at once) are exempt.
 - **every spawned session starts with `--dangerously-skip-permissions`**, which is how
   every agent here is run. A pane that stopped to ask does show as `asking` on the board,
   so it is not invisible, it is just wall clock nobody is spending. `--ask` opts one out.
