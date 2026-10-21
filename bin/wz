@@ -31,6 +31,11 @@ readonly CACHE_TTL=3600
 readonly NOTIFY_LOG="$CACHE/notify-log"
 readonly PANE_READ="$CACHE/pane-read"
 readonly NOTIFY_KEEP=200
+# Narrowest a pane across a tab should be: two on the laptop, four on the big monitor.
+# cc-spawn's MIN_COLS is the same number
+readonly REFLOW_MIN=90
+readonly REFLOW_LOG="$CACHE/wz-reflow.log"
+readonly BOARD_TITLE="▤ board"
 
 usage() {
 	cat <<'USAGE'
@@ -63,6 +68,10 @@ driving
   wz go <target>                      focus a pane, switching tab and workspace
   wz join <src> <target> [--right|--left|--top|--bottom]
   wz break <target>                   move a pane out to its own tab
+  wz reflow [--window <id>]... [--min <cols>] [--dry-run]
+                                      a tab whose side-by-side panes are under <cols>
+                                      (90) is split into tabs of as many as fit, evenly;
+                                      wezterm.lua runs it when a screen comes or goes
   wz notify [--say] [--quiet] [--for S | --sticky] [--compact] [--pane N] [--rank R]
             <title> [body]            a sound and a toast for S seconds (20), or until
                                       you are on pane N with --sticky; a click goes to
@@ -552,6 +561,78 @@ cmd_break() {
 	echo "pane $pane is on its own tab"
 }
 
+# Only tabs that are one row of panes, none zoomed, no board: anything stacked or zoomed was
+# laid out by hand. Panes keep their left-to-right order, across the new tabs too, which
+# wezterm appends after the window's last. Rebuilt rather than resized: adjust-pane-size
+# moves the tab's active pane whatever --pane-id says. Every pane but the first goes to a
+# tab of its own, then each group joins its first pane at the percent that makes it even
+cmd_reflow() {
+	local min=$REFLOW_MIN dry=false wins="" ws focused plan
+	while (($#)); do
+		case $1 in
+		--window) shift; [[ ${1:-} =~ ^[0-9]+$ ]] || die "reflow: --window needs an id"
+			wins+="${wins:+,}$1" ;;
+		--min) shift; [[ ${1:-} =~ ^[0-9]+$ ]] || die "reflow: --min needs columns"
+			min=$1 ;;
+		--dry-run) dry=true ;;
+		-h | --help) usage; return ;;
+		*) die "reflow: unknown argument $1" ;;
+		esac
+		shift
+	done
+	# default: the windows on screen, the workspace of the client touched last
+	IFS=$'\t' read -r ws focused < <(wzcli list-clients --format json 2>/dev/null |
+		jq -r 'min_by(.idle_time.secs) | [.workspace // "-", .focused_pane_id // "-"] | @tsv' \
+			2>/dev/null)
+	[[ -n $wins || (-n $ws && $ws != -) ]] ||
+		die "reflow: no GUI client, so no screen to fit; name one with --window"
+	plan=$(wzcli list --format json 2>/dev/null | jq -r --arg wins "$wins" \
+		--arg ws "${ws:--}" --argjson min "$min" --arg board "$BOARD_TITLE" '
+		($wins | split(",") | map(tonumber)) as $w
+		| map(select(if ($w | length) > 0 then (.window_id as $i | $w | index($i))
+			else .workspace == $ws end))
+		| group_by(.tab_id)[]
+		| select(length > 1 and all(.top_row == 0) and (any(.is_zoomed) | not)
+			and (any(.title == $board or .tab_title == $board) | not)
+			and any(.size.cols < $min))
+		| sort_by(.left_col)
+		| (map(.left_col + .size.cols) | max) as $width
+		| [.[0].tab_id, $width, ([1, (($width + 1) / ($min + 1) | floor)] | max),
+			(map(.pane_id | tostring) | join(" "))]
+		| map(tostring) | @tsv' 2>/dev/null)
+	[[ -n $plan ]] || { echo "nothing narrower than $min columns"; return 0; }
+
+	local tab width k ids panes n i g m j prev moved=""
+	while IFS=$'\t' read -r tab width k ids; do
+		# shellcheck disable=SC2206
+		panes=($ids)
+		n=${#panes[@]}
+		echo "tab $tab, $width columns: $n panes, $k a tab (${ids// /, })"
+		$dry && continue
+		printf '%s\ttab %s\t%s cols\t%s a tab\t%s\n' "$(date '+%F %T')" "$tab" "$width" \
+			"$k" "$ids" >>"$REFLOW_LOG" 2>/dev/null
+		for ((i = 1; i < n; i++)); do
+			wzcli move-pane-to-new-tab --pane-id "${panes[i]}" >/dev/null ||
+				echo "wz: reflow: could not move pane ${panes[i]} out" >&2
+		done
+		for ((g = 0; g < n; g += k)); do
+			m=$((n - g < k ? n - g : k))
+			prev=${panes[g]}
+			for ((j = 1; j < m; j++)); do
+				wzcli split-pane --pane-id "$prev" --move-pane-id "${panes[g + j]}" --right \
+					--percent $((100 * (m - j) / (m - j + 1))) >/dev/null ||
+					echo "wz: reflow: pane ${panes[g + j]} stays on a tab of its own" >&2
+				prev=${panes[g + j]}
+			done
+		done
+		moved+=" $ids "
+	done <<<"$plan"
+	# a join leaves the joined pane active; put Jacob back on the one he was on
+	[[ -n $focused && $moved == *" $focused "* ]] &&
+		wzcli activate-pane --pane-id "$focused" >/dev/null 2>&1
+	return 0
+}
+
 # No @Q here: that is bash 4.4, and this machine is 3.2.
 osa_quote() {
 	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
@@ -982,6 +1063,7 @@ key) shift; cmd_key "$@" ;;
 go) shift; cmd_go "$@" ;;
 join) shift; cmd_join "$@" ;;
 break) shift; cmd_break "$@" ;;
+reflow) shift; cmd_reflow "$@" ;;
 notify) shift; cmd_notify "$@" ;;
 events) shift; cmd_events "$@" ;;
 wait) shift; cmd_wait "$@" ;;
