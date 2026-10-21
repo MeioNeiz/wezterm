@@ -65,13 +65,15 @@ command -v jq >/dev/null || {
 tmp=$(mktemp)
 jq --arg home "$HOME" '
 def hook($arg): { type: "command", command: ("\"$HOME/.claude/hooks/wezterm-pane-state.sh\" " + $arg) };
+def limits($arg): { type: "command", command: ("\"$HOME/.claude/hooks/cc-limits.sh\" " + $arg), timeout: 5 };
 def norm: gsub("\""; "") | sub("^~"; "$HOME") | split($home) | join("$HOME");
 {
 	SessionStart: { hooks: [
 		{ type: "command", command: "\"$HOME/.claude/hooks/wezterm-session-map.sh\"" },
 		{ type: "command", command: "\"$HOME/.claude/bin/cc-tint\"", timeout: 5 }
 	] },
-	UserPromptSubmit: { hooks: [hook("working")] },
+	UserPromptSubmit: { hooks: [hook("working"), limits("prompt")] },
+	PreToolUse: { hooks: [limits("tool")] },
 	Notification: { matcher: "permission_prompt|push_notification|worker_permission_prompt|model_refusal_fallback|quota_auto_resume_stale|quota_auto_resume_disabled|auth_storage_failure", hooks: [hook("notify")] },
 	Stop: { hooks: [hook("done")] },
 	SessionEnd: { hooks: [hook("ended")] },

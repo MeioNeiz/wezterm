@@ -339,8 +339,25 @@ its own parent. Another account means no prompt cache, so the first reply re-rea
 whole context; refused when cold, as every resume is, unless `--force`. For a big session
 `cc-handover --new --account <name>` is cheaper.
 
-The statusLine names the account once there are two, yellow `personal, not work` when it
-is not the folder's. Rate limits are per account: `cache/rate-limits` for `~/.claude`'s,
+**Lending a folder for a while**: `cc-account use work ~/personal/meiolol --until 18:00`
+(or `+2h`) writes `~/.claude/account-overrides`; `acct_for` prefers a live override to the
+map, so the zsh `claude` and cc-spawn pick it up, and it lapses on its own when read after
+its time, with no job left running. Running sessions keep their account. `use` lists them,
+`use --end [dir]` ends one.
+
+**Caps**: `~/.claude/account-limits`, `<name|*> <folder|*> <5h|7d> <stop> [warn]`, every
+matching line applying. A stop of `11,23,47,65,90` is a cap per calendar day of the window,
+counted from the day it started (the weekly one resets Monday 10:00, so Monday morning is
+still the last week's last day). `hooks/cc-limits.sh` runs on UserPromptSubmit and every
+PreToolUse: under the cap it prints nothing (no tokens, ~11ms); at warn it toasts once a
+window; at stop it blocks the prompt or denies the tool call, toasts sticky, and ends an
+override lending the folder to that account. Usage is the statusLine's cache, so it lags by
+at most one response. `cc-account limits [dir]` shows where each account stands, and `use`
+refuses to lend a folder already over its cap.
+
+The statusLine names the account once there are two, as a peach badge when it is not the
+folder's own (`personal, not work`, or `work till 18:00` under an override, with the
+folder's nearest cap `week 19/23%`), red with `STOPPED` at a cap. Rate limits are per account: `cache/rate-limits` for `~/.claude`'s,
 `rate-limits-<name>` for the others; the right status shows each, prefixed by name.
 
 ## cc-doctor: drift between copies, and new values in Claude Code

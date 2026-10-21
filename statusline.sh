@@ -30,6 +30,8 @@ readonly YELLOW=$'\033[38;2;249;226;175m'
 readonly RED=$'\033[38;2;243;139;168m'
 readonly DIM=$'\033[38;2;108;112;134m'
 readonly RESET=$'\033[0m'
+readonly BADGE_ODD=$'\033[48;2;250;179;135m\033[38;2;30;30;46m'
+readonly BADGE_STOP=$'\033[48;2;243;139;168m\033[38;2;30;30;46m'
 readonly MAX_TITLE=64
 readonly MAX_NOTE=52
 readonly NOTES="$HOME/.claude/fleet/notes.tsv"
@@ -171,14 +173,33 @@ label=${label##*/}
 
 # Which login this pane runs on, once there is more than one. Loud when it is not the
 # account this folder defaults to, which is a session moved on purpose or by mistake
+# A solid badge, since a yellow word mid-line went unseen. An override lending the folder
+# still wears it, with its end, and the cap the folder has on this account beside it.
 acct_tag=""
 acct_odd=false
+acct_bg=$BADGE_ODD
 if [[ $ACCT_NAMES == *" "* ]]; then
 	acct_tag=$account
 	acct_for "$dir"
-	if [[ $ACCT != "$account" ]]; then
-		acct_tag="$account, not $ACCT"
+	if [[ $ACCT_BASE != "$account" ]]; then
 		acct_odd=true
+		if [[ $ACCT == "$account" && -n $ACCT_UNTIL ]]; then
+			if [[ $OSTYPE == darwin* ]]; then
+				acct_tag+=" till $(date -r "$ACCT_UNTIL" +%H:%M)"
+			else
+				acct_tag+=" till $(date -d "@$ACCT_UNTIL" +%H:%M)"
+			fi
+		else
+			acct_tag+=", not $ACCT_BASE"
+		fi
+	fi
+	ACCT_NOW=${now:-0}
+	acct_limits "$account" "$dir"
+	[[ -n $LIM_TAG ]] && acct_tag+=" · $LIM_TAG"
+	if [[ -n $LIM_STOP ]]; then
+		acct_tag+=" STOPPED"
+		acct_odd=true
+		acct_bg=$BADGE_STOP
 	fi
 fi
 
@@ -296,7 +317,7 @@ out="${IDC_ANSI:-$BLUE}${title}${RESET}"
 [[ -n $note_status ]] && out+="${meta}  ·  ${RESET}${YELLOW}▸ ${note_status}${RESET}"
 [[ -n $label ]] && out+="${meta}  ·  ${label}${RESET}"
 if $acct_odd; then
-	out+="${meta}  ·  ${RESET}${YELLOW}${acct_tag}${RESET}"
+	out+="${meta}  ·  ${RESET}${acct_bg} ${acct_tag} ${RESET}"
 elif [[ -n $acct_tag ]]; then
 	out+="${meta}  ·  ${acct_tag}${RESET}"
 fi

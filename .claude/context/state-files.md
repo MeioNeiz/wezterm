@@ -8,8 +8,13 @@ wherever a reader splits on whitespace (an empty column folds into its neighbour
 Every path here is under `~/.claude`, whichever account a session runs on: another
 account's folder (`~/.claude-personal`) is links back into it (cc-account), so readers
 never look anywhere else. **`~/.claude/accounts`** is the map, `<name> <folder> <email>
-<dirs>...`, out of the repo; read by cc-account, and via `--lib` by statusline.sh and
-cc-spawn.
+<dirs>...`, out of the repo; read by cc-account, and via `--lib` by statusline.sh,
+cc-spawn and hooks/cc-limits.sh. Beside it, both out of the repo and written by hand or
+cc-account: **`account-overrides`** `<name> <folder> <until epoch>`, a folder lent to
+another account, expired lines ignored and dropped on the next write; and
+**`account-limits`** `<name|*> <folder|*> <5h|7d> <stop> [warn]`, stop a percentage or one
+a calendar day of the window (`11,23,47,65,90`). **`cache/limits/<acct>-<win>-<reset>-
+<level>`** marks a toast sent, once a window; pruned after 8 days.
 
 - **`~/.claude/sessions/<pid>.json`**, the registry. name, status, cwd, session id,
   `statusUpdatedAt` (when its last request finished), `waitingFor`, and `formerNames`, the

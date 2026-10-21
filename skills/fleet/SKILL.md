@@ -144,6 +144,10 @@ login (cc-account); a session keeps the one it started on and its statusLine nam
 place, whole conversation, first reply at full price (refused cold); `cc-handover --new
 --account <name>` when it is big. Never `/login` to change account: it moves every session
 on that login. Signing a folder in is Jacob's: `! cc-account login <name>`.
+`cc-account use <name> [dir] --until 18:00` lends a folder to an account for a while;
+`cc-account limits` shows usage against the caps in `~/.claude/account-limits`, which a hook
+enforces by refusing prompts and tool calls. A refusal saying "Usage cap" is final: stop
+and tell Jacob, never switch account or retry to get round it.
 
 **Claude panes go side by side, not stacked.** A session reads down: its output, diffs
 and scrollback want height. So split `--right` (the default), never `--bottom`. cc-spawn

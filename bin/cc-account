@@ -9,23 +9,41 @@
 #   <name> <config folder> <login email> <folder>...
 # A session started under one of the folders gets that account; `*` marks the default.
 #
-# Sourced as a library by statusline.sh and cc-spawn, which cannot afford a fork:
+# Overrides lend a folder to another account until a time, ~/.claude/account-overrides:
+#   <name> <folder> <until epoch>
+# Limits cap an account's usage, ~/.claude/account-limits, read by hooks/cc-limits.sh:
+#   <name|*> <folder|*> <5h|7d> <stop> [warn]
+# stop is a percentage, or one a day of the window, its first day first: 11,23,47,65,90 (the
+# last holds to the end). Every matching line applies, so the strictest wins.
+#
+# Sourced as a library by statusline.sh, cc-spawn and the limits hook, which cannot afford
+# a fork:
 #   source ~/.claude/bin/cc-account --lib
 #   acct_load; acct_for <dir>; acct_current; acct_env <name>; acct_suffix <name>
+#   acct_limits <name> <dir>
 
 ACCT_FILE="$HOME/.claude/accounts"
+ACCT_OVR_FILE="$HOME/.claude/account-overrides"
+ACCT_LIM_FILE="$HOME/.claude/account-limits"
 ACCT_HOME="$HOME/.claude"
 ACCT_NAMES=""
 ACCT_DEFAULT=""
 ACCT=""
+ACCT_BASE=""
+ACCT_UNTIL=""
+ACCT_OVR_DIR=""
+ACCT_OVR=""
+ACCT_NOW=0
 ACCT_ENV=()
 ACCT_LOADED=false
 
-# ACCT_NAMES, ACCT_DEFAULT, and acct_dir_<name>, acct_email_<name>, acct_dirs_<name>.
+# ACCT_NAMES, ACCT_DEFAULT, and acct_dir_<name>, acct_email_<name>, acct_dirs_<name>;
+# ACCT_OVR the live overrides, `name folder until` a line.
 # No file means one account and nothing to choose: ACCT_NAMES stays empty
 acct_load() {
 	$ACCT_LOADED && return 0
 	ACCT_LOADED=true
+	acct_load_overrides
 	[[ -r $ACCT_FILE ]] || return 0
 	local name dir email rest d dirs home_name=""
 	while read -r name dir email rest; do
@@ -52,19 +70,119 @@ acct_load() {
 	[[ -n $ACCT_DEFAULT ]] || ACCT_DEFAULT=${home_name:-${ACCT_NAMES%% *}}
 }
 
-# ACCT: the account a session started in $1 gets. The longest matching folder wins
+# The clock costs a fork, so only when there is an override to expire
+acct_load_overrides() {
+	local name dir until
+	ACCT_OVR=""
+	[[ -s $ACCT_OVR_FILE ]] || return 0
+	ACCT_NOW=$(date +%s)
+	while read -r name dir until _; do
+		[[ $name =~ ^[A-Za-z0-9_]+$ && $until =~ ^[0-9]+$ ]] || continue
+		((until > ACCT_NOW)) || continue
+		dir=${dir/#\~/$HOME}
+		ACCT_OVR+="$name ${dir%/} $until"$'\n'
+	done <"$ACCT_OVR_FILE"
+}
+
+# ACCT: the account a session started in $1 gets; ACCT_BASE what the map alone says;
+# ACCT_UNTIL and ACCT_OVR_DIR when an override lending the folder to ACCT ends, and its
+# folder. The longest matching folder wins, an override's over the map's
 acct_for() {
-	local dir=${1%/} name d k best=0
-	ACCT=$ACCT_DEFAULT
+	local dir=${1%/} name d k until best=0
+	ACCT_BASE=$ACCT_DEFAULT
+	ACCT_UNTIL=""
+	ACCT_OVR_DIR=""
 	for name in $ACCT_NAMES; do
 		k="acct_dirs_$name"
 		for d in ${!k}; do
 			if [[ $dir == "$d" || $dir == "$d"/* ]] && ((${#d} > best)); then
-				ACCT=$name
+				ACCT_BASE=$name
 				best=${#d}
 			fi
 		done
 	done
+	ACCT=$ACCT_BASE
+	best=0
+	while read -r name d until; do
+		[[ -n $name ]] || continue
+		if [[ $dir == "$d" || $dir == "$d"/* ]] && ((${#d} > best)); then
+			ACCT=$name
+			ACCT_UNTIL=$until
+			ACCT_OVR_DIR=$d
+			best=${#d}
+		fi
+	done <<<"$ACCT_OVR"
+}
+
+# Local calendar day of an epoch, so a window's days turn at midnight across a clock change
+acct_day() {
+	local z off
+	if [[ $OSTYPE == darwin* ]]; then
+		z=$(date -r "$1" +%z)
+	else
+		z=$(date -d "@$1" +%z)
+	fi
+	off=$((10#${z:1:2} * 3600 + 10#${z:3:2} * 60))
+	[[ ${z:0:1} == - ]] && off=$((-off))
+	ACCT_DAY=$((($1 + off) / 86400))
+}
+
+# For account $1 in folder $2, from its rate-limits cache and the limits file:
+# LIM_STOP the first cap reached, LIM_WARN the first warning, LIM_TAG the nearest cap as
+# "week 21/23%" when a folder rule applies, LIM_KEY what a toast dedupes on. All empty
+# when nothing applies or the cache knows nothing
+acct_limits() {
+	local acct=$1 dir=${2%/} f now pct at stop warn caps start i n
+	local r5 r5_at r7 r7_at a d win where
+	LIM_STOP="" LIM_WARN="" LIM_TAG="" LIM_KEY="" LIM_GAP=0
+	[[ -r $ACCT_LIM_FILE ]] || return 0
+	acct_suffix "$acct"
+	f="$ACCT_HOME/cache/rate-limits$ACCT_SUFFIX"
+	[[ -r $f ]] || return 0
+	IFS=$'\t' read -r _ r5 r5_at r7 r7_at _ <"$f"
+	((ACCT_NOW)) || ACCT_NOW=$(date +%s)
+	now=$ACCT_NOW
+	while read -r a d win stop warn _; do
+		[[ -n $a && $a != \#* && -n $stop ]] || continue
+		[[ $a == "*" || $a == "$acct" ]] || continue
+		if [[ $d != "*" ]]; then
+			d=${d/#\~/$HOME}
+			d=${d%/}
+			[[ $dir == "$d" || $dir == "$d"/* ]] || continue
+		fi
+		case $win in
+		5h) pct=$r5 at=$r5_at n=18000 ;;
+		7d) pct=$r7 at=$r7_at n=604800 ;;
+		*) continue ;;
+		esac
+		# past its reset the window is new and its figure unknown, which is as good as 0
+		[[ $pct =~ ^[0-9]+$ && $at =~ ^[0-9]+$ ]] && ((at > now)) || continue
+		if [[ $stop == *,* ]]; then
+			start=$((at - n))
+			acct_day "$start"
+			i=$ACCT_DAY
+			acct_day "$now"
+			i=$((ACCT_DAY - i))
+			IFS=, read -r -a caps <<<"$stop"
+			((i < ${#caps[@]})) || i=$((${#caps[@]} - 1))
+			stop=${caps[i]}
+		fi
+		[[ $stop =~ ^[0-9]+$ ]] || continue
+		win=${win/7d/week}
+		where=""
+		[[ $d != "*" ]] && where=" here"
+		if [[ $d != "*" ]] && [[ -z $LIM_TAG || $((stop - pct)) -lt $LIM_GAP ]]; then
+			LIM_TAG="$win $pct/$stop%"
+			LIM_GAP=$((stop - pct))
+		fi
+		if [[ -z $LIM_STOP ]] && ((pct >= stop)); then
+			LIM_STOP="$acct is at $pct% of its $win limit, capped at $stop%$where"
+			LIM_KEY="$acct-$win-$at-stop"
+		elif [[ -z $LIM_WARN && $warn =~ ^[0-9]+$ ]] && ((pct >= warn)); then
+			LIM_WARN="$acct is at $pct% of its $win limit, stops at $stop%"
+			[[ -n $LIM_STOP ]] || LIM_KEY="$acct-$win-$at-warn"
+		fi
+	done <"$ACCT_LIM_FILE"
 }
 
 # ACCT: the account this process runs on, from CLAUDE_CONFIG_DIR
@@ -156,6 +274,12 @@ cc-account - which claude.ai account a session runs on
                              place, whole conversation. The first reply re-reads all of
                              it at full price, so refused when cold unless --force;
                              cc-handover --new --account is cheaper for a big one
+  cc-account use <name> [dir] --until <HH:MM|+2h|+90m|epoch>
+                             lend dir (default: here) to that account until then: new
+                             sessions there start on it; running ones stay put (switch)
+  cc-account use             the overrides still running
+  cc-account use --end [dir] end the override covering dir now
+  cc-account limits [dir]    every account's usage and the caps that apply in dir
   cc-account link            make or repair the account folders' links (setup.sh does)
   cc-account env [name] [--cwd dir]
                              env(1) arguments starting claude on that account (default:
@@ -168,7 +292,51 @@ The map is ~/.claude/accounts, one account a line:
 A session started under one of the folders gets that account, `*` marks the default, and
 ~/.claude must be one of the config folders. `claude --<name>` and `cc-spawn --account`
 pick one by hand.
+
+Caps are ~/.claude/account-limits, one a line, every matching line applying:
+  <name|*> <folder|*> <5h|7d> <stop%> [warn%]
+  work ~/personal/meiolol 7d 11,23,47,65,90    a cap a day of the window, the last holding
+At stop, hooks/cc-limits.sh refuses every prompt and tool call there and ends an override
+lending the folder to that account; at warn it toasts. Once a window, either way.
 USAGE
+}
+
+# epoch for HH:MM (the next one), +Nh, +Nm or an epoch
+until_epoch() {
+	local t=$1 now h m s
+	now=$(date +%s)
+	if [[ $t =~ ^\+([0-9]+)([hm])$ ]]; then
+		m=${BASH_REMATCH[1]}
+		[[ ${BASH_REMATCH[2]} == h ]] && m=$((m * 60))
+		echo $((now + m * 60))
+	elif [[ $t =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+		h=$((10#${BASH_REMATCH[1]})) m=$((10#${BASH_REMATCH[2]}))
+		IFS=: read -r _h _m s <<<"$(date +%H:%M:%S)"
+		t=$((now - 10#$_h * 3600 - 10#$_m * 60 - 10#$s + h * 3600 + m * 60))
+		((t > now)) || t=$((t + 86400))
+		echo "$t"
+	elif [[ $t =~ ^[0-9]{10}$ ]]; then
+		echo "$t"
+	else
+		return 1
+	fi
+}
+
+hhmm() {
+	if [[ $OSTYPE == darwin* ]]; then date -r "$1" +%H:%M; else date -d "@$1" +%H:%M; fi
+}
+
+# Rewrite the live overrides less those covering $1, or only the one on it with $2=exact.
+# Expired lines go too
+drop_overrides() {
+	local dir=${1%/} exact=${2:-} name d until keep=""
+	while read -r name d until; do
+		[[ -n $name ]] || continue
+		[[ $dir == "$d" ]] && continue
+		[[ -z $exact && $dir == "$d"/* ]] && continue
+		keep+="$name ${d/#$HOME/~} $until"$'\n'
+	done <<<"$ACCT_OVR"
+	printf '%s' "$keep" >"$ACCT_OVR_FILE.$$" && mv -f "$ACCT_OVR_FILE.$$" "$ACCT_OVR_FILE"
 }
 
 die() {
@@ -331,6 +499,66 @@ env)
 	known "$name"
 	acct_env "$name"
 	printf '%s\n' "${ACCT_ENV[@]}"
+	;;
+use)
+	need_accounts
+	if (($# == 0)); then
+		[[ -n $ACCT_OVR ]] || { echo "no overrides"; exit 0; }
+		while read -r name d until; do
+			[[ -n $name ]] && echo "${d/#$HOME/~} on $name until $(hhmm "$until")"
+		done <<<"$ACCT_OVR"
+		exit 0
+	fi
+	name="" dir=$PWD until="" end=false
+	while (($#)); do
+		case $1 in
+		--until) shift; until=${1:-} ;;
+		--end) end=true ;;
+		-*) die "unknown option $1" ;;
+		*) if [[ -z $name ]] && ! $end; then name=$1; else dir=$1; fi ;;
+		esac
+		shift
+	done
+	dir=$(cd "$dir" 2>/dev/null && pwd) || die "no folder $dir"
+	if $end; then
+		acct_for "$dir"
+		[[ -n $ACCT_UNTIL ]] || die "no override covers ${dir/#$HOME/~}"
+		drop_overrides "$dir"
+		echo "${dir/#$HOME/~} is back on $ACCT_BASE"
+		exit 0
+	fi
+	known "$name"
+	[[ -n $until ]] || die "use needs --until"
+	until=$(until_epoch "$until") || die "--until takes HH:MM, +2h, +90m or an epoch"
+	acct_limits "$name" "$dir"
+	[[ -z $LIM_STOP ]] || die "$LIM_STOP"
+	drop_overrides "$dir" exact
+	echo "$name ${dir/#$HOME/~} $until" >>"$ACCT_OVR_FILE"
+	acct_for "$dir"
+	echo "${dir/#$HOME/~} on $name until $(hhmm "$until"), then $ACCT_BASE again." \
+		"Running sessions keep theirs: cc-account switch"
+	;;
+limits)
+	need_accounts
+	dir=$(cd "${1:-$PWD}" 2>/dev/null && pwd) || die "no folder ${1:-}"
+	ACCT_NOW=$(date +%s)
+	for name in $ACCT_NAMES; do
+		acct_suffix "$name"
+		f="$ACCT_HOME/cache/rate-limits$ACCT_SUFFIX"
+		r5=- r7=- r5_at=0 r7_at=0
+		[[ -r $f ]] && IFS=$'\t' read -r _ r5 r5_at r7 r7_at _ <"$f"
+		[[ $r5_at =~ ^[0-9]+$ ]] && ((r5_at > ACCT_NOW)) || r5=-
+		[[ $r7_at =~ ^[0-9]+$ ]] && ((r7_at > ACCT_NOW)) || r7=-
+		acct_limits "$name" "$dir"
+		printf '%s | 5h %s%% | week %s%%' "$name" "$r5" "$r7"
+		[[ -n $LIM_TAG ]] && printf ' | here %s' "$LIM_TAG"
+		if [[ -n $LIM_STOP ]]; then
+			printf ' | STOPPED: %s' "$LIM_STOP"
+		elif [[ -n $LIM_WARN ]]; then
+			printf ' | warning: %s' "$LIM_WARN"
+		fi
+		echo
+	done
 	;;
 link)
 	acct_load
