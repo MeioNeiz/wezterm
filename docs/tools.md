@@ -360,6 +360,18 @@ folder's own (`personal, not work`, or `work till 18:00` under an override, with
 folder's nearest cap `week 19/23%`), red with `STOPPED` at a cap. Rate limits are per account: `cache/rate-limits` for `~/.claude`'s,
 `rate-limits-<name>` for the others; the right status shows each, prefixed by name.
 
+## cc-privacy: the privacy dot, without the noise
+
+macOS cannot be told to skip an app for the dot by Control Centre, and AltTab and DockDoor
+light it about once a second for their window previews. cc-privacy streams Control
+Centre's `sensor-indicators` log and raises a toast when any app outside `IGNORE` (AltTab,
+DockDoor, WezTerm, by bundle id) starts screen recording, the mic or the camera (60s), or
+location (a quiet pill). Each change in what else is on goes to
+`~/.claude/cache/privacy-dots`, `time<TAB>kind app, ...`, empty when nothing: macOS keeps
+these log entries for under a day. `cc-privacy` shows the last 30, `-n N` more. launchd
+keeps `cc-privacy watch` running from login (`--install`, setup.sh runs it); errors to
+`~/.claude/cache/cc-privacy.err`.
+
 ## cc-doctor: drift between copies, and new values in Claude Code
 
 Most bugs the October survey found were one fact kept in several places that had drifted

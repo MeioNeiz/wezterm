@@ -94,6 +94,9 @@ a calendar day of the window (`11,23,47,65,90`). **`cache/limits/<acct>-<win>-<r
   <when>` once a window is 10 points ahead of an even burn (not in its first tenth) or,
   from 75%, on any burn that runs out before the reset; red when that is under a quarter
   of the window away; the 7d figure only then or past 75%
+- **`cache/privacy-dots`** `time\tkind app, ...` by cc-privacy, one line per change in
+  what holds the privacy dot or location, ignored apps left out; empty field is nothing on.
+  Appended forever (a few lines a day). Reader: `cc-privacy`
 - **`cache/fleet-digest`** `#<epoch>`, then `pane, sid, status, waitingFor, seen_ms` per
   pane with a live session. `cc-roster --digest` writes it whole and renames it; wezterm.lua
   asks for one when it is over 5s old. It is how the registry reaches Lua, which cannot

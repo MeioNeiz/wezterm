@@ -24,6 +24,7 @@ wezterm.lua and the hooks call the scripts by their `~/.claude/bin` paths.
 | `bin/cc-doctor` | same | drift between copies; new values in a Claude Code binary |
 | `bin/ccx` | same | closes what a handover came from: `--new` itself, a gather on `!ccx` |
 | `bin/cc-sort`, `cc-watch`, `cc-handovers` | same | Kev: topic sort, output watch (off), digest |
+| `bin/cc-privacy` | same | a toast when an app lights the privacy dot; its history |
 | `bin/cc-toast` | same | built by setup.sh from `toast/`, gitignored |
 | `skills/fleet` | `~/.claude/skills/fleet` | the skill sessions use to drive all of it |
 | `statusline.sh`, `hooks/*` | `~/.claude/`, `~/.claude/hooks/` | the line under each pane; state |

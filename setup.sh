@@ -108,4 +108,6 @@ jq -e '.statusLine.command | test("statusline.sh")' "$settings" >/dev/null ||
 # cc-handovers: yesterday's handover digest at 08:30. Rewrites and reloads its own plist
 if [ "$(uname)" = Darwin ] && [ -z "${SETUP_NO_LAUNCHD:-}" ]; then
 	"$HOME/.claude/bin/cc-handovers" --install || echo "cc-handovers --install failed"
+	# cc-privacy: a toast when an app other than AltTab, DockDoor, WezTerm lights the dot
+	"$HOME/.claude/bin/cc-privacy" --install || echo "cc-privacy --install failed"
 fi

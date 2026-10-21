@@ -1,0 +1,98 @@
+#!/bin/bash
+# Control Centre's privacy dot (screen, mic, camera) and location arrow: a toast whenever an
+# app not in IGNORE starts using one, and a history longer than macOS keeps (its
+# sensor-indicators log lasts under a day). The dot itself cannot be told to skip an app.
+#   cc-privacy [-n N]     the last N changes (30): time, then what was on, empty when nothing
+#   cc-privacy watch      the stream; launchd runs it from --install
+#   cc-privacy --install  start it at login and keep it running (macOS)
+set -u
+
+# AltTab and DockDoor capture windows for their previews, about once a second
+IGNORE=" com.lwouis.alt-tab-macos com.ethanbills.DockDoor com.github.wez.wezterm "
+LOG="$HOME/.claude/cache/privacy-dots"
+PLIST="$HOME/Library/LaunchAgents/net.jacob.cc-privacy.plist"
+PREDICATE='process == "ControlCenter" AND category == "sensor-indicators"
+	AND eventMessage BEGINSWITH "Sorted active attributions"'
+
+toast() {
+	local kind=$1 name=$2
+	case $kind in
+	scr) "$HOME/.claude/bin/wz" notify --for 60 "Screen recording" "$name" ;;
+	mic) "$HOME/.claude/bin/wz" notify --for 60 "Microphone" "$name" ;;
+	cam) "$HOME/.claude/bin/wz" notify --for 60 "Camera" "$name" ;;
+	*) "$HOME/.claude/bin/wz" notify --compact --quiet "Location" "$name" ;;
+	esac >/dev/null 2>&1 &
+}
+
+# a line ends: update: [[scr] AltTab (com.lwouis.alt-tab-macos), [loc] Outlook (com...)]
+watch() {
+	local line items item kind rest id name keys prev=" " shown last=""
+	mkdir -p "${LOG%/*}"
+	/usr/bin/log stream --style compact --predicate "$PREDICATE" | while IFS= read -r line; do
+		case $line in *"update: ["*) ;; *) continue ;; esac
+		items=${line#*update: \[}
+		items=${items%\]}
+		keys=" "
+		shown=""
+		while [ -n "$items" ]; do
+			item=${items%%"), ["*}
+			if [ "$item" = "$items" ]; then
+				items=""
+			else
+				item="$item)"
+				items="[${items#*"), ["}"
+			fi
+			kind=${item:1:3}
+			rest=${item#*"] "}
+			id=${rest##*\(}
+			id=${id%\)}
+			name=${rest% \(*}
+			case $IGNORE in *" $id "*) continue ;; esac
+			keys="$keys$kind:$id "
+			shown="${shown:+$shown, }$kind $name"
+			case $prev in *" $kind:$id "*) ;; *) toast "$kind" "$name" ;; esac
+		done
+		prev=$keys
+		[ "$shown" = "$last" ] && continue
+		last=$shown
+		printf '%s\t%s\n' "${line:0:19}" "$shown" >>"$LOG"
+	done
+}
+
+install() {
+	[ "$(uname)" = Darwin ] || {
+		echo "cc-privacy: macOS only"
+		return 1
+	}
+	cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>Label</key><string>net.jacob.cc-privacy</string>
+ <key>ProgramArguments</key><array>
+  <string>/bin/bash</string><string>$HOME/.claude/bin/cc-privacy</string><string>watch</string>
+ </array>
+ <key>RunAtLoad</key><true/>
+ <key>KeepAlive</key><true/>
+ <key>EnvironmentVariables</key><dict>
+  <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+ </dict>
+ <key>StandardErrorPath</key><string>$HOME/.claude/cache/cc-privacy.err</string>
+</dict></plist>
+EOF
+	launchctl unload "$PLIST" 2>/dev/null
+	launchctl load "$PLIST" && echo "installed $PLIST: toasts from login, history in $LOG"
+}
+
+case ${1:-} in
+watch) watch ;;
+--install) install ;;
+-h | --help) sed -n '2,7s/^# \{0,1\}//p' "$0" ;;
+-n) tail -n "${2:-30}" "$LOG" 2>/dev/null ;;
+"") tail -n 30 "$LOG" 2>/dev/null ;;
+*)
+	echo "usage: cc-privacy [-n N] | watch | --install" >&2
+	exit 2
+	;;
+esac
