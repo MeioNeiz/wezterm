@@ -12,6 +12,8 @@ wezterm.lua and the hooks call the scripts by their `~/.claude/bin` paths.
 | repo | linked as | what |
 |---|---|---|
 | `wezterm.lua` | `~/.wezterm.lua` | the config: tab bar, keys, `pane_status` |
+| `aerospace.toml` | `~/.config/aerospace/` | tiling WM (macOS): ctrl-alt keys, app to workspace |
+| `karabiner/` | `~/.config/karabiner` | Option+Caps = ctrl-alt for AeroSpace; Caps alone untouched |
 | `bin/cc-roster` | `~/.claude/bin/` | who is alive, what state, which pane; names resolve here |
 | `bin/cc-peers`, `cc-fleet` | same | plus titles; grouped and aged, `--brief` |
 | `bin/cc-board`, `cc-colour` | same | the board (LEADER+b); the identity palette |

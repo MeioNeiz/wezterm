@@ -1,0 +1,34 @@
+{
+    "profiles": [
+        {
+            "name": "Default profile",
+            "selected": true,
+            "virtual_hid_keyboard": { "keyboard_type_v2": "ansi" },
+            "complex_modifications": {
+                "rules": [
+                    {
+                        "description": "Option+Caps = ctrl+option (AeroSpace); Caps alone stays Caps Lock",
+                        "manipulators": [
+                            {
+                                "type": "basic",
+                                "from": {
+                                    "key_code": "caps_lock",
+                                    "modifiers": {
+                                        "mandatory": ["option"],
+                                        "optional": ["shift"]
+                                    }
+                                },
+                                "to": [
+                                    {
+                                        "key_code": "left_control",
+                                        "modifiers": ["left_option"]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    ]
+}

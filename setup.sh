@@ -27,6 +27,9 @@ if [ "$(uname)" = Darwin ] && [ -f "$repo/toast/cc-toast.swift" ]; then
 fi
 
 link "$repo/wezterm.lua" "$HOME/.wezterm.lua"
+[ "$(uname)" = Darwin ] && link "$repo/aerospace.toml" "$HOME/.config/aerospace/aerospace.toml"
+# the folder, not the file: Karabiner saves by replacing karabiner.json, which breaks a link
+[ "$(uname)" = Darwin ] && link "$repo/karabiner" "$HOME/.config/karabiner"
 link "$repo/statusline.sh" "$HOME/.claude/statusline.sh"
 link "$repo/skills/fleet" "$HOME/.claude/skills/fleet"
 for f in "$repo"/hooks/*; do

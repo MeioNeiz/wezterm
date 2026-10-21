@@ -1,0 +1,179 @@
+# AeroSpace: tiling window manager. Linked to ~/.config/aerospace/aerospace.toml by setup.sh.
+# Commands: https://nikitabobko.github.io/AeroSpace/commands
+#
+# Every key is ctrl-alt (Control + Option), which Option+Caps also sends (karabiner/).
+# Plain alt is out: on a UK Mac keyboard alt-3 types '#' and alt-2 '€', and AeroSpace
+# would swallow them in every app.
+# One WezTerm window holds every wezterm workspace; AeroSpace only places that window.
+
+config-version = 2
+start-at-login = true
+auto-reload-config = true
+
+# Laptop workspaces (2-5) show one window at a time, full size: tiled, Teams beside Outlook
+# is half a laptop each, and eight in 5 were 190px with Spotify hanging off the edge.
+# The ultrawide (1) tiles
+after-startup-command = [
+    'layout --workspace 2 --root accordion horizontal',
+    'layout --workspace 3 --root accordion horizontal',
+    'layout --workspace 4 --root accordion horizontal',
+    'layout --workspace 5 --root accordion horizontal',
+]
+
+enable-normalization-flatten-containers = true
+enable-normalization-opposite-orientation-for-nested-containers = true
+
+# i3-style, not BSP: four windows in a row are four equal columns on the ultrawide
+default-root-container-layout = 'tiles'
+default-root-container-orientation = 'auto'
+# 0: the default 30 shoves the front window sideways to show a sliver of the next
+accordion-padding = 0
+
+on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
+automatically-unhide-macos-hidden-apps = false
+persistent-workspaces = ['1', '2', '3', '4', '5']
+
+key-mapping.preset = 'qwerty'
+
+# Outer 0: a lone window fills the screen as the Fill zoom does now
+gaps.inner.horizontal = 4
+gaps.inner.vertical = 4
+gaps.outer.left = 0
+gaps.outer.bottom = 0
+gaps.outer.top = 0
+gaps.outer.right = 0
+
+# WezTerm alone on the ultrawide, everything else on the laptop. Patterns are
+# case-insensitive substrings of `aerospace list-monitors`; the first one connected wins,
+# so the laptop alone gets everything
+[workspace-to-monitor-force-assignment]
+1 = ['ultrawide', 'built-in']
+2 = ['built-in']
+3 = ['built-in']
+4 = ['built-in']
+5 = ['built-in']
+
+[mode.main.binding]
+ctrl-alt-left = 'focus left'
+ctrl-alt-down = 'focus down'
+ctrl-alt-up = 'focus up'
+ctrl-alt-right = 'focus right'
+
+ctrl-alt-shift-left = 'move left'
+ctrl-alt-shift-down = 'move down'
+ctrl-alt-shift-up = 'move up'
+ctrl-alt-shift-right = 'move right'
+
+# Fill the screen, not macOS full screen (that one gets its own Space and animates)
+ctrl-alt-enter = 'fullscreen'
+ctrl-alt-f = 'layout floating tiling'
+ctrl-alt-slash = 'layout tiles horizontal vertical'
+ctrl-alt-comma = 'layout accordion horizontal vertical'
+
+ctrl-alt-m = 'move-node-to-monitor --focus-follows-window --wrap-around next'
+ctrl-alt-shift-m = 'move-workspace-to-monitor --wrap-around next'
+
+ctrl-alt-minus = 'resize smart -50'
+ctrl-alt-equal = 'resize smart +50'
+ctrl-alt-0 = 'balance-sizes'
+
+ctrl-alt-tab = 'workspace-back-and-forth'
+ctrl-alt-1 = 'workspace 1'
+ctrl-alt-2 = 'workspace 2'
+ctrl-alt-3 = 'workspace 3'
+ctrl-alt-4 = 'workspace 4'
+ctrl-alt-5 = 'workspace 5'
+ctrl-alt-6 = 'workspace 6'
+ctrl-alt-7 = 'workspace 7'
+ctrl-alt-8 = 'workspace 8'
+ctrl-alt-9 = 'workspace 9'
+
+# Send this window to 1-5 and follow it: the letter under each number, no shift
+ctrl-alt-q = 'move-node-to-workspace --focus-follows-window 1'
+ctrl-alt-w = 'move-node-to-workspace --focus-follows-window 2'
+ctrl-alt-e = 'move-node-to-workspace --focus-follows-window 3'
+ctrl-alt-r = 'move-node-to-workspace --focus-follows-window 4'
+ctrl-alt-t = 'move-node-to-workspace --focus-follows-window 5'
+
+ctrl-alt-shift-1 = 'move-node-to-workspace --focus-follows-window 1'
+ctrl-alt-shift-2 = 'move-node-to-workspace --focus-follows-window 2'
+ctrl-alt-shift-3 = 'move-node-to-workspace --focus-follows-window 3'
+ctrl-alt-shift-4 = 'move-node-to-workspace --focus-follows-window 4'
+ctrl-alt-shift-5 = 'move-node-to-workspace --focus-follows-window 5'
+ctrl-alt-shift-6 = 'move-node-to-workspace --focus-follows-window 6'
+ctrl-alt-shift-7 = 'move-node-to-workspace --focus-follows-window 7'
+ctrl-alt-shift-8 = 'move-node-to-workspace --focus-follows-window 8'
+ctrl-alt-shift-9 = 'move-node-to-workspace --focus-follows-window 9'
+
+ctrl-alt-shift-semicolon = 'mode service'
+
+# Rare fixes: press ctrl-alt-shift-; then one key
+[mode.service.binding]
+esc = ['reload-config', 'mode main']
+r = ['flatten-workspace-tree', 'mode main']
+f = ['layout floating tiling', 'mode main']
+backspace = ['close-all-windows-but-current', 'mode main']
+shift-left = ['join-with left', 'mode main']
+shift-down = ['join-with down', 'mode main']
+shift-up = ['join-with up', 'mode main']
+shift-right = ['join-with right', 'mode main']
+
+# Where apps open: 1 terminal, 2 browsers, 3 Teams and Outlook, 4 notes, 5 music. Runs
+# for each new window and once at startup; moving one by hand afterwards sticks
+[[on-window-detected]]
+if.app-id = 'com.github.wez.wezterm'
+run = 'move-node-to-workspace --focus-follows-window 1'
+
+[[on-window-detected]]
+if.app-id = 'com.google.Chrome'
+run = 'move-node-to-workspace --focus-follows-window 2'
+
+[[on-window-detected]]
+if.app-id = 'com.brave.Browser'
+run = 'move-node-to-workspace --focus-follows-window 2'
+
+[[on-window-detected]]
+if.app-id = 'com.microsoft.teams2'
+run = 'move-node-to-workspace --focus-follows-window 3'
+
+[[on-window-detected]]
+if.app-id = 'com.microsoft.Outlook'
+run = 'move-node-to-workspace --focus-follows-window 3'
+
+[[on-window-detected]]
+if.app-id = 'md.obsidian'
+run = 'move-node-to-workspace --focus-follows-window 4'
+
+[[on-window-detected]]
+if.app-id = 'com.spotify.client'
+run = 'move-node-to-workspace --focus-follows-window 5'
+
+[[on-window-detected]]
+if.app-id = 'com.apple.Music'
+run = 'move-node-to-workspace --focus-follows-window 5'
+
+# Small windows that look wrong stretched to a column
+[[on-window-detected]]
+if.app-id = 'com.apple.systempreferences'
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.nordsec.nordpass'
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.apple.Dictionary'
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.ethanbills.DockDoor'
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.lwouis.alt-tab-macos'
+run = 'layout floating'
+
+# The toast is a bare binary, no bundle id; a panel AeroSpace may skip anyway
+[[on-window-detected]]
+if.app-name-regex-substring = 'cc-toast'
+run = 'layout floating'
