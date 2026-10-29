@@ -124,6 +124,9 @@ a calendar day of the window (`11,23,47,65,90`). **`cache/limits/<acct>-<win>-<r
 - **`fleet/notes.tsv`** cc-note: `sid, at, flags, progress, status`, one line per annotated
   session. Read by the statusLine, cc-fleet and the tab bar. `fleet/todo/<sid>`,
   `fleet/log/<sid>` are read on demand only, never on a timer
+- **`fleet/switch/<sid>`** `to\tuntil epoch (0 none)\tname\tqueued epoch`, a queued
+  `cc-account switch`, its follow-up prompt in `<sid>.then`; written by cc-account, read
+  and removed by its watcher (`.watcher/pid`, a mkdir lock), read by cc-handover --new
 - **`fleet/gathered/<receiver pane>`** `pane\tsid\tname\tepoch` per source of a gather (the
   epoch is the handover's, for ccx's grace on a `shell` source), written by cc-handover,
   read and pruned by ccx (it keeps what it could not close); reaped with the pane by

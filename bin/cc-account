@@ -251,9 +251,10 @@ readonly SEED_PROJECT='hasTrustDialogAccepted allowedTools mcpServers enabledMcp
 readonly CTX_DIR="$HOME/.claude/cache/context"
 # Must match cc-board, cc-fleet, cc-handover
 readonly PROMPT_CACHE_TTL=3600
-# switch waits this long for a turn to end before giving up
-readonly SWITCH_POLL=2
-readonly SWITCH_TRIES=300
+# A queued switch, one file a session id: `to\tuntil epoch (0: none)\tname\tqueued epoch`,
+# its follow-up prompt in <sid>.then. One watcher serves them all (cc-roster is 0.4s)
+readonly SWITCH_DIR="$HOME/.claude/fleet/switch"
+readonly SWITCH_POLL=5
 # The session environment a plain shell would not have; as cc-spawn's CLEAN_ENV
 readonly CLEAN=(-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID
 	-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_MESSAGING_SOCKET
@@ -268,12 +269,18 @@ cc-account - which claude.ai account a session runs on
   cc-account for [dir]       the account a session started in dir gets
   cc-account of <T>          the account a live session is on
   cc-account login <name>    sign that account's folder in (from a shell, not /login)
-  cc-account switch [T] [--to <name>] [--force]
+  cc-account switch [T] [--to <name>] [--force] [--then <prompt>] [--until <time>]
                              carry on that session (default: this one) on the other
                              account: once its turn ends it closes and resumes in its
                              place, whole conversation. The first reply re-reads all of
                              it at full price, so refused when cold unless --force;
-                             cc-handover --new --account is cheaper for a big one
+                             cc-handover --new --account is cheaper for a big one;
+                             --then sends it a prompt once resumed. It waits for a turn
+                             end with only servers left in the background, however long;
+                             dropped, with a toast, at --until (default: the end of the
+                             override lending its folder to that account, if one does)
+  cc-account switch --pending   the switches waiting, and on what
+  cc-account switch [T] --cancel
   cc-account use <name> [dir] --until <HH:MM|+2h|+90m|epoch>
                              lend dir (default: here) to that account until then: new
                              sessions there start on it; running ones stay put (switch)
@@ -434,6 +441,129 @@ cache_cold() {
 	((now > exp))
 }
 
+# The resume that replaces the session's pane, one argument a line
+switch_spawn() {
+	local sid=$1 to=$2 pane=$3 cwd=$4 pid=$5 follow=$6 effort
+	printf '%s\n' cc-spawn --replace "$pane" --resume "$sid" --account "$to" --cwd "$cwd"
+	# effort is per process and a resume starts at the default; a /effort since is lost
+	effort=$(ps -o command= -p "$pid" 2>/dev/null |
+		sed -n 's/.*--effort[ =]\([a-z]*\).*/\1/p')
+	[[ -n $effort ]] && printf '%s\n' --effort "$effort"
+	[[ -n $follow ]] && printf '%s\n' -- "$follow"
+}
+
+switch_toast() {
+	"$HOME/.claude/bin/wz" notify --sticky "$1" "$2" </dev/null >/dev/null 2>&1 &
+}
+
+# Detached and alone: a mkdir lock holding the watcher's pid
+switch_start_watcher() {
+	local lock="$SWITCH_DIR/.watcher" pid=""
+	if [[ -d $lock ]]; then
+		{ IFS= read -r pid <"$lock/pid"; } 2>/dev/null
+		[[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && return 0
+	fi
+	nohup "$HOME/.claude/bin/cc-account" switch --watch </dev/null >/dev/null 2>&1 &
+	disown 2>/dev/null
+}
+
+# Every queued switch, until none is left: a session goes when its turn has ended and
+# nothing of its own runs in the background but servers, which a resume would kill (the
+# resumed session is told what stopped). Waits as long as that takes; a switch is dropped,
+# with a toast, only when its --until (its override's end) passes or the resume fails. A
+# session that has gone (closed, handed over) takes its switch with it
+switch_watch() {
+	local lock="$SWITCH_DIR/.watcher" f sid to until name queued roster row status pane cwd
+	local pid now follow tasks stopped spawn line old
+	mkdir "$lock" 2>/dev/null || {
+		{ IFS= read -r old <"$lock/pid"; } 2>/dev/null
+		[[ -n $old ]] && kill -0 "$old" 2>/dev/null && return 0
+		rm -rf "$lock"
+		mkdir "$lock" 2>/dev/null || return 0
+	}
+	echo $$ >"$lock/pid"
+	# expanded now: the local is gone by the time EXIT fires, and set -u stops the trap
+	# shellcheck disable=SC2064
+	trap "rm -rf '$lock'" EXIT
+	trap '' HUP
+	while :; do
+		set -- "$SWITCH_DIR"/*-*-*-*-*
+		[[ -e $1 ]] || return 0
+		roster=$(cc-roster 2>/dev/null)
+		[[ -n $roster ]] || { sleep "$SWITCH_POLL"; continue; }
+		now=$(date +%s)
+		for f in "$@"; do
+			sid=${f##*/}
+			[[ $sid == *.then ]] && continue
+			IFS=$'\t' read -r to until name queued <"$f" || continue
+			row=$(printf '%s\n' "$roster" | awk -F'\t' -v s="$sid" '$1 == s { print; exit }')
+			if [[ -z $row ]]; then
+				rm -f "$f" "$f.then"
+				continue
+			fi
+			IFS=$'\x1f' read -r _ name status _ pane cwd pid _ <<<"${row//$'\t'/$'\x1f'}"
+			if [[ $until =~ ^[0-9]+$ ]] && ((until && now > until)); then
+				rm -f "$f" "$f.then"
+				switch_toast "Switch to $to dropped: $name" \
+					"Still mid-turn or running a background task at $(hhmm "$until"), so it stays."
+				continue
+			fi
+			acct_of_pid "$pid"
+			[[ $ACCT == "$to" ]] && { rm -f "$f" "$f.then"; continue; }
+			[[ $pane =~ ^[0-9]+$ ]] || continue
+			stopped=""
+			case $status in
+			busy | asking) continue ;;
+			shell)
+				tasks=$("$HOME/.claude/bin/ccx" --tasks "$pid" 2>/dev/null)
+				printf '%s\n' "$tasks" | awk -F'\t' '$2 == "-" { f = 1 } END { exit !f }' &&
+					continue
+				stopped=$(printf '%s\n' "$tasks" | awk -F'\t' 'NF { print "- `" $3 "`" }')
+				;;
+			esac
+			follow=""
+			[[ -r $f.then ]] && follow=$(<"$f.then")
+			if [[ -n $stopped ]]; then
+				follow="${follow:+$follow
+
+}Moving you to $to stopped these background servers of yours; restart any you still need:
+$stopped"
+			fi
+			spawn=()
+			while IFS= read -r line; do spawn+=("$line"); done < <(switch_spawn "$sid" "$to" \
+				"$pane" "$cwd" "$pid" "")
+			[[ -n $follow ]] && spawn+=(-- "$follow")
+			local doomed=""
+			[[ -n $stopped ]] && doomed=$("$HOME/.claude/bin/ccx" --descendants "$pid")
+			rm -f "$f" "$f.then"
+			if "${spawn[@]}" </dev/null >/dev/null 2>&1; then
+				# shellcheck disable=SC2086 # a pid a word
+				[[ -n $doomed ]] && kill $doomed 2>/dev/null
+			else
+				switch_toast "Switch to $to failed: $name" "cc-spawn could not resume it in pane $pane."
+			fi
+		done
+		sleep "$SWITCH_POLL"
+	done
+}
+
+# Each queued switch and what it waits on; starts the watcher if one is needed
+switch_pending() {
+	local f sid to until name queued roster status any=false
+	roster=$(cc-roster 2>/dev/null)
+	for f in "$SWITCH_DIR"/*-*-*-*-*; do
+		[[ -e $f && $f != *.then ]] || continue
+		IFS=$'\t' read -r to until name queued <"$f" || continue
+		sid=${f##*/}
+		status=$(printf '%s\n' "$roster" | awk -F'\t' -v s="$sid" '$1 == s { print $3; exit }')
+		printf '%s | to %s | queued %s | %s%s\n' "$name" "$to" "$(hhmm "$queued")" \
+			"${status:-gone}" "$( ((until)) && echo " | until $(hhmm "$until")")"
+		any=true
+	done
+	$any || { echo "no switches pending"; return 0; }
+	switch_start_watcher
+}
+
 cmd=${1:-}
 (($#)) && shift
 case $cmd in
@@ -578,22 +708,38 @@ login)
 	;;
 switch)
 	need_accounts
-	target="" to="" force=false dry=false
+	target="" to="" force=false dry=false follow="" until="" mode=queue
 	while (($#)); do
 		case $1 in
 		--to) shift; to=${1:-}; [[ -n $to ]] || die "--to needs an account" ;;
+		--then) shift; follow=${1:-} ;;
+		--until) shift; until=${1:-} ;;
 		--force) force=true ;;
 		--dry-run) dry=true ;;
+		--cancel) mode=cancel ;;
+		--pending) mode=pending ;;
+		--watch) mode=watch ;;
 		-*) die "unknown option $1" ;;
 		*) target=$1 ;;
 		esac
 		shift
 	done
+	mkdir -p "$SWITCH_DIR"
+	case $mode in
+	watch) switch_watch; exit 0 ;;
+	pending) switch_pending; exit 0 ;;
+	esac
 	target=${target:-${WEZTERM_PANE:-}}
 	[[ -n $target ]] || die "switch which session? (not in a wezterm pane)"
 	row=$(cc-roster --row "$target") || die "no live session \"$target\""
 	# detail is often empty, and a tab IFS would fold it away
 	IFS=$'\x1f' read -r sid name _ _ pane cwd pid seen _ <<<"${row//$'\t'/$'\x1f'}"
+	if [[ $mode == cancel ]]; then
+		[[ -e $SWITCH_DIR/$sid ]] || die "no switch pending for $name"
+		rm -f "$SWITCH_DIR/$sid" "$SWITCH_DIR/$sid.then"
+		echo "$name stays where it is"
+		exit 0
+	fi
 	[[ $pane =~ ^[0-9]+$ ]] || die "$name has no pane to resume in"
 	acct_of_pid "$pid"
 	from=$ACCT
@@ -609,32 +755,29 @@ switch)
 		die "$name is cold: resuming re-reads its whole context. cc-handover $sid --new \
 --account $to starts fresh with a brief; --force resumes anyway"
 	fi
-	spawn=(cc-spawn --replace "$pane" --resume "$sid" --account "$to" --cwd "$cwd")
-	# effort is per process and a resume starts at the default; a /effort since is lost
-	effort=$(ps -o command= -p "$pid" 2>/dev/null |
-		sed -n 's/.*--effort[ =]\([a-z]*\).*/\1/p')
-	[[ -n $effort ]] && spawn+=(--effort "$effort")
+	if [[ -n $until ]]; then
+		until=$(until_epoch "$until") || die "--until takes HH:MM, +2h, +90m or an epoch"
+	else
+		# for the override that lends its folder to $to, it lasts as long as that does
+		acct_for "$cwd"
+		until=0
+		[[ $ACCT == "$to" && -n $ACCT_UNTIL ]] && until=$ACCT_UNTIL
+	fi
 	if $dry; then
-		printf '%s -> %s: %s\n' "$from" "$to" "${spawn[*]}"
+		printf '%s -> %s: %s\n' "$from" "$to" "$(switch_spawn "$sid" "$to" "$pane" "$cwd" \
+			"$pid" "$follow" | tr '\n' ' ')"
 		exit 0
 	fi
-	# Run detached: from inside the session, this script is the pane's own child, and the
-	# session has a turn to finish before it can close
-	(
-		trap '' HUP
-		for ((i = 0; i < SWITCH_TRIES; i++)); do
-			status=$(cc-roster --row "$sid" 2>/dev/null | cut -f3)
-			[[ -z $status ]] && exit 0
-			case $status in
-			busy | asking | shell) sleep "$SWITCH_POLL" ;;
-			*) break ;;
-			esac
-		done
-		((i < SWITCH_TRIES)) || exit 0
-		"${spawn[@]}"
-	) </dev/null >/dev/null 2>&1 &
-	disown 2>/dev/null
-	echo "$name moves from $from to $to once its turn ends, resumed in place (pane $pane)"
+	printf '%s\t%s\t%s\t%s\n' "$to" "$until" "$name" "$(date +%s)" >"$SWITCH_DIR/$sid"
+	if [[ -n $follow ]]; then
+		printf '%s' "$follow" >"$SWITCH_DIR/$sid.then"
+	else
+		rm -f "$SWITCH_DIR/$sid.then"
+	fi
+	switch_start_watcher
+	printf '%s moves from %s to %s at the end of a turn with %s, resumed in place (pane %s)%s\n' \
+		"$name" "$from" "$to" "nothing but servers left running in its background" "$pane" \
+		"$( ((until)) && echo "; dropped at $(hhmm "$until") if it has not happened")"
 	;;
 -h | --help | help) usage ;;
 *) die "unknown command \"$cmd\" (cc-account --help)" ;;

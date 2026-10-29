@@ -625,6 +625,9 @@ new)
 	# --in: split from a pane elsewhere, so the new session lands in that pane's tab
 	[[ -n $in_pane ]] &&
 		spawn=(cc-spawn --cwd "$cwd" --print-sid --from "$in_pane" "$spawn_where")
+	# A switch queued for the source is where its work was meant to go next
+	sw="$HOME/.claude/fleet/switch/${rows[0]%%$'\t'*}"
+	[[ -z $account && -r $sw ]] && IFS=$'\t' read -r account _ <"$sw"
 	[[ -n $account ]] && spawn+=(--account "$account")
 	# The successor takes the name, so messages addressed to it still land, but only once
 	# the source has closed: a background task finishing can wake the source after the

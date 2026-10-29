@@ -140,9 +140,10 @@ cc-spawn --account personal '...'  # the other claude.ai login (default: the fol
 
 **Two accounts, chosen by folder.** `~/.claude/accounts` maps folders to a claude.ai
 login (cc-account); a session keeps the one it started on and its statusLine names it.
-`cc-account switch [T]` moves a session to the other one once its turn ends, resumed in
-place, whole conversation, first reply at full price (refused cold); `cc-handover --new
---account <name>` when it is big. Never `/login` to change account: it moves every session
+`cc-account switch [T]` moves a session to the other one once its turn ends with nothing
+but servers running in its background, however long that takes; resumed in place, whole
+conversation, first reply at full price (refused cold); `cc-handover --new --account
+<name>` when it is big. `switch --pending` shows what waits, `--cancel` drops one. Never `/login` to change account: it moves every session
 on that login. Signing a folder in is Jacob's: `! cc-account login <name>`.
 `cc-account use <name> [dir] --until 18:00` lends a folder to an account for a while;
 `cc-account limits` shows usage against the caps in `~/.claude/account-limits`, which a hook

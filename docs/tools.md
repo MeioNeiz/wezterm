@@ -344,14 +344,26 @@ for the default. The account is fixed when a session starts:
 - `cc-account login <name>` signs a folder in from a plain shell (`! cc-account login
   personal`); `cc-account status` says who is signed in where
 
-**Moving a running session**: `cc-account switch [T] [--to <name>]` waits for its turn to
-end, then `cc-spawn --replace <pane> --resume <sid>`: a pane split from the old one whose
+**Moving a running session**: `cc-account switch [T] [--to <name>]` queues it in
+`fleet/switch/<sid>`, and once its turn has ended with nothing but servers left in its
+background, `cc-spawn --replace <pane> --resume <sid>`: a pane split from the old one whose
 command waits for the old claude to exit, the old pane killed, the conversation resumed in
 place under the other login with the same session id (and its `--effort`; the name is
-re-derived). Run from inside the session it detaches first, since killing the pane kills
-its own parent. Another account means no prompt cache, so the first reply re-reads the
-whole context; refused when cold, as every resume is, unless `--force`. For a big session
-`cc-handover --new --account <name>` is cheaper.
+re-derived). Another account means no prompt cache, so the first reply re-reads the whole
+context; refused when cold, as every resume is, unless `--force`. For a big session
+`cc-handover --new --account <name>` is cheaper, and a handover of a session with a switch
+queued starts the successor on that account.
+
+It waits as long as that takes. It used to give up silently after 10 min, and on
+2026-10-29 every one of ten meiolol switches did: team sessions stay busy, or sit in
+`shell` on a build, for longer. A resume kills the session's background tasks, so a test
+or push in flight is waited out; servers are not, and the resumed session is told which
+it lost (`--then` prompts arrive the same way). One detached watcher (`switch --watch`,
+a mkdir lock) polls cc-roster every 5s for all of them, since a waiter each cost 0.4s
+apiece every 2s. A switch is dropped, with a sticky toast, only at its `--until`, by
+default the end of the override lending the session's folder to that account; a failed
+resume toasts too; a session that has gone takes its switch with it. `switch --pending`
+lists them (and restarts the watcher after a reboot), `switch <T> --cancel` drops one.
 
 **Lending a folder for a while**: `cc-account use work ~/personal/meiolol --until 18:00`
 (or `+2h`) writes `~/.claude/account-overrides`; `acct_for` prefers a live override to the
