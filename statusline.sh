@@ -17,13 +17,6 @@
 # than that, is cached per session. Transcripts reach 13MB.
 
 readonly CACHE_DIR="$HOME/.claude/cache/statusline"
-# The pane's identity colour, and the one place it can appear inside the pane itself:
-# wezterm has no per-pane colour of any kind, so this line is it. Sourced rather than
-# run, since the statusLine is on the critical path of every turn.
-# shellcheck source=/dev/null
-source "$HOME/.claude/bin/cc-colour" --lib
-# shellcheck source=/dev/null
-source "$HOME/.claude/bin/cc-account" --lib
 readonly BLUE=$'\033[38;2;137;180;250m'
 readonly MAUVE=$'\033[38;2;203;166;247m'
 readonly YELLOW=$'\033[38;2;249;226;175m'
@@ -36,19 +29,82 @@ readonly MAX_TITLE=64
 readonly MAX_NOTE=52
 readonly NOTES="$HOME/.claude/fleet/notes.tsv"
 readonly CTX_DIR="$HOME/.claude/cache/context"
-# Rate limits are per account: this session's from CLAUDE_CONFIG_DIR, which Claude passes on
-acct_load
-acct_current
-account=$ACCT
-acct_suffix "$account"
-readonly RATE_FILE="$HOME/.claude/cache/rate-limits$ACCT_SUFFIX"
 readonly RATE_EVERY=5
 # cc-peers' title memo, `mtime\x1fchecked_at\x1ftitle`; "sl" in the mtime slot says the
 # title came from here, which cc-peers trusts without looking at the transcript
 readonly TITLE_MEMO="$HOME/.claude/cache/titles"
+readonly SEP="  ·  "
+readonly LINE_TTL=30
 
 # ${#title} below must count characters, not bytes
 export LC_CTYPE=${LC_CTYPE:-en_GB.UTF-8}
+
+left_width() {
+	lw=0
+	local i n=0
+	for i in "${!seg[@]}"; do
+		[[ -n ${seg[i]} ]] || continue
+		((lw += seg_w[i] + (n ? ${#SEP} : 0), n++))
+	done
+}
+fits() {
+	left_width
+	((lw + gap + right_w <= width))
+}
+# $1 the fewest characters it keeps, cut from the whole title; reads lw from the fits before
+cut_title() {
+	local room=$((width - right_w - gap - (lw - seg_w[0])))
+	((room < $1)) && room=$1
+	seg[0]="${title_colour}${title}${RESET}"
+	seg_w[0]=${#title}
+	((${#title} > room)) || return 0
+	seg[0]="${title_colour}${title:0:$((room - 1))}…${RESET}"
+	seg_w[0]=$room
+}
+
+draw() {
+	# The right side outranks everything on the left, which gives way first in full: the
+	# metadata, the title down to 8, the notes and badge, then the title itself. Room the
+	# notes leave goes back to the title.
+	# COLUMNS is the pane's width; Claude indents the line 2 and cuts it 2 short of the edge
+	gap=2
+	fitted=false
+	if [[ $COLUMNS =~ ^[0-9]+$ ]] && ((COLUMNS > 20)) && [[ -n $right ]]; then
+		fitted=true
+		width=$((COLUMNS - 4))
+		for i in $drops; do
+			fits && break
+			seg[i]=""
+		done
+		fits || cut_title 8
+		for ((i = ${#seg[@]} - 1; i > 0; i--)); do
+			fits && break
+			seg[i]=""
+		done
+		fits
+		cut_title 4
+		fits || seg[0]=""
+		left_width
+		((lw)) || gap=0
+		((lw + gap + right_w < width)) && gap=$((width - lw - right_w))
+	fi
+
+	out=""
+	for i in "${!seg[@]}"; do
+		[[ -n ${seg[i]} ]] || continue
+		[[ -n $out ]] && out+="${meta}${SEP}${RESET}"
+		out+=${seg[i]}
+	done
+	if [[ -n $right ]]; then
+		if $fitted; then
+			printf -v pad '%*s' "$gap" ''
+			out+="${pad}${right}"
+		else
+			out+="${meta}${SEP}${RESET}${right}"
+		fi
+	fi
+	printf '%s' "$out"
+}
 
 payload=$(cat)
 
@@ -81,6 +137,52 @@ IFS=$'\x1f' read -r transcript session dir title ctx_used ctx_size model effort 
 		| map(tostring | gsub("\\s+"; " ")) | join("\u001f")
 	' 2>/dev/null
 )
+
+# refreshInterval re-renders an idle pane every 2s with the same payload, only to refit the
+# line to a pane that may have been resized. So the pieces come from the last full render,
+# which runs again when the payload or the notes change, or once LINE_TTL old
+line_cache="$CACHE_DIR/$session.line"
+key="$transcript $dir $title $ctx_used $ctx_size $model $effort $fast $pc_expires $pc_ttl"
+key+=" $pc_recache $pc_hit $rl_5h $rl_5h_at $rl_7d $rl_7d_at $rl_spend"
+# Strictly newer than the notes: -nt counts whole seconds, and a note can land in the second
+# a full render wrote the cache
+if [[ -n $session && -r $line_cache && $line_cache -nt $NOTES ]]; then
+	seg=() seg_w=()
+	{
+		IFS= read -r c_key
+		IFS= read -r c_at
+		IFS= read -r c_right_w
+		IFS= read -r c_drops
+		IFS= read -r c_meta
+		IFS= read -r c_right
+		IFS= read -r c_title
+		IFS= read -r c_title_colour
+		while IFS=$'\x1f' read -r w text; do
+			seg+=("$text")
+			seg_w+=("$w")
+		done
+	} <"$line_cache"
+	if [[ $c_key == "$key" && $c_at =~ ^[0-9]+$ ]] && ((${now:-0} - c_at < LINE_TTL)); then
+		right_w=$c_right_w drops=$c_drops meta=$c_meta right=$c_right title=$c_title
+		title_colour=$c_title_colour
+		draw
+		exit 0
+	fi
+fi
+
+# The pane's identity colour, and the one place it can appear inside the pane itself:
+# wezterm has no per-pane colour of any kind, so this line is it. Sourced rather than
+# run, since the statusLine is on the critical path of every turn.
+# shellcheck source=/dev/null
+source "$HOME/.claude/bin/cc-colour" --lib
+# shellcheck source=/dev/null
+source "$HOME/.claude/bin/cc-account" --lib
+# Rate limits are per account: this session's from CLAUDE_CONFIG_DIR, which Claude passes on
+acct_load
+acct_current
+account=$ACCT
+acct_suffix "$account"
+readonly RATE_FILE="$HOME/.claude/cache/rate-limits$ACCT_SUFFIX"
 
 # Claude's own session_name: /rename, else its title. Kept before the fallbacks below
 sname=$title
@@ -248,17 +350,27 @@ fi
 # on failure, since a pane's own line must never break over a cache it writes for others.
 # The last four fields are the rate limits this session reported last time, for the block
 # below to tell a new response from a re-render.
+# Written only when a field besides the epoch moved: refreshInterval re-renders an idle pane
+# every few seconds, and the epoch is cache_cold_at's last resort for when it went quiet.
 rl_fresh=0
+ctx_changed=0
 if [[ -n $session && $ctx_used =~ ^[0-9]+$ ]]; then
 	[[ -d $CTX_DIR ]] || mkdir -p "$CTX_DIR" 2>/dev/null
-	s5=- s5_at=- s7=- s7_at=-
-	[[ -r $CTX_DIR/$session ]] &&
-		IFS=$'\t' read -r _ _ _ _ _ _ _ s5 s5_at s7 s7_at <"$CTX_DIR/$session"
+	o_rec="" s5=- s5_at=- s7=- s7_at=-
+	if [[ -r $CTX_DIR/$session ]]; then
+		IFS=$'\t' read -r o1 o2 _ o4 o5 o6 o7 s5 s5_at s7 s7_at <"$CTX_DIR/$session"
+		o_rec="$o1 $o2 $o4 $o5 $o6 $o7 $s5 $s5_at $s7 $s7_at"
+	fi
 	[[ $rl_5h\ $rl_5h_at\ $rl_7d\ $rl_7d_at != "$s5 $s5_at $s7 $s7_at" ]] && rl_fresh=1
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ctx_used" "${ctx_size:-0}" \
-		"${now:-0}" "${pc_expires:--}" "${pc_ttl:--}" "${pc_recache:--}" "${pc_hit:--}" \
-		"${rl_5h:--}" "${rl_5h_at:--}" "${rl_7d:--}" "${rl_7d_at:--}" \
-		>"$CTX_DIR/$session" 2>/dev/null
+	n_rec="$ctx_used ${ctx_size:-0} ${pc_expires:--} ${pc_ttl:--} ${pc_recache:--} ${pc_hit:--}"
+	n_rec+=" ${rl_5h:--} ${rl_5h_at:--} ${rl_7d:--} ${rl_7d_at:--}"
+	if [[ $n_rec != "$o_rec" ]]; then
+		ctx_changed=1
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ctx_used" "${ctx_size:-0}" \
+			"${now:-0}" "${pc_expires:--}" "${pc_ttl:--}" "${pc_recache:--}" "${pc_hit:--}" \
+			"${rl_5h:--}" "${rl_5h_at:--}" "${rl_7d:--}" "${rl_7d_at:--}" \
+			>"$CTX_DIR/$session" 2>/dev/null
+	fi
 fi
 
 # The title the transcript scan in cc-peers would find, handed over once per change: a
@@ -278,11 +390,12 @@ fi
 # re-render repeats the last response's. So a session writes only figures that changed since
 # its own last render, a new response, and otherwise at most every RATE_EVERY seconds keeps
 # the file alive while it agrees with it. Never "later reset wins": another account's window
-# can reset later and would stick until it did.
+# can reset later and would stick until it did. A timer render that changed nothing keeps
+# nothing alive, so the right status still ages out an idle machine's figures.
 if [[ $rl_5h != "-" || $rl_7d != "-" ]] && [[ -n $rl_5h ]]; then
 	rl_last=0 f5=- f5_at=- f7=- f7_at=-
 	[[ -r $RATE_FILE ]] && IFS=$'\t' read -r rl_last f5 f5_at f7 f7_at _ <"$RATE_FILE"
-	if ((rl_fresh)) || { ((${now:-0} - ${rl_last:-0} >= RATE_EVERY)) &&
+	if ((rl_fresh)) || { ((ctx_changed && ${now:-0} - ${rl_last:-0} >= RATE_EVERY)) &&
 		[[ $rl_5h\ $rl_5h_at\ $rl_7d\ $rl_7d_at == "$f5 $f5_at $f7 $f7_at" ]]; }; then
 		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${now:-0}" "$rl_5h" "${rl_5h_at:--}" "$rl_7d" \
 			"${rl_7d_at:--}" "${rl_spend:--}" >"$RATE_FILE.$$" 2>/dev/null &&
@@ -301,8 +414,7 @@ if [[ -n $session ]]; then
 fi
 
 # The title is the pane's identity colour rather than a fixed blue. It is the first thing
-# on the line and much the longest, so it is the one part that is always on screen however
-# long the rest gets - which the trailing @name is not.
+# on the line and much the longest, so the fit below shortens it last.
 id_colour "$session"
 # The whole line, not only the title: the metadata was grey, and grey carries nothing
 # that the identity colour would be displacing. Muted rather than full strength, at the
@@ -310,19 +422,59 @@ id_colour "$session"
 # competing fields. The context percentage is the exception - its yellow and red are a
 # warning and outrank identity.
 meta=${IDC_MUTED:-$DIM}
-out="${IDC_ANSI:-$BLUE}${title}${RESET}"
-# Straight after the title, because the far end of the line is where a narrow pane
-# truncates and a note the session left for itself outranks the branch it is on.
-[[ -n $note_progress ]] && out+="${meta}  ·  ${RESET}${YELLOW}${note_progress}${RESET}"
-[[ -n $note_status ]] && out+="${meta}  ·  ${RESET}${YELLOW}▸ ${note_status}${RESET}"
-[[ -n $label ]] && out+="${meta}  ·  ${label}${RESET}"
-if $acct_odd; then
-	out+="${meta}  ·  ${RESET}${acct_bg} ${acct_tag} ${RESET}"
-elif [[ -n $acct_tag ]]; then
-	out+="${meta}  ·  ${acct_tag}${RESET}"
+# Each segment as drawn and as wide as it draws. Notes straight after the title: a note
+# the session left for itself outranks the branch it is on
+seg=() seg_w=()
+add_seg() {
+	seg+=("$1")
+	seg_w+=("$2")
+}
+add_seg "${IDC_ANSI:-$BLUE}${title}${RESET}" "${#title}"
+[[ -n $note_progress ]] && add_seg "${YELLOW}${note_progress}${RESET}" "${#note_progress}"
+[[ -n $note_status ]] && add_seg "${YELLOW}▸ ${note_status}${RESET}" $((${#note_status} + 2))
+i_label="" i_acct="" i_branch="" i_engine=""
+if [[ -n $label ]]; then
+	i_label=${#seg[@]}
+	add_seg "${meta}${label}${RESET}" "${#label}"
 fi
-[[ -n $branch ]] && out+="${meta}  ·  ${branch}${RESET}"
-[[ -n $context ]] && out+="${meta}  ·  ${RESET}${context_colour:-$meta}${context}${RESET}"
-[[ -n $engine ]] && out+="${meta}  ·  ${engine}${RESET}"
-[[ -n $peer ]] && out+="${meta}  ·  ${RESET}${IDC_ANSI:-$MAUVE}@${peer}${RESET}"
-printf '%s' "$out"
+if $acct_odd; then
+	add_seg "${acct_bg} ${acct_tag} ${RESET}" $((${#acct_tag} + 2))
+elif [[ -n $acct_tag ]]; then
+	i_acct=${#seg[@]}
+	add_seg "${meta}${acct_tag}${RESET}" "${#acct_tag}"
+fi
+if [[ -n $branch ]]; then
+	i_branch=${#seg[@]}
+	add_seg "${meta}${branch}${RESET}" "${#branch}"
+fi
+if [[ -n $engine ]]; then
+	i_engine=${#seg[@]}
+	add_seg "${meta}${engine}${RESET}" "${#engine}"
+fi
+
+# Context and @name sit flush right, the pane's bottom-right corner: the nearest Claude
+# lets anything else draw to its own mode line, the row below
+right="" right_w=0
+if [[ -n $context ]]; then
+	right="${context_colour:-$meta}${context}${RESET}"
+	right_w=${#context}
+fi
+if [[ -n $peer ]]; then
+	[[ -n $right ]] && right+="${meta}${SEP}${RESET}" && ((right_w += ${#SEP}))
+	right+="${IDC_ANSI:-$MAUVE}@${peer}${RESET}"
+	((right_w += ${#peer} + 1))
+fi
+title_colour=${IDC_ANSI:-$BLUE}
+drops="$i_engine $i_branch $i_label $i_acct"
+
+if [[ -n $session ]]; then
+	[[ -d $CACHE_DIR ]] || mkdir -p "$CACHE_DIR" 2>/dev/null
+	{
+		printf '%s\n' "$key" "${now:-0}" "$right_w" "$drops" "$meta" "$right" "$title" \
+			"$title_colour"
+		for i in "${!seg[@]}"; do
+			printf '%s\x1f%s\n' "${seg_w[i]}" "${seg[i]}"
+		done
+	} >"$line_cache" 2>/dev/null
+fi
+draw

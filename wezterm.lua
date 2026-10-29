@@ -628,8 +628,10 @@ wezterm.on("gui-startup", function()
 	end
 end)
 
--- reload starts a new timer chain without stopping the old; GLOBAL generation stops it
-wezterm.GLOBAL.save_generation = (wezterm.GLOBAL.save_generation or 0) + 1
+-- Started by fast_tick_start, never at load: a reload evaluates the config twice and a
+-- chain started at load could belong to the copy that gets no timers, so saving stopped
+-- at the first reload and a crash restored a week-old layout. A new chain bumps GLOBAL
+-- generation, which ends the old one
 local function periodic_save_all(generation)
 	wezterm.time.call_after(save_interval_seconds, function()
 		if wezterm.GLOBAL.save_generation ~= generation then
@@ -642,7 +644,6 @@ local function periodic_save_all(generation)
 		periodic_save_all(generation)
 	end)
 end
-periodic_save_all(wezterm.GLOBAL.save_generation)
 
 -- ============================================================
 -- Multiplexing keybindings (leader = CTRL-Space, tmux-style)
@@ -1036,6 +1037,46 @@ local ACTION_DIR = "/.claude/fleet/actions.d"
 -- way to see what LEADER+t would do. publish_pick: the same, kept fresh while toasts are up
 local late = {}
 
+-- cc-spawn's new tab (the one holding pane new_id) moved to just right of anchor_id's.
+-- Only a workspace on screen has a GUI window to run MoveTab in, so false means "not
+-- yet": drain_actions retries it until that workspace is shown, or a pane has gone
+late.tab_beside = function(new_id, anchor_id)
+	for _, w in ipairs(wezterm.mux.all_windows()) do
+		local new_tab, new_idx, anchor_idx
+		for idx, t in ipairs(w:tabs()) do
+			for _, p in ipairs(t:panes()) do
+				if p:pane_id() == new_id then
+					new_tab, new_idx = t, idx
+				elseif p:pane_id() == anchor_id then
+					anchor_idx = idx
+				end
+			end
+		end
+		if new_tab and anchor_idx then
+			if new_idx == anchor_idx + 1 then
+				return true
+			end
+			-- w:gui_window() raises for a window off screen
+			for _, g in ipairs(wezterm.gui.gui_windows()) do
+				if g:window_id() == w:window_id() then
+					-- MoveTab moves the active tab, to a 0-based index; what was active
+					-- before is put back, as spawn already focused the new tab if it was to
+					local was = g:active_tab()
+					new_tab:activate()
+					local to = new_idx > anchor_idx and anchor_idx or anchor_idx - 1
+					g:perform_action(act.MoveTab(to), new_tab:active_pane())
+					if was then
+						was:activate()
+					end
+					return true
+				end
+			end
+			return false
+		end
+	end
+	return true
+end
+
 local function perform_action_line(window, pane, verb, a, b)
 	if verb == "workspace" and a and a ~= "" then
 		window:perform_action(act.SwitchToWorkspace({ name = a }), pane)
@@ -1064,6 +1105,10 @@ local function perform_action_line(window, pane, verb, a, b)
 		if late.jump then
 			late.jump(window, pane, tonumber(a))
 		end
+	elseif verb == "tabbeside" and tonumber(a) and tonumber(b) then
+		if not late.tab_beside(tonumber(a), tonumber(b)) then
+			wezterm.GLOBAL.tab_beside = (wezterm.GLOBAL.tab_beside or "") .. a .. ":" .. b .. ";"
+		end
 	elseif verb == "pick" then
 		if late.pick then
 			late.pick(pane)
@@ -1091,6 +1136,17 @@ local function run_claimed(window, pane, claimed)
 end
 
 local function drain_actions(window, pane)
+	local pending = wezterm.GLOBAL.tab_beside
+	if pending and pending ~= "" then
+		local left = ""
+		for n, anchor in pending:gmatch("(%d+):(%d+);") do
+			local ok, done = pcall(late.tab_beside, tonumber(n), tonumber(anchor))
+			if ok and not done then
+				left = left .. n .. ":" .. anchor .. ";"
+			end
+		end
+		wezterm.GLOBAL.tab_beside = left
+	end
 	local taken = ".taken." .. tostring(window:window_id())
 	local ok, entries = pcall(wezterm.read_dir, wezterm.home_dir .. ACTION_DIR)
 	if ok and type(entries) == "table" and #entries > 0 then
@@ -1829,6 +1885,8 @@ fast_tick_start = function()
 	fast_started = true
 	wezterm.GLOBAL.fast_owner = fast_owner
 	wezterm.time.call_after(FAST_TICK, fast_tick)
+	wezterm.GLOBAL.save_generation = (wezterm.GLOBAL.save_generation or 0) + 1
+	periodic_save_all(wezterm.GLOBAL.save_generation)
 end
 
 ---@return boolean true when the pane has a finished turn you have not looked at

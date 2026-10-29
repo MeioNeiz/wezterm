@@ -155,8 +155,8 @@ move a personal session to work.
 
 **Claude panes go side by side, not stacked.** A session reads down: its output, diffs
 and scrollback want height. So split `--right` (the default), never `--bottom`. cc-spawn
-decides the width itself: a split that would leave under a third of the tab's width opens
-a new tab instead and says so on stderr, which in practice means two across. Don't pick
+decides the width itself: a split that would leave a pane under 90 columns opens a new tab
+instead and says so on stderr: four across on the big monitor, two on the laptop. Don't pick
 `--tab` or `--bottom` to second-guess it, and leave `--squeeze` (split anyway) to Jacob.
 A `--shell` pane watching a log is the exception.
 

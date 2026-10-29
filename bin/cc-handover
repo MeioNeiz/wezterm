@@ -69,6 +69,8 @@ cc-handover - hand a session's work to a fresh one
   --turns N     how many substantive replies to carry (default 3)
   --why <text>  a line saying why the work moved
   --account <name>  the account --new or --fork runs on (default: the folder's; cc-account)
+  --workspace <name>  with --window: where it opens (default: the pane it is from;
+                    never "default")
 
 T is a session name, a session id, a pane id, "." for this session, or ".tab" for every
 other live session on this pane's tab.
@@ -111,6 +113,7 @@ turns=3
 why=""
 dry=false
 account=""
+workspace=""
 while (($#)); do
 	case $1 in
 	--new) action=new ;;
@@ -127,6 +130,8 @@ while (($#)); do
 	--turns) shift; turns=${1:-3} ;;
 	--why) shift; why=${1:-} ;;
 	--account) shift; account=${1:-}; [[ -n $account ]] || die "--account needs a name" ;;
+	--workspace) shift; workspace=${1:-}
+		[[ -n $workspace ]] || die "--workspace needs a name" ;;
 	-h | --help) usage; exit 0 ;;
 	-*) die "unknown option $1" ;;
 	*) targets+=("$1") ;;
@@ -457,14 +462,16 @@ if [[ $action == fork ]]; then
 	[[ $CACHE_WARM == warm ]] ||
 		die "--fork: $fname's prompt cache is ${CACHE_WARM:-of unknown warmth}${CACHE_COST:+ \
 ($CACHE_COST to re-read)}; use --new for a fresh session with a brief"
-	[[ $fpane != "-" || $split == window ]] ||
-		die "$fname has no pane to split from; use --window"
+	# No pane of its own: split from --in's, or this one's (cc-spawn's default)
+	[[ $fpane != "-" || -n $in_pane || -n ${WEZTERM_PANE:-} || $split == window ]] ||
+		die "$fname has no pane to split from; use --in <pane> or --window"
 	spawn_where=$split
 	case $split in tab | window) spawn_where="--$split" ;; esac
 	spawn=(cc-spawn --cwd "${fcwd:-$PWD}" --fork "$fsid" --print-sid "$spawn_where")
 	[[ $fpane != "-" ]] && spawn+=(--from "$fpane")
 	[[ -n $in_pane ]] && spawn+=(--from "$in_pane")
 	[[ -n $account ]] && spawn+=(--account "$account")
+	[[ -n $workspace ]] && spawn+=(--workspace "$workspace")
 	$dry && spawn+=(--dry-run)
 	out=$("${spawn[@]}") || exit 1
 	$dry && { printf '%s\n' "$out"; exit 0; }
@@ -613,8 +620,9 @@ to)
 	fi
 	;;
 new)
-	[[ $pane != "-" || $split == window ]] ||
-		die "$name has no pane to split from; use --window"
+	# No pane of its own: split from --in's, or this one's (cc-spawn's default)
+	[[ $pane != "-" || -n $in_pane || -n ${WEZTERM_PANE:-} || $split == window ]] ||
+		die "$name has no pane to split from; use --in <pane> or --window"
 	# cc-spawn clears the inherited Claude environment. It must get --tab, not tab: its
 	# parser takes the first bare word as the start of the prompt.
 	spawn_where=$split
@@ -625,10 +633,16 @@ new)
 	# --in: split from a pane elsewhere, so the new session lands in that pane's tab
 	[[ -n $in_pane ]] &&
 		spawn=(cc-spawn --cwd "$cwd" --print-sid --from "$in_pane" "$spawn_where")
+	# Beside the source: it closes once it has stopped and the new pane takes its width
+	# back, so cc-spawn's narrow-split rule would only scatter handovers over new tabs
+	case $split in
+	--right | --left) [[ -z $in_pane && $pane != "-" ]] && spawn+=(--squeeze) ;;
+	esac
 	# A switch queued for the source is where its work was meant to go next
 	sw="$HOME/.claude/fleet/switch/${rows[0]%%$'\t'*}"
 	[[ -z $account && -r $sw ]] && IFS=$'\t' read -r account _ <"$sw"
 	[[ -n $account ]] && spawn+=(--account "$account")
+	[[ -n $workspace ]] && spawn+=(--workspace "$workspace")
 	# The successor takes the name, so messages addressed to it still land, but only once
 	# the source has closed: a background task finishing can wake the source after the
 	# handover, and two live sessions sharing a name take each other's messages. Until

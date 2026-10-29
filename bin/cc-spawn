@@ -17,6 +17,8 @@ readonly CLEAN_ENV=(env
 	-u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_EXECPATH
 	-u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT
 	TERM_PROGRAM=kitty FORCE_HYPERLINK=1)
+# Narrowest a Claude pane split beside another may be; wz's REFLOW_MIN is the same number
+readonly MIN_COLS=90
 
 usage() {
 	cat <<'USAGE'
@@ -28,10 +30,11 @@ cc-spawn - start a Claude session in a new pane, with a task
   --cwd <dir>        where it runs (default: this pane's directory)
   --from <target>    the pane to split from (default: this one)
   --right | --left | --top | --bottom     split (default: right). A Claude split
-                     --right or --left that would leave under a third of the tab's width
-                     opens a new tab instead: two across fits, three is too narrow
+                     --right or --left that would leave a pane under 90 columns opens a
+                     new tab instead: four across on the big monitor, two on the laptop
   --squeeze          split anyway
-  --tab | --window   a new tab in the same window, or a new window
+  --tab | --window   a new tab right of this one, or a new window in this pane's
+                     workspace (outside wezterm: --workspace, never "default")
   --workspace <name> a new tab in that workspace's window; a new window only when the
                      workspace has none, so it is made if it does not exist
   --shell            a plain shell rather than Claude, for a pane to watch things in
@@ -176,18 +179,15 @@ if [[ -z $cwd ]]; then
 fi
 [[ -d $cwd ]] || die "no such directory: $cwd"
 
-# A split halves the pane. The tab's width is the window's on whichever screen it is on,
-# so a third of it is the floor there; in practice that is two Claude panes across.
+# A split halves the pane, less a column for the divider. A floor in columns, not a share
+# of the tab: the big monitor (429) fits four across, the laptop (211) two.
 # Not for --replace: its split is closed again at once
 if $split_x && [[ -n $listing ]]; then
-	cols="" tabw=""
-	read -r cols tabw < <(jq -r --arg p "$pane" '
-		(.[] | select(.pane_id == ($p | tonumber))) as $me
-		| [.[] | select(.tab_id == $me.tab_id) | .left_col + .size.cols] | max
-		| "\($me.size.cols) \(.)"' <<<"$listing" 2>/dev/null)
-	if [[ $cols =~ ^[0-9]+$ && $tabw =~ ^[0-9]+$ ]] && ((cols / 2 * 3 < tabw)); then
-		echo "cc-spawn: a split of pane $pane ($cols of $tabw columns) would leave under" \
-			"a third of the tab; a new tab instead (--squeeze splits anyway)" >&2
+	cols=$(jq -r --arg p "$pane" '.[] | select(.pane_id == ($p | tonumber)) | .size.cols' \
+		<<<"$listing" 2>/dev/null)
+	if [[ $cols =~ ^[0-9]+$ ]] && (((cols - 1) / 2 < MIN_COLS)); then
+		echo "cc-spawn: a split of pane $pane ($cols columns) would leave under $MIN_COLS" \
+			"each; a new tab instead (--squeeze splits anyway)" >&2
 		where="tab"
 	fi
 fi
@@ -238,7 +238,8 @@ perm=" --dangerously-skip-permissions"
 $ask && perm=" --permission-mode default"
 
 if $shell; then
-	cmd=("$SHELL")
+	# cleaned too: wezterm hands the pane our env, and a claude typed there would inherit it
+	cmd=("${CLEAN_ENV[@]}" "$SHELL")
 else
 	# built in pieces: an empty array expansion is unbound under bash 3.2 and set -u
 	# env takes no option after an assignment, so the unset goes in front of CLEAN_ENV's
@@ -274,6 +275,14 @@ if [[ $where != window ]]; then
 	[[ -n $pane ]] ||
 		die "no pane to split from (run this inside wezterm, or pass --from, or --window)"
 fi
+# wezterm puts a new window without one in "default", a workspace Jacob does not use
+window_ws=$workspace
+if [[ $where == window && -z $window_ws && -n $pane ]]; then
+	window_ws=$(wzcli list --format json 2>/dev/null | jq -r --arg p "$pane" \
+		'.[] | select(.pane_id == ($p | tonumber)) | .workspace // empty' 2>/dev/null)
+fi
+[[ $where != window || -n $window_ws ]] ||
+	die "--window needs a workspace: pass --workspace <name>, or --from a pane in it"
 
 # --replace: the new pane waits for the old claude to exit, or the two would share a
 # transcript for a moment. The pane is killed below, once the new one exists
@@ -298,7 +307,7 @@ if [[ -n $workspace ]]; then
 fi
 
 if $dry; then
-	printf 'would spawn %s%s in %s%s\n' "$where" "${workspace:+ in workspace $workspace}" "$cwd" "${replace:+, closing pane $pane}"
+	printf 'would spawn %s%s in %s%s\n' "$where" "${window_ws:+ in workspace $window_ws}" "$cwd" "${replace:+, closing pane $pane}"
 	if $shell; then
 		printf '  %s\n' "$SHELL"
 	else
@@ -319,12 +328,21 @@ fi
 
 case $where in
 tab) new=$(wzcli spawn "${tab_at[@]}" --cwd "$cwd" -- "${cmd[@]}") ;;
-window) new=$(wzcli spawn --new-window ${workspace:+--workspace "$workspace"} --cwd "$cwd" \
+window) new=$(wzcli spawn --new-window --workspace "$window_ws" --cwd "$cwd" \
 	-- "${cmd[@]}") ;;
 *) new=$(wzcli split-pane --pane-id "$pane" "$where" --cwd "$cwd" -- "${cmd[@]}") ;;
 esac
 
 [[ -n $new ]] || die "wezterm would not open a pane"
+# wezterm appends a tab after the window's last and the CLI cannot move one, so the GUI
+# does it through the action queue (wz's format): beside the tab it was opened from
+if [[ $where == tab && ${tab_at[0]} == --pane-id && $new =~ ^[0-9]+$ ]]; then
+	actions="$HOME/.claude/fleet/actions.d"
+	mkdir -p "$actions" 2>/dev/null
+	tmp="${actions%/*}/.action.$$.$RANDOM"
+	printf 'tabbeside\t%s\t%s\n' "$new" "$pane" >"$tmp" &&
+		mv -f "$tmp" "$actions/$(date +%s)-$$-$RANDOM" || rm -f "$tmp"
+fi
 if $print_sid && [[ -n $sid ]]; then
 	printf '%s\t%s\n' "$new" "$sid"
 else

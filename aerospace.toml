@@ -29,7 +29,6 @@ default-root-container-orientation = 'auto'
 # 0: the default 30 shoves the front window sideways to show a sliver of the next
 accordion-padding = 0
 
-on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
 automatically-unhide-macos-hidden-apps = false
 persistent-workspaces = ['1', '2', '3', '4', '5']
 
@@ -70,40 +69,90 @@ ctrl-alt-f = 'layout floating tiling'
 ctrl-alt-slash = 'layout tiles horizontal vertical'
 ctrl-alt-comma = 'layout accordion horizontal vertical'
 
-ctrl-alt-m = 'move-node-to-monitor --focus-follows-window --wrap-around next'
-ctrl-alt-shift-m = 'move-workspace-to-monitor --wrap-around next'
+# The mouse follows focus to the other screen on these keys only. As a callback on every
+# monitor change it also jumped whenever a new window opened over there
+ctrl-alt-m = [
+    'move-node-to-monitor --focus-follows-window --wrap-around next',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-m = [
+    'move-workspace-to-monitor --wrap-around next',
+    'move-mouse monitor-lazy-center',
+]
 
 ctrl-alt-minus = 'resize smart -50'
 ctrl-alt-equal = 'resize smart +50'
 ctrl-alt-0 = 'balance-sizes'
 
-ctrl-alt-tab = 'workspace-back-and-forth'
-ctrl-alt-1 = 'workspace 1'
-ctrl-alt-2 = 'workspace 2'
-ctrl-alt-3 = 'workspace 3'
-ctrl-alt-4 = 'workspace 4'
-ctrl-alt-5 = 'workspace 5'
-ctrl-alt-6 = 'workspace 6'
-ctrl-alt-7 = 'workspace 7'
-ctrl-alt-8 = 'workspace 8'
-ctrl-alt-9 = 'workspace 9'
+ctrl-alt-tab = ['workspace-back-and-forth', 'move-mouse monitor-lazy-center']
+ctrl-alt-1 = ['workspace 1', 'move-mouse monitor-lazy-center']
+ctrl-alt-2 = ['workspace 2', 'move-mouse monitor-lazy-center']
+ctrl-alt-3 = ['workspace 3', 'move-mouse monitor-lazy-center']
+ctrl-alt-4 = ['workspace 4', 'move-mouse monitor-lazy-center']
+ctrl-alt-5 = ['workspace 5', 'move-mouse monitor-lazy-center']
+ctrl-alt-6 = ['workspace 6', 'move-mouse monitor-lazy-center']
+ctrl-alt-7 = ['workspace 7', 'move-mouse monitor-lazy-center']
+ctrl-alt-8 = ['workspace 8', 'move-mouse monitor-lazy-center']
+ctrl-alt-9 = ['workspace 9', 'move-mouse monitor-lazy-center']
 
 # Send this window to 1-5 and follow it: the letter under each number, no shift
-ctrl-alt-q = 'move-node-to-workspace --focus-follows-window 1'
-ctrl-alt-w = 'move-node-to-workspace --focus-follows-window 2'
-ctrl-alt-e = 'move-node-to-workspace --focus-follows-window 3'
-ctrl-alt-r = 'move-node-to-workspace --focus-follows-window 4'
-ctrl-alt-t = 'move-node-to-workspace --focus-follows-window 5'
+ctrl-alt-q = [
+    'move-node-to-workspace --focus-follows-window 1',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-w = [
+    'move-node-to-workspace --focus-follows-window 2',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-e = [
+    'move-node-to-workspace --focus-follows-window 3',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-r = [
+    'move-node-to-workspace --focus-follows-window 4',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-t = [
+    'move-node-to-workspace --focus-follows-window 5',
+    'move-mouse monitor-lazy-center',
+]
 
-ctrl-alt-shift-1 = 'move-node-to-workspace --focus-follows-window 1'
-ctrl-alt-shift-2 = 'move-node-to-workspace --focus-follows-window 2'
-ctrl-alt-shift-3 = 'move-node-to-workspace --focus-follows-window 3'
-ctrl-alt-shift-4 = 'move-node-to-workspace --focus-follows-window 4'
-ctrl-alt-shift-5 = 'move-node-to-workspace --focus-follows-window 5'
-ctrl-alt-shift-6 = 'move-node-to-workspace --focus-follows-window 6'
-ctrl-alt-shift-7 = 'move-node-to-workspace --focus-follows-window 7'
-ctrl-alt-shift-8 = 'move-node-to-workspace --focus-follows-window 8'
-ctrl-alt-shift-9 = 'move-node-to-workspace --focus-follows-window 9'
+ctrl-alt-shift-1 = [
+    'move-node-to-workspace --focus-follows-window 1',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-2 = [
+    'move-node-to-workspace --focus-follows-window 2',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-3 = [
+    'move-node-to-workspace --focus-follows-window 3',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-4 = [
+    'move-node-to-workspace --focus-follows-window 4',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-5 = [
+    'move-node-to-workspace --focus-follows-window 5',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-6 = [
+    'move-node-to-workspace --focus-follows-window 6',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-7 = [
+    'move-node-to-workspace --focus-follows-window 7',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-8 = [
+    'move-node-to-workspace --focus-follows-window 8',
+    'move-mouse monitor-lazy-center',
+]
+ctrl-alt-shift-9 = [
+    'move-node-to-workspace --focus-follows-window 9',
+    'move-mouse monitor-lazy-center',
+]
 
 ctrl-alt-shift-semicolon = 'mode service'
 
@@ -163,6 +212,11 @@ run = 'layout floating'
 
 [[on-window-detected]]
 if.app-id = 'com.apple.Dictionary'
+run = 'layout floating'
+
+# Tiled, Finder fills its slot and hides the window a file would be dragged onto
+[[on-window-detected]]
+if.app-id = 'com.apple.finder'
 run = 'layout floating'
 
 [[on-window-detected]]

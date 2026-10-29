@@ -15,6 +15,9 @@
 #   <name|*> <folder|*> <5h|7d> <stop> [warn]
 # stop is a percentage, or one a day of the window, its first day first: 11,23,47,65,90 (the
 # last holds to the end). Every matching line applies, so the strictest wins.
+#   <name|*> <folder|*> unlock <Mon..Sun> <HH:MM> [stop]
+# lifts the weekly caps there from that time to the account's weekly reset, but for its own
+# stop on the week if given; of two open at once, the looser holds. 5h caps still apply.
 #   <name|*> <folder|*> fallback <account>
 # at a cap there, moves the session to that account instead of stopping it, if that one is
 # below its own caps; an account with no such line stops.
@@ -117,7 +120,8 @@ acct_for() {
 	done <<<"$ACCT_OVR"
 }
 
-# Local calendar day of an epoch, so a window's days turn at midnight across a clock change
+# Local calendar day of an epoch, so a window's days turn at midnight across a clock change;
+# ACCT_OFF its offset from UTC
 acct_day() {
 	local z off
 	if [[ $OSTYPE == darwin* ]]; then
@@ -127,7 +131,29 @@ acct_day() {
 	fi
 	off=$((10#${z:1:2} * 3600 + 10#${z:3:2} * 60))
 	[[ ${z:0:1} == - ]] && off=$((-off))
+	ACCT_OFF=$off
 	ACCT_DAY=$((($1 + off) / 86400))
+}
+
+# Whether the last day $1 at $2 (local) is inside the week that resets at $3: the quota
+# left after it is spent or lost at the reset anyway
+acct_unlocked() {
+	local days=SunMonTueWedThuFriSat want h m wd at
+	[[ $3 =~ ^[0-9]+$ ]] && (($3 > ACCT_NOW)) || return 1
+	want=${days%%"$1"*}
+	((${#want} < 21 && ${#want} % 3 == 0)) || return 1
+	want=$((${#want} / 3))
+	[[ $2 =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || return 1
+	h=$((10#${BASH_REMATCH[1]}))
+	m=$((10#${BASH_REMATCH[2]}))
+	acct_day "$ACCT_NOW"
+	# 1 Jan 1970 was a Thursday
+	wd=$(((ACCT_DAY + 4) % 7))
+	at=$(((ACCT_DAY - (wd - want + 7) % 7) * 86400 + h * 3600 + m * 60))
+	((at - ACCT_OFF > ACCT_NOW)) && at=$((at - 604800))
+	# that day's own offset, should the clocks have changed since
+	acct_day $((at - ACCT_OFF))
+	((at - ACCT_OFF > $3 - 604800))
 }
 
 # Whether a limits line for account $1 and folder $2 covers account $3 working in $4
@@ -146,7 +172,7 @@ acct_covers() {
 # when nothing applies or the cache knows nothing
 acct_limits() {
 	local acct=$1 dir=${2%/} f now pct at stop warn caps start i n
-	local r5 r5_at r7 r7_at a d win where
+	local r5 r5_at r7 r7_at a d win where ceil allow=-1
 	LIM_STOP="" LIM_WARN="" LIM_TAG="" LIM_KEY="" LIM_GAP=0
 	[[ -r $ACCT_LIM_FILE ]] || return 0
 	acct_suffix "$acct"
@@ -155,17 +181,20 @@ acct_limits() {
 	IFS=$'\t' read -r _ r5 r5_at r7 r7_at _ <"$f"
 	((ACCT_NOW)) || ACCT_NOW=$(date +%s)
 	now=$ACCT_NOW
-	while read -r a d win stop warn _; do
-		[[ -n $a && $a != \#* && -n $stop ]] || continue
-		[[ $a == "*" || $a == "$acct" ]] || continue
-		if [[ $d != "*" ]]; then
-			d=${d/#\~/$HOME}
-			d=${d%/}
-			[[ $dir == "$d" || $dir == "$d"/* ]] || continue
-		fi
+	# an unlock lifts the week's caps but never the 5h ones, so it is known before either
+	while read -r a d win stop warn ceil _; do
+		[[ $win == unlock ]] && acct_covers "$a" "$d" "$acct" "$dir" || continue
+		[[ $ceil =~ ^[0-9]+$ ]] || ceil=101
+		acct_unlocked "$stop" "$warn" "$r7_at" && ((ceil > allow)) && allow=$ceil
+	done <"$ACCT_LIM_FILE"
+	while read -r a d win stop warn ceil _; do
+		[[ -n $stop ]] && acct_covers "$a" "$d" "$acct" "$dir" || continue
 		case $win in
 		5h) pct=$r5 at=$r5_at n=18000 ;;
-		7d) pct=$r7 at=$r7_at n=604800 ;;
+		7d)
+			((allow < 0)) || continue
+			pct=$r7 at=$r7_at n=604800
+			;;
 		*) continue ;;
 		esac
 		# past its reset the window is new and its figure unknown, which is as good as 0
@@ -196,6 +225,20 @@ acct_limits() {
 			[[ -n $LIM_STOP ]] || LIM_KEY="$acct-$win-$at-warn"
 		fi
 	done <"$ACCT_LIM_FILE"
+	((allow >= 0)) || return 0
+	LIM_TAG="unlocked"
+	if ((allow <= 100)); then
+		LIM_TAG="unlocked to $allow%"
+		if [[ -z $LIM_STOP && $r7 =~ ^[0-9]+$ ]] && ((r7 >= allow)); then
+			LIM_STOP="$acct is at $r7% of its week limit, unlocked only to $allow%"
+			LIM_KEY="$acct-week-$r7_at-stop"
+		fi
+	fi
+	acct_day "$r7_at"
+	at=$((r7_at + ACCT_OFF))
+	d=SunMonTueWedThuFriSat
+	printf -v LIM_TAG '%s till %s %02d:%02d' "$LIM_TAG" "${d:$(((at / 86400 + 4) % 7 * 3)):3}" \
+		$((at % 86400 / 3600)) $((at % 3600 / 60))
 }
 
 # ACCT_FALLBACK: where account $1 working in $2 goes at a cap; empty when it stops there
@@ -330,6 +373,8 @@ pick one by hand.
 Caps are ~/.claude/account-limits, one a line, every matching line applying:
   <name|*> <folder|*> <5h|7d> <stop%> [warn%]
   work ~/personal/meiolol 7d 11,23,47,65,90    a cap a day of the window, the last holding
+  * ~/personal unlock Fri 17:00 [95]             no weekly cap there from then to the reset
+                                                 (but 95% of the week, if given; 5h caps hold)
   work * fallback personal                       at a cap, move there rather than stop
 At stop, hooks/cc-limits.sh refuses every prompt and tool call there and ends an override
 lending the folder to that account; at warn it toasts. Once a window, either way. With a

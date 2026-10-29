@@ -91,6 +91,9 @@ def norm: gsub("\""; "") | sub("^~"; "$HOME") | split($home) | join("$HOME");
 			then .matcher = $e.value.matcher else . end)
 	  else . end)
 | .statusLine //= { type: "command", command: "\"$HOME/.claude/statusline.sh\"" }
+# The line is fitted to the width of the pane, and a resize alone never re-renders it
+| if (.statusLine.command // "" | test("statusline.sh")) then .statusLine.refreshInterval //= 2
+  else . end
 # !ccx after a gather (and !cd) would otherwise cost a turn replying to its output
 | if has("respondToBashCommands") then . else .respondToBashCommands = false end
 ' "$settings" >"$tmp"

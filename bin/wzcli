@@ -5,6 +5,27 @@
 # not help, it kills the caller and orphans the cli. WZCLI_TIMEOUT overrides the 5s.
 # --no-auto-start: a cli that finds no GUI must not start a headless mux server.
 PATH="$PATH:/opt/homebrew/bin:/Applications/WezTerm.app/Contents/MacOS"
+
+# A workspace lives only while it has a pane, and Jacob always wants his kept: before
+# killing a workspace's last pane, open a shell tab in its window. No shell, no kill.
+if [[ ${1:-} == kill-pane ]]; then
+	pane=${WEZTERM_PANE:-}
+	args=("$@")
+	for ((i = 1; i < ${#args[@]}; i++)); do
+		[[ ${args[i]} == --pane-id ]] && pane=${args[i + 1]:-}
+	done
+	[[ -n $pane && $pane != *[!0-9]* ]] || pane=""
+	if [[ -n $pane ]] && panes=$("$0" list --format json 2>/dev/null); then
+		read -r in_ws cwd < <(printf '%s' "$panes" | jq -r --argjson p "$pane" '
+			(map(select(.pane_id == $p)) | first) as $me
+			| select($me)
+			| "\(map(select(.workspace == $me.workspace)) | length) \($me.cwd | sub("^file://[^/]*"; ""))"')
+		if [[ ${in_ws:-} == 1 ]]; then
+			"$0" spawn --pane-id "$pane" ${cwd:+--cwd "$cwd"} >/dev/null || exit 1
+		fi
+	fi
+fi
+
 me=$$
 (
 	sleep "${WZCLI_TIMEOUT:-5}"

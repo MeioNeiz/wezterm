@@ -13,10 +13,11 @@ cc-spawn and hooks/cc-limits.sh. Beside it, both out of the repo and written by 
 cc-account: **`account-overrides`** `<name> <folder> <until epoch>`, a folder lent to
 another account, expired lines ignored and dropped on the next write; and
 **`account-limits`** `<name|*> <folder|*> <5h|7d> <stop> [warn]`, stop a percentage or one
-a calendar day of the window (`11,23,47,65,90`); `<name|*> <folder|*> fallback <account>`
-moves a session there at a cap. **`cache/limits/<acct>-<win>-<reset>-<level>`** marks a
-toast sent, once a window; **`cache/limits/moving-<sid>`** a fallback switch started,
-honoured 15 min; both pruned after 8 days.
+a calendar day of the window (`11,23,47,65,90`); `<name|*> <folder|*> unlock <Mon..Sun>
+<HH:MM> [stop]` lifts the 7d ones there from then to the weekly reset, but for its own stop; 5h caps hold. `<name|*> <folder|*> fallback <account>` moves a session there
+at a cap. **`cache/limits/<acct>-<win>-<reset>-<level>`** marks a toast sent, once a
+window; **`cache/limits/moving-<sid>`** a fallback switch started, honoured 15 min; both
+pruned after 8 days.
 
 - **`~/.claude/sessions/<pid>.json`**, the registry. name, status, cwd, session id,
   `statusUpdatedAt` (when its last request finished), `waitingFor`, and `formerNames`, the
@@ -122,7 +123,9 @@ honoured 15 min; both pruned after 8 days.
   order goes, non-sticky first
 - **`fleet/actions.d/`** the shell -> Lua queue, one file per action, written aside and
   renamed in; Lua drains by name every 0.1s. `jump\t<pane>` is a toast click, run
-  in-process like LEADER+t; `goto` is wz go. The old single `fleet/actions` file still drains
+  in-process like LEADER+t; `goto` is wz go; `tabbeside\t<new pane>\t<anchor pane>` is
+  cc-spawn's, moving a new tab right of the anchor's. The old single `fleet/actions` file
+  still drains
 - **`fleet/notes.tsv`** cc-note: `sid, at, flags, progress, status`, one line per annotated
   session. Read by the statusLine, cc-fleet and the tab bar. `fleet/todo/<sid>`,
   `fleet/log/<sid>` are read on demand only, never on a timer
@@ -146,6 +149,10 @@ honoured 15 min; both pruned after 8 days.
 - **`cache/titles/<sid>`** `mtime\x1fchecked_at\x1ftitle`, cc-peers' memo. `checked_at`
   of `sl` means the statusLine wrote it from `session_name` and it needs no transcript read.
   `cache/fleet-rows` cc-fleet's rows, 8s. `cache/jobs-seen/<id>`, `cache/job-rows`
+- **`cache/statusline/<sid>.line`** the statusLine's own: the payload key, epoch, then the
+  line's pieces before fitting. A 2s refreshInterval render with the same payload only
+  refits them to `$COLUMNS`; 30s old or older than `fleet/notes.tsv` renders in full.
+  `cache/statusline/<sid>` alone is its whole-transcript title scan
 - **`~/.cache/kev/cc-sort-pairs.json`** cc-sort's p(same topic) per pair, a day;
   `cc-sort.jsonl` its plans. `~/.cache/kev/cc-watch/` its pid, run.log, asks.jsonl
 - **`cache/cache-write-price`** `cents_per_Mtok\tepoch`, from the last SessionStart resume

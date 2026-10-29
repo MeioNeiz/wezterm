@@ -210,12 +210,18 @@ Two things that are not obvious and cost a while to find:
   build needs. The only thing added here is the repo check, which happens before the pane
   opens: claude refuses `--worktree` outside a repo and says so in a pane that has just
   scrolled and is not being read.
-- **a split never leaves a Claude pane under a third of the tab's width.** Left to
-  sessions, they kept splitting a half-width pane into quarters. A `--right`/`--left` split
-  of a pane narrower than two thirds of its tab (`wezterm cli list`: the pane's `cols`
-  against the tab's widest `left_col + cols`) becomes a new tab, with a line on stderr;
-  on one screen's window that is two across. `--squeeze` overrides; `--shell` and
-  `--replace` (closed again at once) are exempt.
+- **a split never leaves a Claude pane under 90 columns** (`MIN_COLS`, wz's `REFLOW_MIN`).
+  Left to sessions, they kept splitting a half-width pane into quarters. A `--right`/
+  `--left` split whose halves would be narrower becomes a new tab, with a line on stderr:
+  four across on the 429-column monitor, two on the 211-column laptop. It was a third of
+  the tab until 2026-10-21, which held the big monitor to two. `--squeeze` overrides;
+  `--shell` and `--replace` (closed again at once) are exempt, and so is a cc-handover
+  `--new` beside its source, which closes and gives the width back: LEADER+H's "beside
+  this pane" kept landing on a new tab at the far end of the window.
+- **a new tab lands right of the tab it came from**, not after the window's last.
+  `wezterm cli` cannot move a tab, so cc-spawn queues `tabbeside` for the GUI's
+  `MoveTab`. Only the workspace on screen has a GUI window: off screen, the move waits in
+  `wezterm.GLOBAL.tab_beside` until that workspace is shown. `--workspace` is exempt.
 - **every spawned session starts with `--dangerously-skip-permissions`**, which is how
   every agent here is run. A pane that stopped to ask does show as `asking` on the board,
   so it is not invisible, it is just wall clock nobody is spending. `--ask` opts one out.
@@ -377,7 +383,12 @@ its time, with no job left running. Running sessions keep their account. `use` l
 **Caps**: `~/.claude/account-limits`, `<name|*> <folder|*> <5h|7d> <stop> [warn]`, every
 matching line applying. A stop of `11,23,47,65,90` is a cap per calendar day of the window,
 counted from the day it started (the weekly one resets Monday 10:00, so Monday morning is
-still the last week's last day). `hooks/cc-limits.sh` runs on UserPromptSubmit and every
+still the last week's last day). `<name|*> <folder|*> unlock Fri 17:00 [90]` lifts the weekly
+caps there (5h ones still apply) from that time to the account's weekly reset, since the
+quota left by then is lost at the reset anyway, but for its own stop on the week if given
+(work keeps 10% for Monday 08:25, when `work * unlock Mon 08:25` frees it); of two open at
+once the looser holds. The badge
+says `unlocked to 90% till Mon 10:00`. `hooks/cc-limits.sh` runs on UserPromptSubmit and every
 PreToolUse: under the cap it prints nothing (no tokens, ~11ms); at warn it toasts once a
 window; at stop it blocks the prompt or denies the tool call, toasts sticky, and ends an
 override lending the folder to that account. Usage is the statusLine's cache, so it lags by
