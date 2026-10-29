@@ -197,13 +197,14 @@ if $worktree && ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
 	die "--worktree needs a git repo, and $cwd is not in one"
 fi
 
-# Explicit or by folder, always set: a session spawned from another inherits its
-# CLAUDE_CONFIG_DIR, which is the other account's whenever the folders differ
+# Explicit or by folder (its fallback while the folder's account is capped), always set: a
+# session spawned from another inherits its CLAUDE_CONFIG_DIR, which is the other account's
+# whenever the folders differ
 acct_load
 acct_env_args=()
 if [[ -n $ACCT_NAMES ]]; then
 	if [[ -z $account ]]; then
-		acct_for "$cwd"
+		acct_start "$cwd"
 		account=$ACCT
 	fi
 	acct_env "$account" || die "no account \"$account\" in $ACCT_FILE"

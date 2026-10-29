@@ -25,8 +25,8 @@
 # Sourced as a library by statusline.sh, cc-spawn and the limits hook, which cannot afford
 # a fork:
 #   source ~/.claude/bin/cc-account --lib
-#   acct_load; acct_for <dir>; acct_current; acct_env <name>; acct_suffix <name>
-#   acct_limits <name> <dir>; acct_fallback <name> <dir>
+#   acct_load; acct_for <dir>; acct_start <dir>; acct_current; acct_env <name>
+#   acct_suffix <name>; acct_limits <name> <dir>; acct_fallback <name> <dir>
 
 ACCT_FILE="$HOME/.claude/accounts"
 ACCT_OVR_FILE="$HOME/.claude/account-overrides"
@@ -255,6 +255,19 @@ acct_fallback() {
 	done <"$ACCT_LIM_FILE"
 }
 
+# ACCT for a new session in $1: acct_for's, or its fallback when that account is at a cap
+# there and the fallback is not. Else the session would start on the capped account, only
+# for the limits hook to refuse its first prompt
+acct_start() {
+	acct_for "$1"
+	acct_limits "$ACCT" "$1"
+	[[ -n $LIM_STOP ]] || return 0
+	acct_fallback "$ACCT" "$1"
+	[[ -n $ACCT_FALLBACK ]] || return 0
+	acct_limits "$ACCT_FALLBACK" "$1"
+	[[ -n $LIM_STOP ]] || ACCT=$ACCT_FALLBACK
+}
+
 # ACCT: the account this process runs on, from CLAUDE_CONFIG_DIR
 acct_current() {
 	local dir=${CLAUDE_CONFIG_DIR:-$ACCT_HOME} name k
@@ -336,7 +349,8 @@ cc-account - which claude.ai account a session runs on
 
   cc-account                 this session's account, and the one this folder defaults to
   cc-account status          every account: its folder and who is signed in there
-  cc-account for [dir]       the account a session started in dir gets
+  cc-account for [dir]       the account a session started in dir gets (the fallback
+                             while the folder's own is at a cap)
   cc-account of <T>          the account a live session is on
   cc-account login <name>    sign that account's folder in (from a shell, not /login)
   cc-account switch [T] [--to <name>] [--force] [--then <prompt>] [--until <time>]
@@ -674,7 +688,7 @@ status)
 	;;
 for)
 	need_accounts
-	acct_for "${1:-$PWD}"
+	acct_start "${1:-$PWD}"
 	echo "$ACCT"
 	;;
 of)
@@ -698,7 +712,7 @@ env)
 	# no map: leave the environment as it is
 	[[ -n $ACCT_NAMES ]] || exit 0
 	if [[ -z $name ]]; then
-		acct_for "$cwd"
+		acct_start "$cwd"
 		name=$ACCT
 	fi
 	known "$name"

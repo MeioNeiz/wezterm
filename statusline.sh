@@ -36,8 +36,12 @@ readonly TITLE_MEMO="$HOME/.claude/cache/titles"
 readonly SEP="  ·  "
 readonly LINE_TTL=30
 
-# ${#title} below must count characters, not bytes
-export LC_CTYPE=${LC_CTYPE:-en_GB.UTF-8}
+# ${#title} below must count characters, not bytes. Not every box has en_GB (WSL Ubuntu has
+# only C.UTF-8), so a UTF-8 locale already set is kept
+case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
+*[Uu][Tt][Ff]-8 | *[Uu][Tt][Ff]8) ;;
+*) export LC_CTYPE=en_GB.UTF-8 ;;
+esac
 
 left_width() {
 	lw=0

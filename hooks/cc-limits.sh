@@ -6,7 +6,8 @@
 # lending this folder to the account, so the next session here starts on the folder's own.
 # An account with a fallback (cc-account) moves the session there instead, resumed in place
 # once its turn ends, so long as the fallback is below its own caps: the move only ever
-# goes to an account with room, so two can never pass a session back and forth.
+# goes to an account with room, so two can never pass a session back and forth. With no
+# pane to resume in (no WEZTERM_PANE) it stops, saying how to resume it by hand.
 # Usage comes from the statusLine's per-account cache, so it lags by at most one response.
 
 [[ -s $HOME/.claude/account-limits ]] || exit 0
@@ -32,6 +33,7 @@ fi
 
 # Once per session: every refused tool call of the turn lands here, and the switch is
 # already waiting for that turn to end
+room=$moving sid=""
 if [[ -n $moving ]]; then
 	input=$(cat)
 	sid=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)
@@ -50,6 +52,9 @@ if [[ -n $moving ]]; then
 			${then:+--then "$then"} </dev/null >/dev/null 2>&1 || { rm -f "$mark"; moving=""; }
 	fi
 fi
+resume=""
+[[ -n $room && -z $moving && -n $sid ]] &&
+	resume=" To carry on on $room: /exit, then \`claude --$room --resume $sid\`."
 
 back=""
 if [[ -n $LIM_STOP ]]; then
@@ -69,7 +74,7 @@ if [[ ! -e $seen ]]; then
 	if [[ -n $moving ]]; then
 		notify+=("Usage cap: $account to $moving" "$LIM_STOP. Moving to $moving.$back")
 	elif [[ -n $LIM_STOP ]]; then
-		notify+=(--sticky "Usage cap: $account stopped" "$LIM_STOP.$back")
+		notify+=(--sticky "Usage cap: $account stopped" "$LIM_STOP.$back$resume")
 	else
 		notify+=("Usage warning: $account" "$LIM_WARN")
 	fi
@@ -96,11 +101,11 @@ fi
 case ${1:-} in
 prompt)
 	printf '{"decision":"block","reason":"%s"}\n' \
-		"Usage cap: $LIM_STOP.$back cc-account limits shows where it stands."
+		"Usage cap: $LIM_STOP.$back${resume:- cc-account limits shows where it stands.}"
 	;;
 tool)
 	why="Usage cap: $LIM_STOP. Every tool call is refused until it resets."
-	why+=" Do not retry or work round it: stop and tell Jacob."
+	why+=" Do not retry or work round it: stop and tell Jacob.$resume"
 	printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse",%s,%s}}\n' \
 		'"permissionDecision":"deny"' "\"permissionDecisionReason\":\"$why\""
 	;;
