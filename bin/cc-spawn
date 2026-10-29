@@ -55,6 +55,8 @@ cc-spawn - start a Claude session in a new pane, with a task
   --replace <pane>   start in that pane's place: split from it, close it, and start once
                      the claude in it has exited. How cc-account switch moves a session
   --print-sid        print the new session's id after the pane id, tab-separated
+  --name <name>      the session's name (claude --name); Claude lets two live sessions
+                     share one, and SendMessage then reaches whichever is listed first
   --dry-run          print what it would run
 
 Prints the new pane id. The session id is chosen here and passed as --session-id, so it
@@ -92,6 +94,7 @@ resume=""
 replace=""
 account=""
 print_sid=false
+name=""
 workspace=""
 squeeze=false
 while (($#)); do
@@ -116,6 +119,7 @@ while (($#)); do
 	--replace) shift; replace=${1:-}; [[ -n $replace ]] || die "--replace needs a pane" ;;
 	--account) shift; account=${1:-}; [[ -n $account ]] || die "--account needs a name" ;;
 	--print-sid) print_sid=true ;;
+	--name) shift; name=${1:-}; [[ -n $name ]] || die "--name needs a name" ;;
 	--squeeze) squeeze=true ;;
 	--dry-run) dry=true ;;
 	-h | --help) usage; exit 0 ;;
@@ -233,6 +237,7 @@ else
 	if $ask; then cmd+=(--permission-mode default); else cmd+=(--dangerously-skip-permissions); fi
 	[[ -n $effort ]] && cmd+=(--effort "$effort")
 	[[ -n $model ]] && cmd+=(--model "$model")
+	[[ -n $name ]] && cmd+=(--name "$name")
 	# a resume never restores bypass, which is why the mode above is always passed
 	if [[ -n $resume ]]; then
 		cmd+=(--resume "$resume")
@@ -283,7 +288,7 @@ if $dry; then
 	else
 		wt=""
 		$worktree && wt=" --worktree${wtname:+ $wtname}"
-		opts="${effort:+ --effort $effort}${model:+ --model $model}"
+		opts="${effort:+ --effort $effort}${model:+ --model $model}${name:+ --name $name}"
 		if [[ -n $resume ]]; then
 			opts+=" --resume $resume"
 		else

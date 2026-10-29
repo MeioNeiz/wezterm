@@ -270,6 +270,13 @@ until the source is closed, for up to 30 min. A self-handover is mid-turn until 
 reported, so it goes a few seconds after. Past 30 min it stays, and `!ccx` typed in the
 new session still closes it. A plain `--to` closes nothing (it pastes, unsent).
 
+The new session starts as `<name>-next` and takes the name only once its source has gone:
+ccx types `/rename <name>` into it as the list empties. Handing the name over at once left
+two live sessions sharing it for as long as a background task kept the source open, and
+when that task finished it woke the source, so messages reached either (meiolol-b2,
+2026-10-29). Typed while busy, `/rename` is queued and applied when the turn ends, without
+a turn of its own.
+
 Enter on it runs **ccx**, which closes each source whose pane still holds the same session
 and is not busy, asking, waiting or running a background shell, and keeps the rest listed
 for a later `ccx`. It never closes the receiver. Claude answers a bash-mode command with a

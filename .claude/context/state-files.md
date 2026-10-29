@@ -126,7 +126,8 @@ a calendar day of the window (`11,23,47,65,90`). **`cache/limits/<acct>-<win>-<r
   `fleet/log/<sid>` are read on demand only, never on a timer
 - **`fleet/gathered/<receiver pane>`** `pane\tsid\tname` per source of a gather, written by
   cc-handover, read and pruned by ccx (it keeps what it could not close); reaped with the
-  pane by `cc-roster --digest`
+  pane by `cc-roster --digest`. Beside it, a plain `--new`'s `<receiver pane>.name`: the
+  source's name, which ccx `/rename`s the receiver to once the list empties
 - **`fleet/handover/<name>-<stamp>.md`** cc-handover's briefs, each source's screen
   beside it as `<name>-<stamp>.<source>.scrollback.txt` (cc-handovers globs `*.md`, so
   keep that suffix off it). Reaped by `cc-roster --digest`: screens after 3 days, briefs

@@ -305,7 +305,8 @@ reap() {
 		[[ $p =~ ^[0-9]+$ ]] || continue
 		k="lp_$p"
 		if [[ -z ${!k:-} ]]; then
-			rm -f "$PANE_STATE/$p" "$PANE_MAP/$p" "$HOME/.claude/fleet/gathered/$p"
+			rm -f "$PANE_STATE/$p" "$PANE_MAP/$p" "$HOME/.claude/fleet/gathered/$p" \
+				"$HOME/.claude/fleet/gathered/$p.name"
 			continue
 		fi
 		[[ $f == "$PANE_MAP/$p" ]] || continue

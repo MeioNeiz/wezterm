@@ -50,19 +50,29 @@ while IFS=$'\x1f' read -r pane sid name; do
 done < <(awk -F'\t' '{ printf "%s\x1f%s\x1f%s\n", $1, $2, $3 }' "$list")
 
 # what is still working stays listed, so a later ccx closes it once it has stopped
+took=""
 if [[ -n $left ]]; then
 	printf '%s' "$left" >"$list"
 else
 	rm -f "$list"
+	# A plain --new's successor runs as <name>-next until its source is gone. Typed while
+	# busy, /rename is queued and applied when the turn ends, with no turn of its own
+	if [[ -s $list.name ]]; then
+		{ IFS= read -r took <"$list.name"; } 2>/dev/null
+		rm -f "$list.name"
+		[[ -n $took ]] && wzcli send-text --no-paste --pane-id "$me" -- "/rename $took" &&
+			wzcli send-text --no-paste --pane-id "$me" -- $'\r'
+	fi
 fi
+took=${took:+; this session is now $took}
 # Claude answers a bash-mode command with a turn of its own, so the line says what it means
 if [[ -n $left ]]; then
 	printf 'ccx closed %d:%s; kept%s, mid-turn: ccx again once stopped. %s\n' \
 		"$nclosed" "${closed:- none}" "$kept" "Nothing else to do"
 elif [[ -n $kept ]]; then
-	printf 'ccx closed %d:%s; kept%s. Nothing else to do\n' "$nclosed" "${closed:- none}" \
-		"$kept"
+	printf 'ccx closed %d:%s; kept%s%s. Nothing else to do\n' "$nclosed" "${closed:- none}" \
+		"$kept" "$took"
 else
-	printf 'ccx closed %d:%s. Handover sources done with; nothing else to do\n' "$nclosed" \
-		"${closed:- none}"
+	printf 'ccx closed %d:%s%s. Handover sources done with; nothing else to do\n' \
+		"$nclosed" "${closed:- none}" "$took"
 fi

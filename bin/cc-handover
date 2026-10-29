@@ -611,6 +611,20 @@ new)
 	[[ -n $in_pane ]] &&
 		spawn=(cc-spawn --cwd "$cwd" --print-sid --from "$in_pane" "$spawn_where")
 	[[ -n $account ]] && spawn+=(--account "$account")
+	# The successor takes the name, so messages addressed to it still land, but only once
+	# the source has closed: a background task finishing can wake the source after the
+	# handover, and two live sessions sharing a name take each other's messages. Until
+	# then it is <name>-next; ccx types the /rename. A gather's receiver stands for several
+	# sessions, so it keeps a name of its own
+	take_name=""
+	if ! $gather && [[ $name != "${rows[0]%%$'\t'*}" ]]; then
+		if [[ $pane != "-" ]]; then
+			take_name=$name
+			spawn+=(--name "$name-next")
+		else
+			spawn+=(--name "$name")
+		fi
+	fi
 	$dry && spawn+=(--dry-run)
 	new=$("${spawn[@]}" -- "$brief") || exit 1
 	new_sid=""
@@ -629,8 +643,10 @@ new)
 		prefill_later "$new"
 		echo "gathered ${#rows[@]} sessions into pane $new; $PREFILL is typed there to close them"
 	elif [[ -s $GATHERED/$new ]]; then
+		[[ -n $take_name ]] && printf '%s\n' "$take_name" >"$GATHERED/$new.name"
 		close_later "$new"
-		echo "handed $name over to pane $new; $name closes itself once it has stopped"
+		echo "handed $name over to pane $new as $name-next; $name closes itself once it has \
+stopped and the new session takes its name"
 	else
 		echo "handed $name over to pane $new"
 	fi
