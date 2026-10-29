@@ -56,7 +56,8 @@ cc-spawn - start a Claude session in a new pane, with a task
                      the claude in it has exited. How cc-account switch moves a session
   --print-sid        print the new session's id after the pane id, tab-separated
   --name <name>      the session's name (claude --name); Claude lets two live sessions
-                     share one, and SendMessage then reaches whichever is listed first
+                     share one, and SendMessage then reaches whichever is listed first.
+                     Default for a fresh session: <folder>-<2 hex> that none live holds
   --dry-run          print what it would run
 
 Prints the new pane id. The session id is chosen here and passed as --session-id, so it
@@ -217,6 +218,21 @@ if [[ -n $resume ]]; then
 	sid=$resume
 else
 	$shell || sid=$(uuidgen | tr 'A-F' 'a-f')
+fi
+
+# Claude derives <folder>-<2 hex> and its uniqueness check sits behind a flag, so with
+# fifteen live sessions in one folder two shared a name (meiolol-57, 2026-10-29). A fresh
+# session gets a free one of the same shape instead; a resume or fork keeps Claude's, and
+# a worktree's folder is not known yet
+if [[ -z $name && -z $resume && -z $fork ]] && ! $shell && ! $worktree; then
+	base=${cwd##*/}
+	base=$(printf '%s' "$base" | tr 'A-Z ' 'a-z-')
+	taken=" $(cc-roster 2>/dev/null | cut -f2 | tr '\n' ' ') "
+	for len in 2 3; do
+		for hex in $(printf '%s' "$sid$len" | shasum -a 256 | fold -w "$len" | head -40); do
+			[[ $taken == *" $base-$hex "* ]] || { name=$base-$hex; break 2; }
+		done
+	done
 fi
 perm=" --dangerously-skip-permissions"
 $ask && perm=" --permission-mode default"

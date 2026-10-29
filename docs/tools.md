@@ -22,9 +22,12 @@ The name does move, though, in four ways, and `nameSource` says which:
 | `auto` | background and forked sessions, named after the task they were given |
 | `user` / `hook` | `/rename`, or `--name` at launch |
 
-The collision check does not always run: on 2026-10-01 `7c8722c7` and `e90da9f8`, both
-`derived`, were live as `d5-lca-90` at once (two hex is 256 names a directory, and d5-lca
-holds twenty sessions). cc-roster refuses a name two live sessions share, saying which
+The collision check does not always run (it sits behind `tengu_session_name_uniqueness`):
+on 2026-10-01 `7c8722c7` and `e90da9f8`, both `derived`, were live as `d5-lca-90` at once
+(two hex is 256 names a directory, and d5-lca holds twenty sessions), and on 2026-10-29 a
+fresh meiolol session came up as W4's `meiolol-57`. So cc-spawn names a fresh session
+itself, `<folder>-<2 hex>` that no live session holds (3 hex if it finds none free), which
+also makes it `user` and sticky; a resume, fork or worktree keeps Claude's. cc-roster refuses a name two live sessions share, saying which
 panes, and `cc-fleet --brief` prints `same name, <name> is panes <a> <b>: /rename one`.
 
 Adoption means a resume, a remote attach or a spare claim, and the binary is explicit
