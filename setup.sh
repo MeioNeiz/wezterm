@@ -40,6 +40,11 @@ for f in "$repo"/bin/*; do
 	link "$f" "$HOME/.claude/bin/${f##*/}"
 	link "$HOME/.claude/bin/${f##*/}" "$HOME/.local/bin/${f##*/}"
 done
+# WSL: the GUI is the Windows wezterm.exe, driven through a `wezterm` of our own
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+	link "$repo/wsl/wezterm" "$HOME/.claude/bin/wezterm"
+	link "$HOME/.claude/bin/wezterm" "$HOME/.local/bin/wezterm"
+fi
 # Every other account's config folder is links back into ~/.claude (cc-account); new
 # entries Claude has made there since are linked on each run. Nothing without
 # ~/.claude/accounts

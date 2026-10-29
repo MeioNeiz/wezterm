@@ -193,6 +193,10 @@ if is_windows then
 	local shell = { pwsh and "pwsh.exe" or "powershell.exe", "-NoLogo" }
 	config.default_prog = shell
 	config.default_domain = WSL_DOMAIN
+	-- WSL takes from Windows only the variables WSLENV names, and wezterm appends its TERM
+	-- ones. WEZTERM_PANE is how the cc-* scripts find their pane (cc-spawn --replace, the
+	-- move to the other account at a usage cap)
+	config.set_environment_variables = { WSLENV = "WEZTERM_PANE" }
 	config.launch_menu = {
 		{ label = "PowerShell", args = shell, domain = { DomainName = "local" } },
 		{ label = "CMD", args = { "cmd.exe" }, domain = { DomainName = "local" } },
@@ -1186,7 +1190,8 @@ end)
 local rate = {
 	read_at = 0,
 	globbed_at = 0,
-	DIR = wezterm.home_dir .. "/.claude/cache/",
+	-- on Windows Claude runs in WSL, so the files are in the distro's home, not C:\Users
+	DIR = (is_windows and "//wsl.localhost/Ubuntu/home/jmu" or wezterm.home_dir) .. "/.claude/cache/",
 	GLOB_EVERY = 30,
 }
 

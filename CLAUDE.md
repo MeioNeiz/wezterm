@@ -26,13 +26,15 @@ wezterm.lua and the hooks call the scripts by their `~/.claude/bin` paths.
 | `bin/cc-sort`, `cc-watch`, `cc-handovers` | same | Kev: topic sort, output watch (off), digest |
 | `bin/cc-privacy` | same | a toast when an app lights the privacy dot; its history |
 | `bin/cc-toast` | same | built by setup.sh from `toast/`, gitignored |
+| `wsl/wezterm` | same, WSL only | `wezterm` in WSL: drives the Windows wezterm.exe |
 | `skills/fleet` | `~/.claude/skills/fleet` | the skill sessions use to drive all of it |
 | `statusline.sh`, `hooks/*` | `~/.claude/`, `~/.claude/hooks/` | the line under each pane; state |
 
 **Every script needs both links**, `~/.claude/bin/<name>` and `~/.local/bin/<name>`; only
 the second is on PATH and a missing one fails silently (full-path callers keep working).
 `setup.sh` makes every link and registers the hooks, rerunnable on macOS and Linux.
-macOS and Linux run everything; Windows runs the config only (`setup-windows.ps1`).
+macOS and Linux run everything; Windows runs the config only (`setup-windows.ps1`), with
+the scripts in WSL: wezterm.lua passes WEZTERM_PANE in through WSLENV.
 
 ## rules for every change
 

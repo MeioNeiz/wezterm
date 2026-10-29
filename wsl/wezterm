@@ -1,0 +1,47 @@
+#!/bin/bash
+# `wezterm` inside WSL: the Windows wezterm.exe, so the cc-* scripts drive the GUI the
+# same as on the Mac. setup.sh links it onto PATH on WSL only. What differs from a native
+# CLI, and is made up for here:
+# - wezterm.exe resolves --cwd against its own Windows cwd: run from / (the distro's
+#   \\wsl.localhost\<distro>), a Linux path lands in WSL's folder; relative ones are made
+#   absolute first
+# - the new pane runs `wsl.exe --exec`, which keeps none of the caller's environment, so
+#   claude in ~/.local/bin is not found: the caller's PATH goes in front of the command.
+#   Nothing else, since WEZTERM_PANE and WSL_INTEROP must be the new pane's own
+# - list reports a pane's cwd as a Windows path: file:///wsl.localhost/<distro>/home/...
+#   or file:///C:/...; turned back into Linux ones
+# -n: the config is the GUI's business, and loading it here prints its warnings and runs
+# its shell-outs from a UNC folder cmd.exe refuses
+exe="/mnt/c/Program Files/WezTerm/wezterm.exe"
+[[ -x $exe ]] || {
+	echo "wezterm: no $exe" >&2
+	exit 127
+}
+[[ ${1:-} == cli ]] || exec "$exe" "$@"
+
+args=("$@")
+sub="" dashdash=""
+for ((i = 1; i < ${#args[@]}; i++)); do
+	case ${args[i]} in
+	--) [[ -z $dashdash ]] && dashdash=$i ;;
+	--cwd)
+		[[ -z $dashdash && ${args[i + 1]:-} == [!/]* ]] &&
+			args[i + 1]=$(realpath -m -- "${args[i + 1]}")
+		;;
+	--cwd=[!/]*) [[ -z $dashdash ]] && args[i]=--cwd=$(realpath -m -- "${args[i]#--cwd=}") ;;
+	-*) ;;
+	*) [[ -z $sub ]] && sub=${args[i]} ;;
+	esac
+done
+if [[ $sub == spawn || $sub == split-pane ]] && [[ -n $dashdash ]] &&
+	((dashdash + 1 < ${#args[@]})); then
+	args=("${args[@]:0:dashdash+1}" /usr/bin/env "PATH=$PATH" "${args[@]:dashdash+1}")
+fi
+
+cd / || exit 1
+[[ $sub == list ]] || exec "$exe" -n "${args[@]}"
+set -o pipefail
+distro=${WSL_DISTRO_NAME:-Ubuntu}
+"$exe" -n "${args[@]}" | sed -E \
+	-e "s#file:///wsl(\\.localhost|\\$)/$distro/#file:///#g" \
+	-e 's#file:///([A-Za-z]):/#file:///mnt/\L\1/#g'
