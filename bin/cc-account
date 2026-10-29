@@ -15,12 +15,15 @@
 #   <name|*> <folder|*> <5h|7d> <stop> [warn]
 # stop is a percentage, or one a day of the window, its first day first: 11,23,47,65,90 (the
 # last holds to the end). Every matching line applies, so the strictest wins.
+#   <name|*> <folder|*> fallback <account>
+# at a cap there, moves the session to that account instead of stopping it, if that one is
+# below its own caps; an account with no such line stops.
 #
 # Sourced as a library by statusline.sh, cc-spawn and the limits hook, which cannot afford
 # a fork:
 #   source ~/.claude/bin/cc-account --lib
 #   acct_load; acct_for <dir>; acct_current; acct_env <name>; acct_suffix <name>
-#   acct_limits <name> <dir>
+#   acct_limits <name> <dir>; acct_fallback <name> <dir>
 
 ACCT_FILE="$HOME/.claude/accounts"
 ACCT_OVR_FILE="$HOME/.claude/account-overrides"
@@ -127,6 +130,16 @@ acct_day() {
 	ACCT_DAY=$((($1 + off) / 86400))
 }
 
+# Whether a limits line for account $1 and folder $2 covers account $3 working in $4
+acct_covers() {
+	local d=$2
+	[[ -n $1 && $1 != \#* ]] && [[ $1 == "*" || $1 == "$3" ]] || return 1
+	[[ $d == "*" ]] && return 0
+	d=${d/#\~/$HOME}
+	d=${d%/}
+	[[ $4 == "$d" || $4 == "$d"/* ]]
+}
+
 # For account $1 in folder $2, from its rate-limits cache and the limits file:
 # LIM_STOP the first cap reached, LIM_WARN the first warning, LIM_TAG the nearest cap as
 # "week 21/23%" when a folder rule applies, LIM_KEY what a toast dedupes on. All empty
@@ -182,6 +195,20 @@ acct_limits() {
 			LIM_WARN="$acct is at $pct% of its $win limit, stops at $stop%"
 			[[ -n $LIM_STOP ]] || LIM_KEY="$acct-$win-$at-warn"
 		fi
+	done <"$ACCT_LIM_FILE"
+}
+
+# ACCT_FALLBACK: where account $1 working in $2 goes at a cap; empty when it stops there
+# shellcheck disable=SC2034
+acct_fallback() {
+	local a d win to
+	ACCT_FALLBACK=""
+	[[ -r $ACCT_LIM_FILE ]] || return 0
+	while read -r a d win to _; do
+		[[ $win == fallback && -n $to && $to != "$1" ]] || continue
+		acct_covers "$a" "$d" "$1" "$2" || continue
+		ACCT_FALLBACK=$to
+		return 0
 	done <"$ACCT_LIM_FILE"
 }
 
@@ -303,8 +330,11 @@ pick one by hand.
 Caps are ~/.claude/account-limits, one a line, every matching line applying:
   <name|*> <folder|*> <5h|7d> <stop%> [warn%]
   work ~/personal/meiolol 7d 11,23,47,65,90    a cap a day of the window, the last holding
+  work * fallback personal                       at a cap, move there rather than stop
 At stop, hooks/cc-limits.sh refuses every prompt and tool call there and ends an override
-lending the folder to that account; at warn it toasts. Once a window, either way.
+lending the folder to that account; at warn it toasts. Once a window, either way. With a
+fallback below its own caps, the session moves to it instead (cc-account switch, resumed
+in place) and carries on.
 USAGE
 }
 

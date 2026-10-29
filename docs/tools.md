@@ -381,6 +381,15 @@ override lending the folder to that account. Usage is the statusLine's cache, so
 at most one response. `cc-account limits [dir]` shows where each account stands, and `use`
 refuses to lend a folder already over its cap.
 
+**Fallback**: `<name|*> <folder|*> fallback <account>`. At a cap there the hook moves the
+session rather than stopping it: `cc-account switch --force --then`, resumed in place once
+its turn ends. A refused prompt is resent on the new account as the `--then`, and a turn cut
+off at a tool call gets "carry on". Only to an account below its own caps, so a session
+never bounces between two; one move per session (`cache/limits/moving-<sid>`, 15 min); a
+switch that fails stops it as before. Jacob's rule (2026-10-29) is `work * fallback
+personal`: work can always move to personal, personal stops at its caps and never takes
+work.
+
 The statusLine names the account once there are two, as a peach badge when it is not the
 folder's own (`personal, not work`, or `work till 18:00` under an override, with the
 folder's nearest cap `week 19/23%`), red with `STOPPED` at a cap. Rate limits are per account: `cache/rate-limits` for `~/.claude`'s,

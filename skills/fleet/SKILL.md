@@ -147,8 +147,11 @@ conversation, first reply at full price (refused cold); `cc-handover --new --acc
 on that login. Signing a folder in is Jacob's: `! cc-account login <name>`.
 `cc-account use <name> [dir] --until 18:00` lends a folder to an account for a while;
 `cc-account limits` shows usage against the caps in `~/.claude/account-limits`, which a hook
-enforces by refusing prompts and tool calls. A refusal saying "Usage cap" is final: stop
-and tell Jacob, never switch account or retry to get round it.
+enforces by refusing prompts and tool calls. At a work cap the hook moves the session to
+personal itself (a `fallback` line): end the turn with a one-line status when told to, and
+it resumes in place on personal and carries on. A refusal that does not say it is moving
+is final: stop and tell Jacob, never switch account or retry to get round it, and never
+move a personal session to work.
 
 **Claude panes go side by side, not stacked.** A session reads down: its output, diffs
 and scrollback want height. So split `--right` (the default), never `--bottom`. cc-spawn
