@@ -278,10 +278,17 @@ when that task finished it woke the source, so messages reached either (meiolol-
 a turn of its own.
 
 Enter on it runs **ccx**, which closes each source whose pane still holds the same session
-and is not busy, asking, waiting or running a background shell, and keeps the rest listed
-for a later `ccx`. It never closes the receiver. Claude answers a bash-mode command with a
-turn of its own, so ccx's one line says what it did and that nothing else is needed:
-without that the session guessed at why a source was kept, wrongly.
+and is not busy, asking or waiting, and keeps the rest listed for a later `ccx`. One whose
+turn is over but a background task still runs (`shell`) never stops by itself when the
+task is a dev server or a watcher (meiolol-c1, 2026-10-29), so ccx closes it at once when
+every task has a listening TCP port somewhere under it, and otherwise 15 min after the
+handover, so a push in flight gets to land. It stops those tasks too: a pane's death does
+not reach them, and they outlive claude as orphans holding memory (7 GB of them on
+2026-10-29). `ccx --tasks <claude pid>` lists them, and the brief carries that list so
+the successor knows what to restart. A source closed by hand still hands over its name,
+but its tasks are left running. It never closes the receiver. Claude answers a bash-mode
+command with a turn of its own, so ccx's one line says what it did and that nothing else
+is needed: without that the session guessed at why a source was kept, wrongly.
 
 ## Kev's three: cc-sort, cc-watch, cc-handovers
 

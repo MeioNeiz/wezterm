@@ -24,6 +24,9 @@ readonly PREFILL_TRIES=120
 # session still closes it
 readonly CLOSE_POLL=2
 readonly CLOSE_TRIES=900
+# ccx's: how long a source whose turn is over waits on a background task that is not a
+# server (a push in flight) before it is stopped too
+readonly SHELL_GRACE=900
 # A source's screen is saved beside the brief: its pane may be closed by this very run,
 # and a pane id is reused, so a `wz read <id>` in the brief can read a stranger later
 readonly SCROLLBACK_LINES=200
@@ -185,10 +188,11 @@ LEAD_NAME=""
 
 render_session() {
 	local sid name cwd pane transcript title last_prompt last_prompt_at queued
-	local replies files branch dirty note tailfile outputs scroll
+	local replies files branch dirty note tailfile outputs scroll pid running
 
-	IFS=$'\x1f' read -r sid name cwd pane < <(
-		printf '%s\n' "$1" | awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s", $1, $2, $6, $5 }'
+	IFS=$'\x1f' read -r sid name cwd pane pid < <(
+		printf '%s\n' "$1" |
+			awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s\x1f%s", $1, $2, $6, $5, $7 }'
 	)
 	: "${name:=$sid}" "${cwd:=$PWD}" "${pane:=-}"
 	if [[ -z $LEAD_CWD ]]; then
@@ -277,6 +281,9 @@ render_session() {
 
 	note=$(cc-note show --for "$sid" --bare 2>/dev/null)
 	outputs=$(task_outputs "$transcript")
+	running=""
+	[[ $pane != "-" && $pid =~ ^[0-9]+$ ]] && closes_source "$pane" &&
+		running=$("$HOME/.claude/bin/ccx" --tasks "$pid" 2>/dev/null)
 	cache_note "$sid"
 	[[ -n $CACHE_NOTE ]] && printf '%s: %s\n' "$name" "$CACHE_NOTE" >&2
 
@@ -315,6 +322,14 @@ render_session() {
 			printf '(a subagent'"'"'s is its JSONL transcript: tail it)\n\n'
 			printf '%s\n' "$outputs" |
 				awk -F'\t' '{ printf "- `%s` (%d KB)\n", $1, ($2 + 1023) / 1024 }'
+			printf '\n'
+		fi
+		if [[ -n $running ]]; then
+			printf '**Still running in its background**, stopped when it closes: at once if '
+			printf 'all are servers, else %d min after the handover. Restart what you need\n\n' \
+				"$((SHELL_GRACE / 60))"
+			printf '%s\n' "$running" | awk -F'\t' '{ printf "- pid %s%s: `%s`\n", $1,
+				($2 == "-" ? "" : ", port " $2), $3 }'
 			printf '\n'
 		fi
 		[[ -n $scroll ]] && printf 'Its screen at the handover, the last %s lines: `%s`\n\n' \
@@ -463,8 +478,8 @@ write_gathered() {
 	mkdir -p "$GATHERED" 2>/dev/null
 	for row in "${rows[@]}"; do
 		printf '%s\n' "$row"
-	done | awk -F'\t' -v r="$receiver" '$5 != r && $5 != "-" && $5 != "" {
-		print $5 "\t" $1 "\t" $2 }' >"$GATHERED/$receiver"
+	done | awk -F'\t' -v r="$receiver" -v now="$(date +%s)" '$5 != r && $5 != "-" && $5 != "" {
+		print $5 "\t" $1 "\t" $2 "\t" now }' >"$GATHERED/$receiver"
 }
 
 # Detached: once the receiver is busy on the brief, type PREFILL into its prompt as keys,
