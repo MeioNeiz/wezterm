@@ -465,9 +465,9 @@ function agree(name, files, label,   a, n, i, k, v, seen, nd, s) {
 FNR == 1 { heredoc = ""; f = rel(FILENAME) }
 f == "setup.sh" {
 	if (/^def /) { print "jqdef\t" $0; sawdef = 1; next }
-	if (sawdef && !inwant && !wantdone && /^\{[ \t]*$/) inwant = 1
+	if (sawdef && !inwant && !wantdone && /^\[[ \t]*$/) inwant = 1
 	if (inwant) {
-		if (/^\} as \$want/) { print "jqobj\t}"; inwant = 0; wantdone = 1; next }
+		if (/^\] as \$want/) { print "jqobj\t]"; inwant = 0; wantdone = 1; next }
 		print "jqobj\t" $0
 		if (/matcher:/) print "matcherline\t" FNR
 	}
@@ -528,18 +528,18 @@ END {
 }
 AWK
 
-# setup.sh's $want object, run against settings.json with setup.sh's own norm
+# setup.sh's $want list, run against settings.json with setup.sh's own norm
 check_hooks() {
 	local defs=$1 obj=$2 mline=$3 out line n=0 bad=""
 	if [[ -z $obj ]]; then
-		report FAIL "hooks: no \$want object found in setup.sh (cc-doctor needs updating)"
+		report FAIL "hooks: no \$want list found in setup.sh (cc-doctor needs updating)"
 		return
 	fi
 	[[ -f $SETTINGS ]] || { report FAIL "hooks: no $SETTINGS (rerun setup.sh)"; return; }
 	out=$(jq -r --arg home "$HOME" "$defs"$'\n'"($obj) as \$want"$'\n''
 	| . as $s
-	| ([$want[].hooks[]] | length | "n\t\(.)"),
-	  ($want | to_entries[] | .key as $ev | .value as $w
+	| ([$want[].value.hooks[]] | length | "n\t\(.)"),
+	  ($want[] | .key as $ev | .value as $w
 	  | ([$s.hooks[$ev][]?.hooks[]?.command | norm]) as $got
 	  | ($w.hooks[] | (.command | norm) as $c | select(any($got[]; . == $c) | not)
 	    | "bad\t\($ev) does not run \($c)"),
@@ -550,7 +550,7 @@ check_hooks() {
 	    | "bad\t\($ev) matcher is \(.matcher // "(none)"),"
 	      + " setup.sh:'"$mline"' wants \($w.matcher)"))
 	' "$SETTINGS" 2>&1) || {
-		report FAIL "hooks: jq failed on setup.sh's object or settings.json: ${out%%$'\n'*}"
+		report FAIL "hooks: jq failed on setup.sh's list or settings.json: ${out%%$'\n'*}"
 		return
 	}
 	while IFS= read -r line; do
@@ -632,11 +632,11 @@ cmd_doctor() {
 
 	check_links
 
-	local ttl="wezterm.lua bin/cc-board bin/cc-fleet bin/cc-handover bin/wz"
+	local ttl="wezterm.lua bin/cc-board bin/cc-fleet bin/cc-handover bin/wz hooks/cc-hold.sh"
 	local parked="wezterm.lua bin/cc-board bin/cc-roster"
 	out=$(LC_ALL=C awk -v repo="$REPO" -v ttl_files="$ttl" -v parked_files="$parked" \
 		"$REPO_AWK" "$REPO/setup.sh" "$REPO/docs/research/sources.md" "$REPO/wezterm.lua" \
-		"$REPO"/bin/*)
+		"$REPO"/bin/* "$REPO/hooks/cc-hold.sh")
 	local results="" more
 	while IFS= read -r line; do
 		tag=${line%%$'\t'*}

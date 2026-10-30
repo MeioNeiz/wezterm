@@ -128,7 +128,9 @@ pruned after 8 days.
   still drains
 - **`fleet/notes.tsv`** cc-note: `sid, at, flags, progress, status`, one line per annotated
   session. Read by the statusLine, cc-fleet and the tab bar. `fleet/todo/<sid>`,
-  `fleet/log/<sid>` are read on demand only, never on a timer
+  `fleet/log/<sid>` are read on demand only, never on a timer. Flag `hold` (only Jacob
+  wakes it) keeps its why in `fleet/hold/<sid>`, one line; readers: hooks/cc-hold.sh,
+  cc-peers, cc-fleet, statusline.sh, wz, cc-handover (via `cc-note held`)
 - **`fleet/switch/<sid>`** `to\tuntil epoch (0 none)\tname\tqueued epoch`, a queued
   `cc-account switch`, its follow-up prompt in `<sid>.then`; written by cc-account, read
   and removed by its watcher (`.watcher/pid`, a mkdir lock), read by cc-handover --new

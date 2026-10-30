@@ -58,9 +58,10 @@ cc-spawn - start a Claude session in a new pane, with a task
   --replace <pane>   start in that pane's place: split from it, close it, and start once
                      the claude in it has exited. How cc-account switch moves a session
   --print-sid        print the new session's id after the pane id, tab-separated
-  --name <name>      the session's name (claude --name); Claude lets two live sessions
-                     share one, and SendMessage then reaches whichever is listed first.
-                     Default for a fresh session: <folder>-<2 hex> that none live holds
+  --name <name>      the session's name (claude --name), required for a fresh session:
+                     <repo>-<topic>, e.g. meiolol-crawler. Jacob knows sessions by name
+                     only. Claude lets two live sessions share one, and SendMessage then
+                     reaches whichever is listed first
   --dry-run          print what it would run
 
 Prints the new pane id. The session id is chosen here and passed as --session-id, so it
@@ -221,12 +222,22 @@ else
 	$shell || sid=$(uuidgen | tr 'A-F' 'a-f')
 fi
 
-# Claude derives <folder>-<2 hex> and its uniqueness check sits behind a flag, so with
-# fifteen live sessions in one folder two shared a name (meiolol-57, 2026-10-29). A fresh
-# session gets a free one of the same shape instead; a resume or fork keeps Claude's, and
-# a worktree's folder is not known yet
-if [[ -z $name && -z $resume && -z $fork ]] && ! $shell && ! $worktree; then
-	base=${cwd##*/}
+# A fresh session is named for its topic: Jacob sees names, never panes, and meiolol-57
+# says nothing. A resume or fork keeps its own
+if [[ -z $name && -z $resume && -z $fork ]] && ! $shell; then
+	base=${cwd%/}
+	base=${base##*/}
+	die "--name is required: <repo>-<topic>, e.g. ${base:-meiolol}-crawler or" \
+		"${base:-meiolol}-squads. Jacob knows sessions by name only"
+fi
+# --name auto, for cc-handover's gather: <folder>-<2 hex> that none live holds. Claude
+# derives the same shape, but its uniqueness check sits behind a flag (two shared
+# meiolol-57, 2026-10-29). A worktree's folder is not known yet, so Claude names that one
+[[ $name == auto ]] && { name=""; $worktree || name=auto; }
+if [[ $name == auto ]]; then
+	name=""
+	base=${cwd%/}
+	base=${base##*/}
 	base=$(printf '%s' "$base" | tr 'A-Z ' 'a-z-')
 	taken=" $(cc-roster 2>/dev/null | cut -f2 | tr '\n' ' ') "
 	for len in 2 3; do

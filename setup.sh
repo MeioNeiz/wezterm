@@ -71,21 +71,24 @@ tmp=$(mktemp)
 jq --arg home "$HOME" '
 def hook($arg): { type: "command", command: ("\"$HOME/.claude/hooks/wezterm-pane-state.sh\" " + $arg) };
 def limits($arg): { type: "command", command: ("\"$HOME/.claude/hooks/cc-limits.sh\" " + $arg), timeout: 5 };
+def hold($arg): { type: "command", command: ("\"$HOME/.claude/hooks/cc-hold.sh\" " + $arg), timeout: 5 };
 def norm: gsub("\""; "") | sub("^~"; "$HOME") | split($home) | join("$HOME");
-{
-	SessionStart: { hooks: [
+# A list, not an object: one event can want two groups with different matchers
+[
+	{ key: "SessionStart", value: { hooks: [
 		{ type: "command", command: "\"$HOME/.claude/hooks/wezterm-session-map.sh\"" },
 		{ type: "command", command: "\"$HOME/.claude/bin/cc-tint\"", timeout: 5 }
-	] },
-	UserPromptSubmit: { hooks: [hook("working"), limits("prompt")] },
-	PreToolUse: { hooks: [limits("tool")] },
-	Notification: { matcher: "permission_prompt|push_notification|worker_permission_prompt|model_refusal_fallback|quota_auto_resume_stale|quota_auto_resume_disabled|auth_storage_failure", hooks: [hook("notify")] },
-	Stop: { hooks: [hook("done")] },
-	SessionEnd: { hooks: [hook("ended")] },
-	StopFailure: { hooks: [hook("errored")] },
-	PermissionRequest: { hooks: [hook("asking")] }
-} as $want
-| reduce ($want | to_entries[]) as $e (.;
+	] } },
+	{ key: "UserPromptSubmit", value: { hooks: [hook("working"), limits("prompt"), hold("prompt")] } },
+	{ key: "PreToolUse", value: { hooks: [limits("tool")] } },
+	{ key: "PreToolUse", value: { matcher: "SendMessage|Bash", hooks: [hold("tool")] } },
+	{ key: "Notification", value: { matcher: "permission_prompt|push_notification|worker_permission_prompt|model_refusal_fallback|quota_auto_resume_stale|quota_auto_resume_disabled|auth_storage_failure", hooks: [hook("notify")] } },
+	{ key: "Stop", value: { hooks: [hook("done")] } },
+	{ key: "SessionEnd", value: { hooks: [hook("ended")] } },
+	{ key: "StopFailure", value: { hooks: [hook("errored")] } },
+	{ key: "PermissionRequest", value: { hooks: [hook("asking")] } }
+] as $want
+| reduce $want[] as $e (.;
 	([.hooks[$e.key][]?.hooks[]?.command | norm]) as $got
 	| [$e.value.hooks[] | select((.command | norm) as $c | $got | any(.[]; . == $c) | not)] as $missing
 	| if ($missing | length) == 0 then .

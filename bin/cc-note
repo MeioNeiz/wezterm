@@ -10,6 +10,8 @@ if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 readonly FLEET="$HOME/.claude/fleet"
 readonly NOTES="$FLEET/notes.tsv"
 readonly LOGDIR="$FLEET/log"
+# The why of a hold; the hold itself is the flag in notes.tsv
+readonly HOLDDIR="$FLEET/hold"
 readonly LOCK="$FLEET/.lock"
 # Past this many rows, ended sessions are swept; a sweep costs a roster.
 readonly SWEEP_AT=200
@@ -25,7 +27,7 @@ cc-note - what a session says about itself
   cc-note                          this session's note
   cc-note show [--for T] [--bare]  one session's note, in full; --bare without its name
   cc-note list [--json]            every session that has one
-  cc-note clear [--for T]          drop the note and its log
+  cc-note clear [--for T]          drop the note and its log (a hold stays)
 
   cc-note status <text>            one line: what it is doing, or waiting on
   cc-note status --clear
@@ -35,6 +37,12 @@ cc-note - what a session says about itself
   cc-note needs --clear
   cc-note progress <done> <total>  3 of 7; --clear to drop it
   cc-note mute | unmute            stop it competing for attention when it stops
+  cc-note hold [why]               on hold: no other session may wake it (SendMessage is
+                                   refused). For a session that stops to wait on
+                                   something off this machine
+  cc-note hold --clear             Jacob only, with ! (a hook refuses it from Claude). A
+                                   prompt he types into the session clears it too
+  cc-note held                     prints the why and exits 0 if on hold, else 1
   cc-note log <text>               append a line worth keeping
   cc-note log --tail [n]
 
@@ -45,6 +53,7 @@ acts on the calling session, which is free: no lookup, no roster.
   cc-note status 'waiting on the staging deploy'
   cc-note progress 3 7
   cc-note status --for d5-lca-48 'blocked on the DNS change'
+  cc-note hold --for meiolol-d2 'gpu-box off all weekend'
   cc-note list --json
 USAGE
 }
@@ -136,6 +145,11 @@ sweep() {
 	awk -F'\t' 'NR == FNR { live[$1] = 1; next } $1 in live' \
 		<(printf '%s\n' "$live") "$NOTES" >"$NOTES.$$" && mv -f "$NOTES.$$" "$NOTES"
 	drop_lock
+	local f
+	for f in "$HOLDDIR"/*; do
+		[[ -e $f ]] || continue
+		grep -q "^${f##*/}"$'\t' "$NOTES" 2>/dev/null || rm -f "$f"
+	done
 }
 
 # Takes the lock that write_row releases, so every setter is one read-modify-write.
@@ -200,6 +214,31 @@ cmd_log() {
 	fi
 }
 
+# --- hold -----------------------------------------------------------------------
+#
+# Read by hooks/cc-hold.sh, which refuses a SendMessage to a held session.
+
+hold_why() {
+	local why=""
+	[[ -r $HOLDDIR/$1 ]] && IFS= read -r why <"$HOLDDIR/$1"
+	printf '%s' "${why:-no reason given}"
+}
+
+cmd_hold() {
+	local sid=$1
+	shift
+	load "$sid"
+	if [[ ${1:-} == --clear ]]; then
+		rm -f "$HOLDDIR/$sid"
+		write_row "$sid" "$(drop_flag "$F_FLAGS" hold)" "$F_PROGRESS" "$F_STATUS"
+		return
+	fi
+	mkdir -p "$HOLDDIR" 2>/dev/null
+	clean "$*" >"$HOLDDIR/$sid.$$" && printf '\n' >>"$HOLDDIR/$sid.$$" &&
+		mv -f "$HOLDDIR/$sid.$$" "$HOLDDIR/$sid"
+	write_row "$sid" "$(add_flag "$F_FLAGS" hold)" "$F_PROGRESS" "$F_STATUS"
+}
+
 # --- showing ----------------------------------------------------------------------
 
 readonly DIM=$'\033[38;2;108;112;134m'
@@ -230,6 +269,9 @@ cmd_show() {
 		printf '  progress  %s %s\n' "$(bar "${F_PROGRESS%%/*}" "${F_PROGRESS##*/}")" "$F_PROGRESS"
 	fi
 	[[ $F_FLAGS != "-" ]] && printf '  flags     %s\n' "$F_FLAGS"
+	if has_flag "$F_FLAGS" hold; then
+		printf '  on hold   %s\n' "$(hold_why "$sid")"
+	fi
 	local logs
 	logs=$(cmd_log "$sid" --tail "$SHOW_LOG")
 	[[ -n $logs ]] && printf '  log\n%s\n' "$(printf '%s\n' "$logs" | sed 's/^/    /')"
@@ -340,10 +382,19 @@ needs)
 	fi
 	;;
 log) cmd_log "$sid" "$@" ;;
+hold) cmd_hold "$sid" "$@" ;;
+held)
+	load "$sid" ro
+	has_flag "$F_FLAGS" hold || exit 1
+	hold_why "$sid"
+	echo
+	;;
 clear)
-	mkdir -p "$FLEET" 2>/dev/null
-	take_lock
-	write_row "$sid" "-" "-" "-"
+	# A hold outlives the note: only hold --clear lifts it, which a hook keeps from Claude
+	load "$sid"
+	flags=-
+	has_flag "$F_FLAGS" hold && flags=hold
+	write_row "$sid" "$flags" "-" "-"
 	rm -f "$(log_file "$sid")"
 	;;
 *) usage >&2; exit 2 ;;

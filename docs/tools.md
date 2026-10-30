@@ -25,10 +25,14 @@ The name does move, though, in four ways, and `nameSource` says which:
 The collision check does not always run (it sits behind `tengu_session_name_uniqueness`):
 on 2026-10-01 `7c8722c7` and `e90da9f8`, both `derived`, were live as `d5-lca-90` at once
 (two hex is 256 names a directory, and d5-lca holds twenty sessions), and on 2026-10-29 a
-fresh meiolol session came up as W4's `meiolol-57`. So cc-spawn names a fresh session
-itself, `<folder>-<2 hex>` that no live session holds (3 hex if it finds none free), which
-also makes it `user` and sticky; a resume, fork or worktree keeps Claude's. cc-roster refuses a name two live sessions share, saying which
-panes, and `cc-fleet --brief` prints `same name, <name> is panes <a> <b>: /rename one`.
+fresh meiolol session came up as W4's `meiolol-57`. And Jacob knows sessions by name
+only (statusLine, tab), never by pane, where `meiolol-57` says nothing. So cc-spawn
+refuses a fresh session without `--name <repo>-<topic>` (`meiolol-crawler`), which also
+makes it `user` and sticky; `cc-handover --new --name` gives a successor on a new topic
+its own. A resume or fork keeps Claude's. `--name auto` (a gather's receiver, which
+stands for several) is `<folder>-<2 hex>` that no live session holds, 3 hex if none is
+free; in a worktree it leaves the name to Claude. cc-roster refuses a name two live
+sessions share, saying which panes, and `cc-fleet --brief` prints `same name, <name> is panes <a> <b>: /rename one`.
 
 Adoption means a resume, a remote attach or a spare claim, and the binary is explicit
 that `/clear`, a fork and a `cd` are not on that list: those keep the name. `auto` is how
@@ -177,6 +181,35 @@ It renders in three places and deliberately not in a fourth:
   noise is most expensive.
 - **not the tab bar.** Four false starts up there are documented above and every one of
   them was adding a channel. Progress and status have somewhere better to live.
+
+### hold: only Jacob wakes it
+
+On 2026-10-30 the meiolol coordinator sent new work to a worker parked on the gpu-box and
+woke it. `cc-note hold [why]` (or `--for <name>`, Jacob holding any session) sets the
+`hold` flag, with the why in `fleet/hold/<sid>`. It shows as an `on hold` badge on the
+statusLine, `idle, on hold` in cc-peers, `on hold` in cc-fleet and its own list in
+`--brief`. `cc-note clear` leaves it standing.
+
+`hooks/cc-hold.sh`, global (setup.sh), enforces it with nothing in any context:
+
+- **PreToolUse SendMessage** refuses a target that is on hold, or idle (or errored) with
+  a cold cache by wz's rule, exit 2 with the reason. `main` and `parent` always pass. A
+  name, `name [ref]` (the ref is Claude's own; the name is what resolves) or
+  `uds:/tmp/cc-socks/<pid>.sock` (its registry file). One jq over the registry per send,
+  about 10 ms over bash's start; `cc-roster --row`, the resolver of record, runs only
+  when a candidate is held or looks cold, for the merged state (a parked session reads
+  busy) and a former or shared name. A held name one live session wears is refused
+  without it. A cc-roster failure lets the message through and says so on stderr.
+- **PreToolUse Bash** refuses `cc-note hold --clear` where a command starts (prose in a
+  heredoc passes). Jacob types `! cc-note hold --clear [--for <name>]`, and `!` runs no
+  hook.
+- **UserPromptSubmit** in the held session clears it: Jacob typed into it. A
+  cross-session message also fires UserPromptSubmit (checked 2026-10-30), its prompt
+  starting `<cross-session-message`; that, `<task-notification` and `<teammate-message`
+  do not count. A /loop or ScheduleWakeup prompt in the held session itself would.
+
+`wz send`/`key` refuse a held session (`--force` is Jacob's), and `cc-handover --to`
+refuses one outright.
 
 ## handing work over
 

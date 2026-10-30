@@ -23,6 +23,7 @@ readonly US=$'\x1f'
 readonly CACHE="$HOME/.claude/cache/fleet-rows"
 readonly CACHE_TTL=8
 readonly NOTES="$HOME/.claude/fleet/notes.tsv"
+readonly HOLDS="$HOME/.claude/fleet/hold"
 readonly CTX_DIR="$HOME/.claude/cache/context"
 readonly PANE_STATE="$HOME/.claude/wezterm-state"
 # What you have read, kept by wezterm.lua: see "unread" there.
@@ -502,7 +503,7 @@ fi
 
 if [[ $mode == brief ]]; then
 	# What has asked for you by name comes first: it wants something done away from here.
-	needs=""
+	needs="" held=""
 	while IFS="$US" read -r _ _ _ _ _ nm _ _ _ _ _ _ sid _; do
 		[[ -n ${sid:-} ]] || continue
 		fkey="nf_${sid//-/_}"
@@ -510,8 +511,17 @@ if [[ $mode == brief ]]; then
 		case ",${!fkey:--}," in
 		*,needs,*) needs="$needs  $nm: ${!skey:--}"$'\n' ;;
 		esac
+		case ",${!fkey:--}," in
+		*,hold,*)
+			why=""
+			[[ -r $HOLDS/$sid ]] && IFS= read -r why <"$HOLDS/$sid"
+			held="$held  $nm: ${why:-no reason given}"$'\n'
+			;;
+		esac
 	done <<<"$rows"
 	[[ -n $needs ]] && printf 'needs you:\n%s' "$needs"
+	# No session can message these; Jacob lifts one with ! cc-note hold --clear --for <name>
+	[[ -n $held ]] && printf 'on hold, only you wake them:\n%s' "$held"
 
 	# Background jobs stopped on a question for you join the list; finished ones get a line.
 	jobs_want="" jobs_done=""
@@ -638,7 +648,7 @@ if [[ $mode == brief ]]; then
 	if ((n_cold > 0)); then
 		fmt_tok "$cold_sum"
 		fmt_usd "$cold_sum"
-		printf '%d cold hold ~%s tokens (~%s) to resume; hand over or close (--stale)\n' \
+		printf '%d cold: ~%s tokens (~%s) to resume; hand over or close (--stale)\n' \
 			"$n_cold" "$TOK" "$USD"
 	fi
 	[[ -n $jobs_done ]] && printf 'background, finished unread (cc-fleet --job <id>):\n%s' \
@@ -817,6 +827,7 @@ while IFS="$US" read -r _ _ ws n wants old rank _ _ _ pane name kind detail idle
 		title="▸ $note"
 		body=$YELLOW
 	fi
+	[[ ,$flags, == *,hold,* ]] && label="on hold"
 	[[ $prog != "-" ]] && label="$label $prog"
 	# Fullness only once it is worth acting on; below that it crowds the state.
 	ckey="cx_$key"
@@ -844,7 +855,7 @@ printf '\n%s%s chats%s %s· %s workspaces' "$BOLD" "$total" "$RESET" "$DIM" "$nw
 if ((cold_n > 0)); then
 	fmt_tok "$cold_total"
 	fmt_usd "$cold_total"
-	printf ' · %s cold hold ~%s (~%s) to resume' "$cold_n" "$TOK" "$USD"
+	printf ' · %s cold, ~%s (~%s) to resume' "$cold_n" "$TOK" "$USD"
 fi
 printf '%s\n' "$RESET"
 

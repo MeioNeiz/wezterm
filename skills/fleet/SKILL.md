@@ -117,7 +117,7 @@ it closes the sources that have stopped. A plain `--new` closes its source itsel
 new session is on the brief and the source has stopped: don't close it yourself.
 
 **A bare word in a cc-spawn argument list ends the options** and the rest becomes the
-prompt, `--dry-run` included. Flags only, before the prompt.
+prompt, `--dry-run` included. Flags first; `--name <repo>-<topic>` is required.
 
 Nothing is lost: closing a pane keeps the transcript, which is all a successor reads, and
 a warm session can still be resumed. Ask before closing it.
@@ -127,8 +127,8 @@ went.
 ## Starting work
 
 ```bash
-cc-spawn 'read src/auth.ts and list every path that skips the guard'
-cc-spawn --tab --cwd ~/work/api 'run the failing test and say why'
+cc-spawn --name api-auth-guard 'read src/auth.ts and list every path that skips the guard'
+cc-spawn --name api-flaky-test --tab --cwd ~/work/api 'run the failing test and say why'
 cc-spawn --shell                   # a plain pane to watch something in
 cc-spawn --workspace api --cwd ~/work/api '...'   # a tab in that workspace's window
 cc-spawn --ask '...'               # leave permission prompts on
@@ -194,6 +194,7 @@ cc-note status 'waiting on the staging deploy'   # shows on its statusLine and c
 cc-note progress 3 7
 cc-note log '...'           # log --tail 20
 cc-note mute                # stop it counting towards "wants you elsewhere"
+cc-note hold 'gpu-box off till Mon'    # waiting off-machine: only Jacob wakes it
 cc-note show --for d5-lca-48
 cc-note list --json
 ```

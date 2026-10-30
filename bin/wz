@@ -420,13 +420,18 @@ key_bytes() {
 
 # A cold session is never woken: one keystroke into it writes its whole context back into
 # the cache. Its successor reads it from disk instead. A session on a dialog or asking
-# mid-turn is live, and a shell pane has no session, so both pass.
+# mid-turn is live, and a shell pane has no session, so both pass. One on hold (cc-note)
+# waits for Jacob, warm or not.
 refuse_cold() {
 	local pane=$1 row sid name status seen exp="" now
 	row=$(session_tsv | awk -F'\t' -v p="$pane" -v us=$'\x1f' '
 		$5 == p { print $1 us $2 us $3 us $8; exit }')
 	[[ -n $row ]] || return 0
 	IFS=$'\x1f' read -r sid name status seen <<<"$row"
+	local why
+	if why=$("$HOME/.claude/bin/cc-note" held --for "$sid" 2>/dev/null); then
+		die "$name is on hold ($why): only Jacob wakes it. Ask him (--force types anyway)"
+	fi
 	case $status in idle | errored) ;; *) return 0 ;; esac
 	now=$(date +%s)
 	# No field is ever empty in that file, so IFS=tab is safe here.

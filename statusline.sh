@@ -337,9 +337,11 @@ engine=${model%% (*}
 # tab-as-IFS has nothing to fold.
 note_status=""
 note_progress=""
+note_hold=false
 if [[ -n $session && -r $NOTES ]]; then
 	while IFS=$'\t' read -r n_sid _ n_flags n_prog n_stat; do
 		[[ $n_sid == "$session" ]] || continue
+		[[ ,$n_flags, == *,hold,* ]] && note_hold=true
 		[[ ${n_prog:--} != "-" ]] && note_progress=$n_prog
 		[[ ${n_stat:--} != "-" ]] && note_status=$n_stat
 		break
@@ -434,6 +436,8 @@ add_seg() {
 	seg_w+=("$2")
 }
 add_seg "${IDC_ANSI:-$BLUE}${title}${RESET}" "${#title}"
+# Straight after the title, so it is the last to give way: Jacob wakes it or nobody does
+$note_hold && add_seg "${BADGE_ODD} on hold ${RESET}" 9
 [[ -n $note_progress ]] && add_seg "${YELLOW}${note_progress}${RESET}" "${#note_progress}"
 [[ -n $note_status ]] && add_seg "${YELLOW}▸ ${note_status}${RESET}" $((${#note_status} + 2))
 i_label="" i_acct="" i_branch="" i_engine=""

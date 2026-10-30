@@ -10,6 +10,7 @@ if [[ $OSTYPE == darwin* ]]; then MTIME=(-f %m); else MTIME=(-c %Y); fi
 
 readonly TITLE_CACHE="$HOME/.claude/cache/statusline"
 readonly TITLE_MEMO="$HOME/.claude/cache/titles"
+readonly NOTES="$HOME/.claude/fleet/notes.tsv"
 # A busy transcript moves every turn; without a floor it would rescan on every call.
 readonly TITLE_TTL=60
 
@@ -147,9 +148,15 @@ printf '%s' "$rows" |
 	if $tsv; then
 		cat
 	else
-		awk -F'\t' -v self="${CLAUDE_CODE_SESSION_ID:-}" '
-			BEGIN { print "NAME\tSTATE\tPANE\tDIR\tTITLE" }
+		# On hold (cc-note): no other session may message it, so it says so where names
+		# are picked from
+		awk -F'\t' -v self="${CLAUDE_CODE_SESSION_ID:-}" -v notes="$NOTES" '
+			BEGIN {
+				print "NAME\tSTATE\tPANE\tDIR\tTITLE"
+				while ((getline line < notes) > 0)
+					if (split(line, f, "\t") >= 3 && ("," f[3] ",") ~ /,hold,/) held[f[1]] = 1
+			}
 			{ mark = ($2 == self) ? " ←you" : ""
-			  print $1 mark "\t" $3 "\t" $4 "\t" $5 "\t" $6 }
+			  print $1 mark "\t" $3 (($2 in held) ? ", on hold" : "") "\t" $4 "\t" $5 "\t" $6 }
 		' | column -t -s $'\t'
 	fi

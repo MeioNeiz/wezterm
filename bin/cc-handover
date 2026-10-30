@@ -68,6 +68,8 @@ cc-handover - hand a session's work to a fresh one
 
   --turns N     how many substantive replies to carry (default 3)
   --why <text>  a line saying why the work moved
+  --name <name> with --new: the successor starts a new topic under this name
+                (<repo>-<topic>) instead of taking the source's
   --account <name>  the account --new or --fork runs on (default: the folder's; cc-account)
   --workspace <name>  with --window: where it opens (default: the pane it is from;
                     never "default")
@@ -114,6 +116,7 @@ why=""
 dry=false
 account=""
 workspace=""
+new_name=""
 while (($#)); do
 	case $1 in
 	--new) action=new ;;
@@ -129,6 +132,7 @@ while (($#)); do
 	--window) split="window" ;;
 	--turns) shift; turns=${1:-3} ;;
 	--why) shift; why=${1:-} ;;
+	--name) shift; new_name=${1:-}; [[ -n $new_name ]] || die "--name needs a name" ;;
 	--account) shift; account=${1:-}; [[ -n $account ]] || die "--account needs a name" ;;
 	--workspace) shift; workspace=${1:-}
 		[[ -n $workspace ]] || die "--workspace needs a name" ;;
@@ -544,6 +548,10 @@ if [[ $action == to ]]; then
 	if [[ -n $to_row ]]; then
 		to_sid=$(printf '%s' "$to_row" | cut -f1)
 		to_status=$(printf '%s' "$to_row" | cut -f3)
+		if to_why=$(cc-note held --for "$to_sid" 2>/dev/null); then
+			die "--to: $(printf '%s' "$to_row" | cut -f2) is on hold ($to_why): only Jacob" \
+				"wakes it. Ask him, or use --new for a fresh session"
+		fi
 		cache_note "$to_sid"
 		if [[ $to_status == idle && $CACHE_WARM == cold ]]; then
 			die "--to: pane $pane_to is idle with a cold prompt cache${CACHE_COST:+ \
@@ -649,13 +657,17 @@ new)
 	# then it is <name>-next; ccx types the /rename. A gather's receiver stands for several
 	# sessions, so it keeps a name of its own
 	take_name=""
-	if ! $gather && [[ $name != "${rows[0]%%$'\t'*}" ]]; then
+	if [[ -n $new_name ]]; then
+		spawn+=(--name "$new_name")
+	elif ! $gather && [[ $name != "${rows[0]%%$'\t'*}" ]]; then
 		if [[ $pane != "-" ]]; then
 			take_name=$name
 			spawn+=(--name "$name-next")
 		else
 			spawn+=(--name "$name")
 		fi
+	else
+		spawn+=(--name auto)
 	fi
 	$dry && spawn+=(--dry-run)
 	new=$("${spawn[@]}" -- "$brief") || exit 1
@@ -674,11 +686,15 @@ new)
 	if $gather; then
 		prefill_later "$new"
 		echo "gathered ${#rows[@]} sessions into pane $new; $PREFILL is typed there to close them"
-	elif [[ -s $GATHERED/$new ]]; then
-		[[ -n $take_name ]] && printf '%s\n' "$take_name" >"$GATHERED/$new.name"
+	elif [[ -s $GATHERED/$new && -n $take_name ]]; then
+		printf '%s\n' "$take_name" >"$GATHERED/$new.name"
 		close_later "$new"
 		echo "handed $name over to pane $new as $name-next; $name closes itself once it has \
 stopped and the new session takes its name"
+	elif [[ -s $GATHERED/$new ]]; then
+		close_later "$new"
+		echo "handed $name over to pane $new as ${new_name:-$name}; $name closes itself once it has \
+stopped"
 	else
 		echo "handed $name over to pane $new"
 	fi
