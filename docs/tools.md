@@ -312,12 +312,18 @@ until the source is closed, for up to 30 min. A self-handover is mid-turn until 
 reported, so it goes a few seconds after. Past 30 min it stays, and `!ccx` typed in the
 new session still closes it. A plain `--to` closes nothing (it pastes, unsent).
 
-The new session starts as `<name>-next` and takes the name only once its source has gone:
-ccx types `/rename <name>` into it as the list empties. Handing the name over at once left
-two live sessions sharing it for as long as a background task kept the source open, and
-when that task finished it woke the source, so messages reached either (meiolol-b2,
-2026-10-29). Typed while busy, `/rename` is queued and applied when the turn ends, without
-a turn of its own.
+The new session starts as `<name>-next` and takes the name as soon as it is on the brief,
+however long the source stays open: ccx's first run types `/rename <name>-old` into the
+source (`-old2`.. if taken), waits for the registry to show it, then `/rename <name>` into
+the new session. The order matters: two live sessions sharing a name take each other's
+messages (meiolol-b2, 2026-10-29), and a former name resolves only while no live session
+has it as its current one. Waiting for the close instead left a source that a stuck
+background loop held open for the whole grace taking its successor's messages and having
+to forward them (meiolol-meio-truth, 2026-11-04). `/rename` is an `immediate` command:
+applied at once, mid-turn too, with no turn of its own. ccx types only into an empty input
+box in insert mode, never over a draft or into a dialog, and not into a source that is
+asking or waiting; until both renames have landed, each later ccx tries again, and a
+source that never gave the name up hands it over when it closes.
 
 Enter on it runs **ccx**, which closes each source whose pane still holds the same session
 and is not busy, asking or waiting, and keeps the rest listed for a later `ccx`. One whose
@@ -327,10 +333,13 @@ every task has a listening TCP port somewhere under it, and otherwise 15 min aft
 handover, so a push in flight gets to land. It stops those tasks too: a pane's death does
 not reach them, and they outlive claude as orphans holding memory (7 GB of them on
 2026-10-29). `ccx --tasks <claude pid>` lists them, and the brief carries that list so
-the successor knows what to restart. A source closed by hand still hands over its name,
-but its tasks are left running. It never closes the receiver. Claude answers a bash-mode
-command with a turn of its own, so ccx's one line says what it did and that nothing else
-is needed: without that the session guessed at why a source was kept, wrongly.
+the successor knows what to restart. Until then `cc-fleet --brief` names each source a
+task is holding open, with the task's pid and command (`ccx --held`), so a loop that
+can never end (one that `pgrep -f`s a pattern its own command line matches) shows. A
+source closed by hand still hands over its name, but its tasks are left running. It never
+closes the receiver. Claude answers a bash-mode command with a turn of its own, so ccx's
+one line says what it did and that nothing else is needed: without that the session
+guessed at why a source was kept, wrongly.
 
 ## Kev's three: cc-sort, cc-watch, cc-handovers
 

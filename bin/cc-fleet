@@ -653,6 +653,17 @@ if [[ $mode == brief ]]; then
 	fi
 	[[ -n $jobs_done ]] && printf 'background, finished unread (cc-fleet --job <id>):\n%s' \
 		"$jobs_done"
+	# A handover source that a task keeps open past its turn, with the task: a stuck loop
+	# held one for the whole grace (meiolol-meio-truth, 2026-11-04)
+	for f in "$HOME/.claude/fleet/gathered"/*; do
+		[[ -f $f && $f != *.name ]] || continue
+		held=$("$HOME/.claude/bin/ccx" --held 2>/dev/null)
+		[[ -n $held ]] || break
+		printf 'handed over, held open by a task (ccx closes it at 15m):\n'
+		printf '%s\n' "$held" | awk -F'\t' '{
+			printf "  %s %dm: pid %s %s\n", $1, $2 / 60, $3, substr($4, 1, 70) }'
+		break
+	done
 	if [[ -n $full ]]; then
 		printf 'near full (cc-handover --new):\n'
 		# Two leading spaces make the name field 3 and the percentage field 4.

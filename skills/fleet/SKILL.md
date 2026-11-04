@@ -114,7 +114,9 @@ pane's tab, in wezterm's own left-to-right order, skipping panes holding no sess
 exists because "hand me the rest of this tab" otherwise takes three calls and a join.
 Jacob's key for it is LEADER+G; a gather leaves `!ccx` typed in the receiver, and Enter on
 it closes the sources that have stopped. A plain `--new` closes its source itself, once the
-new session is on the brief and the source has stopped: don't close it yourself.
+new session is on the brief and the source has stopped: don't close it yourself. The
+new session takes the source's name as soon as it is on the brief (the source becomes
+`<name>-old`), so messages to the name reach it, not the source.
 
 **A bare word in a cc-spawn argument list ends the options** and the rest becomes the
 prompt, `--dry-run` included. Flags first; `--name <repo>-<topic>` is required.

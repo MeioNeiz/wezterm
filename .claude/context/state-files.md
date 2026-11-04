@@ -138,7 +138,8 @@ pruned after 8 days.
   epoch is the handover's, for ccx's grace on a `shell` source), written by cc-handover,
   read and pruned by ccx (it keeps what it could not close); reaped with the pane by
   `cc-roster --digest`. Beside it, a plain `--new`'s `<receiver pane>.name`: the
-  source's name, which ccx `/rename`s the receiver to once the list empties
+  source's name, which ccx moves to the receiver once it is busy (source to `-old`
+  first), then deletes; `ccx --held` reads the lists for cc-fleet --brief
 - **`fleet/handover/<name>-<stamp>.md`** cc-handover's briefs, each source's screen
   beside it as `<name>-<stamp>.<source>.scrollback.txt` (cc-handovers globs `*.md`, so
   keep that suffix off it). Reaped by `cc-roster --digest`: screens after 3 days, briefs

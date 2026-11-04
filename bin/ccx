@@ -8,8 +8,11 @@
 # runs (`shell`) closes at once when every task is a server, else past SHELL_GRACE from
 # the handover, so a push in flight can land; its tasks are stopped with it. Transcripts
 # stay on disk.
+# A plain --new's source gives its name up as soon as the receiver is busy, however long
+# it stays open: renamed to <name>-old, then the receiver to <name>.
 #   ccx --tasks <claude pid>   its background tasks: pid, listening ports, command
 #   ccx --descendants <pid>    every process under it, for stopping them with it
+#   ccx --held                 sources a task holds open: name, age, the task (cc-fleet)
 
 set -u
 wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
@@ -58,7 +61,33 @@ tasks() {
 		}'
 }
 
+# One line per handed-over source whose turn is over but a task that is not a server keeps
+# it open until SHELL_GRACE: name, seconds since the handover, pid and command of each
+held() {
+	local f roster now pane sid name at status claude held
+	now=$(date +%s)
+	roster=$(cc-roster 2>/dev/null)
+	for f in "$GATHERED"/*; do
+		[[ -f $f && $f != *.name ]] || continue
+		while IFS=$'\x1f' read -r pane sid name at; do
+			[[ $at =~ ^[0-9]+$ ]] || continue
+			held=""
+			{ IFS= read -r held <"$MAP/$pane"; } 2>/dev/null
+			[[ $held == "$sid" ]] || continue
+			IFS=$'\x1f' read -r name status claude < <(printf '%s\n' "$roster" |
+				awk -F'\t' -v s="$sid" '$1 == s { printf "%s\x1f%s\x1f%s\n", $2, $3, $7; exit }')
+			[[ $status == shell && $claude =~ ^[0-9]+$ ]] || continue
+			tasks "$claude" | awk -F'\t' -v n="$name" -v age=$((now - at)) \
+				'$2 == "-" { printf "%s\t%s\t%s\t%s\n", n, age, $1, $3 }'
+		done < <(awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s\n", $1, $2, $3, $4 }' "$f")
+	done
+}
+
 case ${1:-} in
+--held)
+	held
+	exit 0
+	;;
 --tasks | --descendants)
 	[[ ${2:-} =~ ^[0-9]+$ ]] || { echo "ccx $1 <claude pid>" >&2; exit 2; }
 	"${1#--}" "$2"
@@ -82,6 +111,66 @@ shell_may_close() {
 	t=$(tasks "$claude")
 	[[ -z $t ]] && return 0
 	! printf '%s\n' "$t" | awk -F'\t' '$2 == "-" { f = 1 } END { exit !f }'
+}
+
+# Typed keys land after whatever is in the prompt, and Enter would send the lot; in a
+# dialog they answer it. Only into an empty input box in insert mode: the last line
+# opening with the prompt glyph (then a no-break space), between the box's two rules
+prompt_empty() {
+	wzcli get-text --pane-id "$1" 2>/dev/null | awk -v nbsp=$'\xc2\xa0' '
+		{ l[NR] = $0 }
+		END {
+			for (i = NR; i > 1; i--) if (index(l[i], "❯") == 1) break
+			if (i <= 1) exit 1
+			for (j = i + 1; j <= NR; j++) if (index(l[j], "-- NORMAL --")) exit 1
+			p = substr(l[i], length("❯") + 1)
+			gsub(nbsp, "", p)
+			exit !(p ~ /^[ \t]*$/ && index(l[i - 1], "─") == 1 && index(l[i + 1], "─") == 1)
+		}'
+}
+
+# /rename is an immediate command: applied at once, mid-turn too, with no turn of its own
+type_rename() {
+	wzcli send-text --no-paste --pane-id "$1" -- "/rename $2" &&
+		wzcli send-text --no-paste --pane-id "$1" -- $'\r'
+}
+
+# Into ROW: status and name of a session, from a fresh roster
+ROW_STATUS="" ROW_NAME=""
+row_of() {
+	IFS=$'\x1f' read -r ROW_STATUS ROW_NAME < <(cc-roster 2>/dev/null |
+		awk -F'\t' -v s="$1" '$1 == s { printf "%s\x1f%s\n", $3, $2; exit }')
+}
+
+# A plain --new's name moves as soon as the receiver is on the brief, not when the source
+# closes: a task can hold the source open for SHELL_GRACE, and messages to the name woke
+# it meanwhile (meiolol-meio-truth, 2026-11-04). The source goes to <name>-old first, so
+# the two never share it; a former name resolves only while no live session has it as
+# its current one. Not into a source that is asking or waiting: keys would answer it
+hand_name() {
+	local took=$1 pane sid old n i
+	IFS=$'\x1f' read -r pane sid < <(awk -F'\t' \
+		'NR == 1 { printf "%s\x1f%s\n", $1, $2 }' "$list")
+	row_of "$sid"
+	if [[ $ROW_NAME == "$took" ]]; then
+		[[ $ROW_STATUS == busy || $ROW_STATUS == shell ]] || return 1
+		prompt_empty "$pane" || return 1
+		old=$took-old
+		n=2
+		while printf '%s\n' "$roster" | cut -f2 | grep -Fxq -- "$old"; do
+			old=$took-old$n
+			n=$((n + 1))
+		done
+		type_rename "$pane" "$old" || return 1
+		for ((i = 0; i < 10; i++)); do
+			sleep 0.3
+			row_of "$sid"
+			[[ $ROW_NAME != "$took" ]] && break
+		done
+		[[ $ROW_NAME != "$took" ]] || return 1
+	fi
+	prompt_empty "$me" || return 1
+	type_rename "$me" "$took"
 }
 
 now=$(date +%s)
@@ -128,24 +217,25 @@ done < <(awk -F'\t' '{ printf "%s\x1f%s\x1f%s\x1f%s\n", $1, $2, $3, $4 }' "$list
 
 # what is still working stays listed, so a later ccx closes it once it has stopped
 took=""
+[[ -s $list.name ]] && { IFS= read -r took <"$list.name"; } 2>/dev/null
 if [[ -n $left ]]; then
 	printf '%s' "$left" >"$list"
-else
-	rm -f "$list"
-	# A plain --new's successor runs as <name>-next until its source is gone. Typed while
-	# busy, /rename is queued and applied when the turn ends, with no turn of its own
-	if [[ -s $list.name ]]; then
-		{ IFS= read -r took <"$list.name"; } 2>/dev/null
+	# the name moves now; until it has, a later ccx tries again
+	if [[ -n $took ]] && hand_name "$took"; then
 		rm -f "$list.name"
-		[[ -n $took ]] && wzcli send-text --no-paste --pane-id "$me" -- "/rename $took" &&
-			wzcli send-text --no-paste --pane-id "$me" -- $'\r'
+	else
+		took=""
 	fi
+else
+	rm -f "$list" "$list.name"
+	# its source has gone, or never gave the name up (asking the whole time, closed by hand)
+	[[ -n $took ]] && { type_rename "$me" "$took" || took=""; }
 fi
 took=${took:+; this session is now $took}
 # Claude answers a bash-mode command with a turn of its own, so the line says what it means
 if [[ -n $left ]]; then
-	printf 'ccx closed %d:%s; kept%s, mid-turn: ccx again once stopped. %s\n' \
-		"$nclosed" "${closed:- none}" "$kept" "Nothing else to do"
+	printf 'ccx closed %d:%s; kept%s, mid-turn: ccx again once stopped%s. %s\n' \
+		"$nclosed" "${closed:- none}" "$kept" "$took" "Nothing else to do"
 elif [[ -n $kept ]]; then
 	printf 'ccx closed %d:%s; kept%s%s. Nothing else to do\n' "$nclosed" "${closed:- none}" \
 		"$kept" "$took"
