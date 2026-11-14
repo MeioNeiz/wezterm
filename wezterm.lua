@@ -201,6 +201,8 @@ if is_windows then
 		{ label = "PowerShell", args = shell, domain = { DomainName = "local" } },
 		{ label = "CMD", args = { "cmd.exe" }, domain = { DomainName = "local" } },
 	}
+	-- 0 also overrides the blinking style TUIs like Claude Code request
+	config.cursor_blink_rate = 0
 end
 
 -- ============================================================
@@ -947,6 +949,9 @@ if is_windows then
 		domain = { DomainName = "local" },
 	}) })
 	table.insert(config.keys, { key = "l", mods = "CTRL|SHIFT", action = act.ShowLauncher })
+	-- Kitty keyboard is off, so Shift+Enter would send a bare CR and submit. ESC CR is what
+	-- Claude Code and most TUIs read as a newline
+	table.insert(config.keys, { key = "Enter", mods = "SHIFT", action = act.SendString("\x1b\r") })
 end
 
 -- Resize mode: LEADER r, then hjkl to resize, Esc/Enter to exit
