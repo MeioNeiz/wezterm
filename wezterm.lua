@@ -45,7 +45,10 @@ end
 config.font = wezterm.font_with_fallback({
 	{ family = "JetBrains Mono", weight = "Regular" },
 })
-config.font_size = 14.0
+-- Points are pixels at macOS's 72 dpi but 96 dpi on Windows: the same 14 drew a third
+-- larger on the PC's 1080p monitors. Scaled so both get the Mac's pixel size
+local FONT_SCALE = is_windows and 72 / 96 or 1
+config.font_size = 14.0 * FONT_SCALE
 config.line_height = 1.0
 config.harfbuzz_features = { "calt=1", "liga=1", "clig=1" } -- programming ligatures
 
@@ -78,7 +81,7 @@ config.tab_max_width = 320
 -- Fancy bar draws in window_frame.font, NOT terminal cells; `frame` measures in it. Pinned
 -- so an upgrade cannot move the advances below. Smaller = more chars per tab (per-tab cap
 -- is pixels) but below 12 is unreadable here.
-local FRAME_FONT_SIZE = 12.0
+local FRAME_FONT_SIZE = 12.0 * FONT_SCALE
 config.window_frame = {
 	font = wezterm.font({ family = "Roboto", weight = "Bold" }),
 	font_size = FRAME_FONT_SIZE,
