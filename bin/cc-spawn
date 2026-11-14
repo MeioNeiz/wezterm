@@ -60,8 +60,8 @@ cc-spawn - start a Claude session in a new pane, with a task
   --print-sid        print the new session's id after the pane id, tab-separated
   --name <name>      the session's name (claude --name), required for a fresh session:
                      <repo>-<topic>, e.g. meiolol-crawler. Jacob knows sessions by name
-                     only. Claude lets two live sessions share one, and SendMessage then
-                     reaches whichever is listed first
+                     only. Refused when a live session holds it: Claude would let
+                     them share it, and SendMessage reach whichever is listed first
   --dry-run          print what it would run
 
 Prints the new pane id. The session id is chosen here and passed as --session-id, so it
@@ -245,6 +245,13 @@ if [[ $name == auto ]]; then
 			[[ $taken == *" $base-$hex "* ]] || { name=$base-$hex; break 2; }
 		done
 	done
+fi
+# Claude lets two live sessions share a name and SendMessage then reaches either.
+# cc-handover never asks for a held one: its successor is <name>-next until the source goes
+if [[ -n $name && -z $resume && -z $fork ]]; then
+	holder=$(cc-roster 2>/dev/null | awk -F'\t' -v n="$name" '$2 == n { print $5; exit }')
+	[[ -n $holder ]] && die "--name $name is held by a live session (pane $holder):" \
+		"pick another topic, or hand that one over with cc-handover --new"
 fi
 perm=" --dangerously-skip-permissions"
 $ask && perm=" --permission-mode default"

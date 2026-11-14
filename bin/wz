@@ -66,6 +66,9 @@ driving
                                       both refuse an idle session whose prompt cache is
                                       cold (cc-handover <name> --new); --force types anyway
   wz go <target>                      focus a pane, switching tab and workspace
+  wz rmws <ws>|. [--force]            delete a workspace: closes every pane in it, the
+                                      only way past keeping its last pane as a shell;
+                                      refuses while a session in it works or asks
   wz join <src> <target> [--right|--left|--top|--bottom]
   wz break <target>                   move a pane out to its own tab
   wz reflow [--window <id>]... [--min <cols>] [--dry-run]
@@ -534,6 +537,80 @@ cmd_go() {
 		return
 	fi
 	wzcli activate-pane --pane-id "$pane"
+}
+
+# The one way a workspace goes: every other kill-pane leaves its last pane a shell (wzcli).
+# A GUI window emptied under you closes, and the last one quits wezterm, so the GUI moves
+# to another workspace before anything dies.
+cmd_rmws() {
+	local ws="" force=false toast=false
+	local here="" focused="" other busy mru pane n=0 failed=0 tries=0
+	while (($#)); do
+		case $1 in
+		--force) force=true ;;
+		--toast) toast=true ;;
+		-h | --help) usage; return ;;
+		--) shift; ws=${1:-}; break ;;
+		*) [[ -z $ws ]] || die "rmws: one workspace at a time"; ws=$1 ;;
+		esac
+		shift
+	done
+	# --toast: run from LEADER+X, where nobody reads stderr
+	rmws_fail() {
+		$toast && "$0" notify --quiet "workspace $ws kept" "$*"
+		die "rmws: $*"
+	}
+	[[ -n $ws ]] || die "rmws: need a workspace (. for this one)"
+	load
+	[[ $ws == . ]] && ws=$(scope_ws false)
+	[[ -n $ws ]] || die "rmws: \".\" needs a wezterm pane"
+	printf '%s\n' "$PANES" | awk -F'\t' -v w="$ws" '$1 == w { f = 1 } END { exit !f }' ||
+		rmws_fail "no such workspace"
+
+	busy=$(awk -F'\t' -v w="$ws" '
+		NR == FNR { if ($1 == w) mine[$4] = 1; next }
+		($5 in mine) && ($3 == "busy" || $3 == "asking" || $3 == "waiting") {
+			printf "%s%s (%s)", sep, $2, $3; sep = ", "
+		}' <(printf '%s\n' "$PANES") <(session_tsv))
+	[[ -z $busy ]] || $force || rmws_fail "still working: $busy (--force kills them)"
+
+	# where the GUI goes: the workspace last looked at, else any other
+	mru=$CACHE/wezterm-mru
+	[[ -r $mru ]] || mru=/dev/null
+	other=$(awk -F'\t' -v w="$ws" '
+		NR == FNR { if ($1 != w) live[$1] = 1; next }
+		($0 in live) { print; found = 1; exit }
+		END { if (!found) for (l in live) { print l; exit } }
+	' <(printf '%s\n' "$PANES") "$mru")
+	[[ -n $other ]] || rmws_fail "the only workspace: deleting it would quit wezterm"
+
+	IFS=$'\t' read -r here focused < <(wzcli list-clients --format json 2>/dev/null |
+		jq -r 'min_by(.idle_time.secs) | [.workspace // "-", .focused_pane_id // "-"] | @tsv' \
+			2>/dev/null)
+	if [[ $here == "$ws" ]]; then
+		queue_action workspace "$other"
+		poke_lua "$focused"
+		while [[ $here == "$ws" ]] && ((tries++ < 30)); do
+			sleep 0.1
+			here=$(wzcli list-clients --format json 2>/dev/null |
+				jq -r 'min_by(.idle_time.secs) | .workspace // "-"' 2>/dev/null)
+		done
+		[[ $here != "$ws" ]] || rmws_fail "the window did not move to $other"
+	fi
+
+	while IFS= read -r pane; do
+		if WZCLI_EMPTY_OK=1 wzcli kill-pane --pane-id "$pane" 2>/dev/null; then
+			n=$((n + 1))
+		else
+			failed=$((failed + 1))
+		fi
+	done < <(printf '%s\n' "$PANES" | awk -F'\t' -v w="$ws" '$1 == w { print $4 }')
+	# forget first: else the save files it as closed and LEADER+w offers it back
+	queue_action forget "$ws"
+	# else a restart before the next periodic save brings it back
+	queue_action save
+	((failed == 0)) || rmws_fail "$failed of $((n + failed)) panes would not close"
+	echo "deleted $ws: $n panes"
 }
 
 # split-pane --move-pane-id is join-pane: across tabs and windows; `wz break` undoes it.
@@ -1066,6 +1143,7 @@ toasts) shift; cmd_toasts "$@" ;;
 send) shift; cmd_send "$@" ;;
 key) shift; cmd_key "$@" ;;
 go) shift; cmd_go "$@" ;;
+rmws) shift; cmd_rmws "$@" ;;
 join) shift; cmd_join "$@" ;;
 break) shift; cmd_break "$@" ;;
 reflow) shift; cmd_reflow "$@" ;;

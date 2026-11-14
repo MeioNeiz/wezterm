@@ -31,7 +31,8 @@ refuses a fresh session without `--name <repo>-<topic>` (`meiolol-crawler`), whi
 makes it `user` and sticky; `cc-handover --new --name` gives a successor on a new topic
 its own. A resume or fork keeps Claude's. `--name auto` (a gather's receiver, which
 stands for several) is `<folder>-<2 hex>` that no live session holds, 3 hex if none is
-free; in a worktree it leaves the name to Claude. cc-roster refuses a name two live
+free; in a worktree it leaves the name to Claude. Any other `--name` a live session holds
+is refused, so only Claude's own naming or a `/rename` can still make a pair. cc-roster refuses a name two live
 sessions share, saying which panes, and `cc-fleet --brief` prints `same name, <name> is panes <a> <b>: /rename one`.
 
 Adoption means a resume, a remote attach or a spare claim, and the binary is explicit
@@ -90,6 +91,18 @@ was make it cheap enough to reach for mid-task. The parts worth knowing:
   queue at once instead of on its next 0.1s tick. Only a pane on screen fires that event
   (`dead-ends.md`), which the focused one always is; lost or not, the file still runs once.
   The client is the one with the least `idle_time`, if a second is ever attached.
+- **`rmws` is the only way a workspace is deleted.** A workspace lives while it has a pane,
+  so `wzcli kill-pane` opens a shell before taking a workspace's last pane, and every
+  script kills through it. `rmws` (and LEADER+X, which runs it after a yes) passes
+  `WZCLI_EMPTY_OK=1` to skip that. It refuses while a session there is busy, asking or
+  waiting (`--force`), and refuses the last workspace. On screen, it moves the GUI to the
+  workspace last looked at (`cache/wezterm-mru`) and waits for the switch before killing:
+  a window emptied under you closes, and the last one quits wezterm. Then a `save` action,
+  so a restart before the next periodic save does not resurrect it.
+  A pane closed by hand (CMD+W), a window closed or a shell that exits still takes its
+  workspace with it: none goes through wzcli. The next save files such a workspace as
+  closed and LEADER+w lists it; picking it reopens its last save. `rmws` queues `forget`
+  first so a deleted one is not offered back.
 - **The event log is polled, not pushed.** wezterm has no outbound event stream, and the
   states worth waking up for (busy, asking, idle) are Claude's rather than wezterm's, so
   they would not appear in one if it existed. `wz events --daemon` diffs a five-field
@@ -312,18 +325,22 @@ until the source is closed, for up to 30 min. A self-handover is mid-turn until 
 reported, so it goes a few seconds after. Past 30 min it stays, and `!ccx` typed in the
 new session still closes it. A plain `--to` closes nothing (it pastes, unsent).
 
-The new session starts as `<name>-next` and takes the name as soon as it is on the brief,
-however long the source stays open: ccx's first run types `/rename <name>-old` into the
-source (`-old2`.. if taken), waits for the registry to show it, then `/rename <name>` into
-the new session. The order matters: two live sessions sharing a name take each other's
-messages (meiolol-b2, 2026-10-29), and a former name resolves only while no live session
-has it as its current one. Waiting for the close instead left a source that a stuck
-background loop held open for the whole grace taking its successor's messages and having
-to forward them (meiolol-meio-truth, 2026-11-04). `/rename` is an `immediate` command:
-applied at once, mid-turn too, with no turn of its own. ccx types only into an empty input
-box in insert mode, never over a draft or into a dialog, and not into a source that is
-asking or waiting; until both renames have landed, each later ccx tries again, and a
-source that never gave the name up hands it over when it closes.
+The new session takes the source's name. Before spawning it, cc-handover runs `ccx --give-name`,
+which types `/rename <name>-old` into the source (`-old2`.. if taken) and waits for the
+registry to show it; the new session then starts as `<name>`, so nothing types into its
+pane, where Jacob may already be writing (a `/rename` typed there after his draft failed).
+The order matters: two live sessions sharing a name take each other's messages
+(meiolol-b2, 2026-10-29), and a former name resolves only while no live session has it as
+its current one. `/rename` is an `immediate` command: applied at once, mid-turn too, so a
+self-handover renames itself while running cc-handover. Nothing is typed over a draft or
+into a dialog, nor into a source that is asking or waiting; if the source refuses, the new
+session starts as `<name>-next` (`-next2`.. while an earlier successor holds that) and
+ccx's first run once it is on the brief does both renames, source first, however long the
+source stays open. Waiting for the close instead left a source that a stuck background
+loop held open for the whole grace taking its successor's messages (meiolol-meio-truth,
+2026-11-04). Until both have landed, each later ccx tries again, and a source that never
+gave the name up hands it over when it closes. A source with no pane runs outside wezterm
+and nothing types into it, so its successor keeps `-next`.
 
 Enter on it runs **ccx**, which closes each source whose pane still holds the same session
 and is not busy, asking or waiting, and keeps the rest listed for a later `ccx`. One whose

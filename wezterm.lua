@@ -215,7 +215,6 @@ local painted_dir = wezterm.home_dir .. "/.claude/cache/cc-tint-painted"
 -- written by hooks/wezterm-pane-state.sh
 local pane_state_dir = wezterm.home_dir .. "/.claude/wezterm-state"
 local brief_script = wezterm.home_dir .. "/.claude/hooks/claude-session-brief.py"
-local save_interval_seconds = 120
 local context_dir = wezterm.home_dir .. "/.claude/cache/context"
 -- the prompt cache's life: past it a stopped pane has gone cold, and picking it up pays
 -- for its whole context again. The fallback only: the statusLine's own expiry wins (see
@@ -393,10 +392,106 @@ local function tag_claude_panes(node, live)
 	return title or right or bottom
 end
 
+-- Closing a workspace's last window is not deleting it (wzcli guards the CLI side the same
+-- way): a save that finds a manifest name gone files it here, newest first, and LEADER+w
+-- lists it and reopens its last save. `wz rmws` and a rename take the name out (forget)
+local closed_ws = {
+	path = resurrect.state_manager.save_state_dir .. "closed_workspaces",
+	manifest = resurrect.state_manager.save_state_dir .. "live_workspaces",
+	MAX = 20,
+}
+
+function closed_ws.read_lines(path)
+	local lines = {}
+	local file = io.open(path, "r")
+	if file then
+		for line in file:lines() do
+			line = line:match("^%s*(.-)%s*$")
+			if line ~= "" then
+				table.insert(lines, line)
+			end
+		end
+		file:close()
+	end
+	return lines
+end
+
+function closed_ws.write_lines(path, lines)
+	local file = io.open(path, "w")
+	if file then
+		file:write(table.concat(lines, "\n"))
+		file:close()
+	end
+end
+
+function closed_ws.has_state(name)
+	local file = io.open(resurrect.state_manager.save_state_dir .. "workspace/" .. name .. ".json", "r")
+	if file then
+		file:close()
+	end
+	return file ~= nil
+end
+
+---@param gone string[] prepended, deduped, capped at MAX
+function closed_ws.add(gone)
+	local list, seen = {}, {}
+	for _, list_part in ipairs({ gone, closed_ws.read_lines(closed_ws.path) }) do
+		for _, name in ipairs(list_part) do
+			if not seen[name] and #list < closed_ws.MAX then
+				seen[name] = true
+				table.insert(list, name)
+			end
+		end
+	end
+	closed_ws.write_lines(closed_ws.path, list)
+end
+
+---Off the manifest too, or the next save would file it as closed again
+function closed_ws.forget(name)
+	for _, path in ipairs({ closed_ws.path, closed_ws.manifest }) do
+		local kept = {}
+		for _, line in ipairs(closed_ws.read_lines(path)) do
+			if line ~= name then
+				table.insert(kept, line)
+			end
+		end
+		closed_ws.write_lines(path, kept)
+	end
+end
+
+---Closed and reopenable, newest first. The manifest counts too: a window closed since the
+---last save is not filed yet
+---@param live table name -> true
+function closed_ws.list(live)
+	local names, seen = {}, {}
+	for _, path in ipairs({ closed_ws.path, closed_ws.manifest }) do
+		for _, name in ipairs(closed_ws.read_lines(path)) do
+			if not live[name] and not seen[name] and closed_ws.has_state(name) then
+				seen[name] = true
+				table.insert(names, name)
+			end
+		end
+	end
+	return names
+end
+
 local function save_all_workspaces()
 	local live = live_claude_panes()
 	local saved = 0
 	local live_names = {}
+	local is_live = {}
+	for _, name in ipairs(wezterm.mux.get_workspace_names()) do
+		is_live[name] = true
+	end
+	local gone = {}
+	for _, name in ipairs(closed_ws.read_lines(closed_ws.manifest)) do
+		if not is_live[name] then
+			table.insert(gone, name)
+		end
+	end
+	if #gone > 0 then
+		closed_ws.add(gone)
+	end
 
 	for _, name in ipairs(wezterm.mux.get_workspace_names()) do
 		local state = { workspace = name, window_states = {} }
@@ -430,11 +525,7 @@ local function save_all_workspaces()
 
 	-- manifest decides what comes back: saved states are never deleted, so globbing the
 	-- dir would resurrect every workspace ever
-	local manifest = io.open(resurrect.state_manager.save_state_dir .. "live_workspaces", "w")
-	if manifest then
-		manifest:write(table.concat(live_names, "\n"))
-		manifest:close()
-	end
+	closed_ws.write_lines(closed_ws.manifest, live_names)
 
 	return saved
 end
@@ -551,6 +642,30 @@ local function on_pane_restore(pane_tree)
 	end
 end
 
+---A closed workspace back from its last save, as gui-startup restores one; not switched to
+---@return string|nil cwd of its first pane, for a bare shell when the restore fails
+function closed_ws.restore(name)
+	closed_ws.forget(name)
+	for _, live in ipairs(wezterm.mux.get_workspace_names()) do
+		if live == name then
+			return nil
+		end
+	end
+	local state = resurrect.state_manager.load_state(name, "workspace")
+	local first = state and state.window_states and state.window_states[1]
+	local cwd = first and first.tabs and first.tabs[1] and first.tabs[1].pane_tree.cwd
+	local ok, err = pcall(resurrect.workspace_state.restore_workspace, state, {
+		relative = true,
+		restore_text = true,
+		spawn_in_workspace = true,
+		on_pane_restore = on_pane_restore,
+	})
+	if not ok then
+		wezterm.log_error("resurrect: could not reopen workspace " .. name .. ": " .. tostring(err))
+	end
+	return cwd
+end
+
 local function saved_workspace_names()
 	local on_disk = {}
 	local pattern = resurrect.state_manager.save_state_dir .. "workspace/*.json"
@@ -637,7 +752,7 @@ end)
 -- at the first reload and a crash restored a week-old layout. A new chain bumps GLOBAL
 -- generation, which ends the old one
 local function periodic_save_all(generation)
-	wezterm.time.call_after(save_interval_seconds, function()
+	wezterm.time.call_after(120, function()
 		if wezterm.GLOBAL.save_generation ~= generation then
 			return
 		end
@@ -717,7 +832,9 @@ config.keys = {
 			description = "Rename workspace:",
 			action = wezterm.action_callback(function(window, _, line)
 				if line and line ~= "" then
-					wezterm.mux.rename_workspace(window:active_workspace(), line)
+					local old = window:active_workspace()
+					wezterm.mux.rename_workspace(old, line)
+					closed_ws.forget(old)
 				end
 			end),
 		}),
@@ -1117,6 +1234,12 @@ local function perform_action_line(window, pane, verb, a, b)
 		if late.pick then
 			late.pick(pane)
 		end
+	elseif verb == "save" then
+		pcall(save_all_workspaces)
+	elseif verb == "forget" and a and a ~= "" then
+		closed_ws.forget(a)
+	elseif verb == "reopen" and a and a ~= "" then
+		closed_ws.restore(a)
 	elseif verb == "toast" then
 		-- wz queues this only off macOS, where wezterm's own toast is seen
 		window:toast_notification(a or "wezterm", b or "", nil, 8000)
@@ -3794,9 +3917,18 @@ workspace_picker = function(window, pane)
 		end
 	end
 
+	local live = {}
+	for _, ws in ipairs(order) do
+		live[ws] = true
+	end
+	for _, ws in ipairs(closed_ws.list(live)) do
+		room(ws).closed = true
+	end
+
 	local current = window:active_workspace()
 
-	-- MRU, then unvisited, then current
+	-- MRU, then unvisited, then closed, then current. Closed after live: just closed is
+	-- also just used, and the top entry is the alt-tab one
 	local rank = {}
 	for i, name in ipairs(ws_mru_read()) do
 		if rank[name] == nil then
@@ -3806,6 +3938,9 @@ workspace_picker = function(window, pane)
 	table.sort(order, function(a, b)
 		if (a == current) ~= (b == current) then
 			return b == current -- you are already there
+		end
+		if (rooms[a].closed == true) ~= (rooms[b].closed == true) then
+			return not rooms[a].closed
 		end
 		local ra, rb = rank[a], rank[b]
 		if (ra ~= nil) ~= (rb ~= nil) then
@@ -3821,6 +3956,32 @@ workspace_picker = function(window, pane)
 		end
 		return a < b
 	end)
+
+	-- The matcher (nucleo) scores nothing after a match, so "d5" ties d5, d5sn and d5-sites
+	-- and the list order decides. What it does score is the char before: a space beats any
+	-- other non-word char. So where a name starts with another workspace's name, that space
+	-- becomes U+2800, a blank cell to the eye but non-word to nucleo: the full name wins.
+	-- Branch and topic lose every space the same way, or "Smart Numbers d5-order" ties d5
+	local function unspaced(text)
+		return (text:gsub(" ", "⠀"))
+	end
+
+	local function shown_name(ws)
+		local spaced = " " .. ws:lower()
+		local swap = {}
+		for _, other in ipairs(order) do
+			if #other < #ws then
+				local at = spaced:find(" " .. other:lower(), 1, true)
+				while at do
+					swap[at] = true
+					at = spaced:find(" " .. other:lower(), at + 1, true)
+				end
+			end
+		end
+		return (string.gsub(" " .. ws, "() ", function(at)
+			return swap[at] and "⠀" or nil
+		end))
+	end
 
 	local dirs = workspace_dirs()
 	local git = read_git_snapshot()
@@ -3838,7 +3999,9 @@ workspace_picker = function(window, pane)
 		end
 
 		local detail = r.chats .. (r.chats == 1 and " chat" or " chats")
-		if r.chats == 0 then
+		if r.closed then
+			detail = "closed"
+		elseif r.chats == 0 then
 			detail = r.ended > 0 and "exited" or "empty"
 		end
 
@@ -3846,7 +4009,7 @@ workspace_picker = function(window, pane)
 			{ Foreground = { Color = colour } },
 			{ Text = marker .. " " },
 			{ Foreground = { Color = r.chats > 0 and colour or TAB_COLOURS.stale } },
-			{ Text = (ws == current and "▸ " or "  ") .. ws .. ws_pad(2 + #ws, WS_NAME_W) },
+			{ Text = (ws == current and "▸" or " ") .. shown_name(ws) .. ws_pad(2 + #ws, WS_NAME_W) },
 			{ Foreground = { Color = TAB_COLOURS.index } },
 			{ Text = fleet_pad(detail, WS_COUNT_W) },
 		}
@@ -3873,13 +4036,15 @@ workspace_picker = function(window, pane)
 			end
 		end
 		table.insert(label, { Foreground = { Color = TAB_COLOURS.index } })
-		table.insert(label, { Text = ws_pad(used, WS_STATE_W) .. git_text .. ws_pad(git_w, WS_GIT_W) })
+		table.insert(label, {
+			Text = unspaced(ws_pad(used, WS_STATE_W) .. git_text .. ws_pad(git_w, WS_GIT_W)),
+		})
 
 		-- topic last, so fuzzy matching reaches it
 		if r.topic ~= "" then
 			local cold = r.weight <= NEED.stale
 			table.insert(label, { Foreground = { Color = cold and TAB_COLOURS.stale or TAB_COLOURS.active } })
-			table.insert(label, { Text = r.topic })
+			table.insert(label, { Text = unspaced(r.topic) })
 		end
 
 		table.insert(choices, { id = ws, label = wezterm.format(label) })
@@ -3888,7 +4053,7 @@ workspace_picker = function(window, pane)
 	window:perform_action(
 		act.InputSelector({
 			title = "Workspaces",
-			description = "Alt-tab order. ⚠ blocked · ✓ just finished · ✳ waiting on you · ◐ working · · cold · › exited",
+			description = "Alt-tab order. ⚠ blocked · ✓ just finished · ✳ waiting on you · ◐ working · · cold · › exited · closed reopens its last save",
 			fuzzy = true,
 			fuzzy_description = "workspace: ",
 			choices = choices,
@@ -3897,6 +4062,15 @@ workspace_picker = function(window, pane)
 					return
 				end
 				ws_touch(ws) -- the status bar would catch this a second later; do not wait
+				if rooms[ws] and rooms[ws].closed then
+					local cwd = closed_ws.restore(ws)
+					-- spawn only acts if the restore made nothing: a shell where it was
+					win:perform_action(act.SwitchToWorkspace({
+						name = ws,
+						spawn = cwd and { cwd = cwd } or nil,
+					}), target)
+					return
+				end
 				-- raise its own GUI window; detached or typed names fall through to a switch
 				for _, mux_window in ipairs(wezterm.mux.all_windows()) do
 					if mux_window:get_workspace() == ws then
@@ -3920,6 +4094,44 @@ workspace_picker = function(window, pane)
 	-- on the way out, so the next press is current
 	ws_git_refresh()
 end
+
+-- LEADER+X deletes this workspace, after a yes. `wz rmws` does it: the only kill wzcli
+-- lets empty a workspace, and it moves the window elsewhere first
+fleet_key({
+	key = "X",
+	mods = "LEADER",
+	action = wezterm.action_callback(function(window, pane)
+		local ws = window:active_workspace()
+		local count = 0
+		for _, w in ipairs(wezterm.mux.all_windows()) do
+			if w:get_workspace() == ws then
+				for _, t in ipairs(w:tabs()) do
+					count = count + #t:panes()
+				end
+			end
+		end
+		window:perform_action(
+			act.InputSelector({
+				title = "Delete workspace",
+				description = "Delete " .. ws .. " and close its " .. count
+					.. (count == 1 and " pane?" or " panes?"),
+				choices = { { id = "no", label = "Keep it" }, { id = "yes", label = "Delete " .. ws } },
+				action = wezterm.action_callback(function(_, _, id)
+					if id ~= "yes" then
+						return
+					end
+					wezterm.background_child_process({
+						"/bin/sh", "-c",
+						'PATH="$HOME/.claude/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH" '
+							.. 'exec "$0" rmws --toast -- "$1"',
+						wz_script, ws,
+					})
+				end),
+			}),
+			pane
+		)
+	end),
+})
 
 -- a board in a zoomed tab is hidden; the next press would open a second
 local function tab_is_zoomed(tab)

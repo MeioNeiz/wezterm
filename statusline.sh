@@ -69,7 +69,8 @@ cut_title() {
 draw() {
 	# The right side outranks everything on the left, which gives way first in full: the
 	# metadata, the title down to 8, the notes and badge, then the title itself. Room the
-	# notes leave goes back to the title.
+	# notes leave goes back to the title. The engine goes last of the metadata, and its
+	# model family moves right: which model a pane runs is never out of sight
 	# COLUMNS is the pane's width; Claude indents the line 2 and cuts it 2 short of the edge
 	gap=2
 	fitted=false
@@ -80,6 +81,11 @@ draw() {
 			fits && break
 			seg[i]=""
 		done
+		if [[ -n $i_engine ]] && ! fits; then
+			seg[i_engine]=""
+			right="${meta}${engine_short}${SEP}${RESET}${right}"
+			((right_w += ${#engine_short} + ${#SEP}))
+		fi
 		fits || cut_title 8
 		for ((i = ${#seg[@]} - 1; i > 0; i--)); do
 			fits && break
@@ -146,7 +152,7 @@ IFS=$'\x1f' read -r transcript session dir title ctx_used ctx_size model effort 
 # line to a pane that may have been resized. So the pieces come from the last full render,
 # which runs again when the payload or the notes change, or once LINE_TTL old
 line_cache="$CACHE_DIR/$session.line"
-key="$transcript $dir $title $ctx_used $ctx_size $model $effort $fast $pc_expires $pc_ttl"
+key="v2 $transcript $dir $title $ctx_used $ctx_size $model $effort $fast $pc_expires $pc_ttl"
 key+=" $pc_recache $pc_hit $rl_5h $rl_5h_at $rl_7d $rl_7d_at $rl_spend"
 # Strictly newer than the notes: -nt counts whole seconds, and a note can land in the second
 # a full render wrote the cache
@@ -161,6 +167,8 @@ if [[ -n $session && -r $line_cache && $line_cache -nt $NOTES ]]; then
 		IFS= read -r c_right
 		IFS= read -r c_title
 		IFS= read -r c_title_colour
+		IFS= read -r c_i_engine
+		IFS= read -r c_engine_short
 		while IFS=$'\x1f' read -r w text; do
 			seg+=("$text")
 			seg_w+=("$w")
@@ -168,7 +176,7 @@ if [[ -n $session && -r $line_cache && $line_cache -nt $NOTES ]]; then
 	} <"$line_cache"
 	if [[ $c_key == "$key" && $c_at =~ ^[0-9]+$ ]] && ((${now:-0} - c_at < LINE_TTL)); then
 		right_w=$c_right_w drops=$c_drops meta=$c_meta right=$c_right title=$c_title
-		title_colour=$c_title_colour
+		title_colour=$c_title_colour i_engine=$c_i_engine engine_short=$c_engine_short
 		draw
 		exit 0
 	fi
@@ -323,8 +331,10 @@ if [[ $ctx_used =~ ^[0-9]+$ ]]; then
 		window="${ctx_size:-?}"
 	fi
 	context="${ctx_used}% of ${window}"
-	((ctx_used >= 80)) && context_colour=$RED
-	((ctx_used >= 60 && ctx_used < 80)) && context_colour=$YELLOW
+	# By tokens, at hooks/cc-context-nag.sh's thresholds: hand over soon, then now
+	ctx_k=$((ctx_used * ${ctx_size:-0} / 100000))
+	((ctx_k >= 200)) && context_colour=$RED
+	((ctx_k >= 80 && ctx_k < 200)) && context_colour=$YELLOW
 fi
 
 # Catches a /model or /effort left behind in one pane. The parenthetical is the
@@ -332,6 +342,8 @@ fi
 engine=${model%% (*}
 [[ -n $effort ]] && engine="${engine} ${effort}"
 [[ -n $fast ]] && engine="${engine} ⚡"
+engine_short=${model%% *}
+[[ -n $fast ]] && engine_short="${engine_short} ⚡"
 
 # What this session told itself, out of cc-note. Every field has a "-" placeholder, so
 # tab-as-IFS has nothing to fold.
@@ -473,13 +485,13 @@ if [[ -n $peer ]]; then
 	((right_w += ${#peer} + 1))
 fi
 title_colour=${IDC_ANSI:-$BLUE}
-drops="$i_engine $i_branch $i_label $i_acct"
+drops="$i_branch $i_label $i_acct"
 
 if [[ -n $session ]]; then
 	[[ -d $CACHE_DIR ]] || mkdir -p "$CACHE_DIR" 2>/dev/null
 	{
 		printf '%s\n' "$key" "${now:-0}" "$right_w" "$drops" "$meta" "$right" "$title" \
-			"$title_colour"
+			"$title_colour" "$i_engine" "$engine_short"
 		for i in "${!seg[@]}"; do
 			printf '%s\x1f%s\n' "${seg_w[i]}" "${seg[i]}"
 		done

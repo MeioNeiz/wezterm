@@ -8,11 +8,14 @@
 # runs (`shell`) closes at once when every task is a server, else past SHELL_GRACE from
 # the handover, so a push in flight can land; its tasks are stopped with it. Transcripts
 # stay on disk.
-# A plain --new's source gives its name up as soon as the receiver is busy, however long
-# it stays open: renamed to <name>-old, then the receiver to <name>.
+# A plain --new's source gives its name up before the receiver starts, which then starts
+# as <name>; failing that, ccx moves it as soon as the receiver is busy, however long the
+# source stays open: renamed to <name>-old, then the receiver to <name>.
 #   ccx --tasks <claude pid>   its background tasks: pid, listening ports, command
 #   ccx --descendants <pid>    every process under it, for stopping them with it
 #   ccx --held                 sources a task holds open: name, age, the task (cc-fleet)
+#   ccx --give-name <pane> <sid> <name> [to]  renames that session <name>-old, or TO, and
+#                              prints its new name; cc-handover, before the receiver starts
 
 set -u
 wzcli() { "$HOME/.claude/bin/wzcli" "$@"; } # 5s deadline, --no-auto-start
@@ -83,36 +86,6 @@ held() {
 	done
 }
 
-case ${1:-} in
---held)
-	held
-	exit 0
-	;;
---tasks | --descendants)
-	[[ ${2:-} =~ ^[0-9]+$ ]] || { echo "ccx $1 <claude pid>" >&2; exit 2; }
-	"${1#--}" "$2"
-	exit 0
-	;;
-esac
-
-me=${WEZTERM_PANE:-}
-[[ -n $me ]] || { echo "ccx: not in a wezterm pane"; exit 1; }
-list="$GATHERED/$me"
-[[ -s $list ]] || { echo "ccx: nothing gathered into this pane"; exit 0; }
-
-roster=$(cc-roster 2>/dev/null)
-live=" $(wzcli list --format json 2>/dev/null | jq -r '.[].pane_id' | tr '\n' ' ') "
-
-# A `shell` source may go now: its turn is over and the successor has the brief. Not
-# while a task that is not a server runs, until the grace is up
-shell_may_close() {
-	local claude=$1 at=$2 t
-	(($(date +%s) - at >= SHELL_GRACE)) && return 0
-	t=$(tasks "$claude")
-	[[ -z $t ]] && return 0
-	! printf '%s\n' "$t" | awk -F'\t' '$2 == "-" { f = 1 } END { exit !f }'
-}
-
 # Typed keys land after whatever is in the prompt, and Enter would send the lot; in a
 # dialog they answer it. Only into an empty input box in insert mode: the last line
 # opening with the prompt glyph (then a no-break space), between the box's two rules
@@ -142,32 +115,83 @@ row_of() {
 		awk -F'\t' -v s="$1" '$1 == s { printf "%s\x1f%s\n", $3, $2; exit }')
 }
 
+# Session SID in PANE gives NAME up, to TO or else <name>-old (-old2.. if taken), and
+# prints what it is now once the registry shows it. Not into a session that is asking or
+# waiting: keys would answer it
+give_name() {
+	local pane=$1 sid=$2 took=$3 to=${4:-} n i
+	row_of "$sid"
+	[[ $ROW_NAME == "$took" ]] || return 1
+	[[ $ROW_STATUS == asking || $ROW_STATUS == waiting ]] && return 1
+	prompt_empty "$pane" || return 1
+	if [[ -z $to ]]; then
+		to=$took-old
+		n=2
+		while cc-roster 2>/dev/null | cut -f2 | grep -Fxq -- "$to"; do
+			to=$took-old$n
+			n=$((n + 1))
+		done
+	fi
+	type_rename "$pane" "$to" || return 1
+	for ((i = 0; i < 10; i++)); do
+		sleep 0.3
+		row_of "$sid"
+		[[ $ROW_NAME == "$to" ]] && break
+	done
+	[[ $ROW_NAME == "$to" ]] || return 1
+	printf '%s\n' "$to"
+}
+
+case ${1:-} in
+--give-name)
+	[[ -n ${2:-} && -n ${3:-} && -n ${4:-} ]] ||
+		{ echo "ccx --give-name <pane> <sid> <name> [to]" >&2; exit 2; }
+	give_name "$2" "$3" "$4" "${5:-}"
+	exit
+	;;
+--held)
+	held
+	exit 0
+	;;
+--tasks | --descendants)
+	[[ ${2:-} =~ ^[0-9]+$ ]] || { echo "ccx $1 <claude pid>" >&2; exit 2; }
+	"${1#--}" "$2"
+	exit 0
+	;;
+esac
+
+me=${WEZTERM_PANE:-}
+[[ -n $me ]] || { echo "ccx: not in a wezterm pane"; exit 1; }
+list="$GATHERED/$me"
+[[ -s $list ]] || { echo "ccx: nothing gathered into this pane"; exit 0; }
+
+roster=$(cc-roster 2>/dev/null)
+live=" $(wzcli list --format json 2>/dev/null | jq -r '.[].pane_id' | tr '\n' ' ') "
+
+# A `shell` source may go now: its turn is over and the successor has the brief. Not
+# while a task that is not a server runs, until the grace is up
+shell_may_close() {
+	local claude=$1 at=$2 t
+	(($(date +%s) - at >= SHELL_GRACE)) && return 0
+	t=$(tasks "$claude")
+	[[ -z $t ]] && return 0
+	! printf '%s\n' "$t" | awk -F'\t' '$2 == "-" { f = 1 } END { exit !f }'
+}
+
 # A plain --new's name moves as soon as the receiver is on the brief, not when the source
 # closes: a task can hold the source open for SHELL_GRACE, and messages to the name woke
 # it meanwhile (meiolol-meio-truth, 2026-11-04). The source goes to <name>-old first, so
 # the two never share it; a former name resolves only while no live session has it as
-# its current one. Not into a source that is asking or waiting: keys would answer it
+# its current one. cc-handover does this before spawning when it can, and then nothing
+# is left to move here
 hand_name() {
-	local took=$1 pane sid old n i
+	local took=$1 pane sid
 	IFS=$'\x1f' read -r pane sid < <(awk -F'\t' \
 		'NR == 1 { printf "%s\x1f%s\n", $1, $2 }' "$list")
 	row_of "$sid"
 	if [[ $ROW_NAME == "$took" ]]; then
 		[[ $ROW_STATUS == busy || $ROW_STATUS == shell ]] || return 1
-		prompt_empty "$pane" || return 1
-		old=$took-old
-		n=2
-		while printf '%s\n' "$roster" | cut -f2 | grep -Fxq -- "$old"; do
-			old=$took-old$n
-			n=$((n + 1))
-		done
-		type_rename "$pane" "$old" || return 1
-		for ((i = 0; i < 10; i++)); do
-			sleep 0.3
-			row_of "$sid"
-			[[ $ROW_NAME != "$took" ]] && break
-		done
-		[[ $ROW_NAME != "$took" ]] || return 1
+		give_name "$pane" "$sid" "$took" >/dev/null || return 1
 	fi
 	prompt_empty "$me" || return 1
 	type_rename "$me" "$took"

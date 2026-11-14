@@ -72,6 +72,7 @@ jq --arg home "$HOME" '
 def hook($arg): { type: "command", command: ("\"$HOME/.claude/hooks/wezterm-pane-state.sh\" " + $arg) };
 def limits($arg): { type: "command", command: ("\"$HOME/.claude/hooks/cc-limits.sh\" " + $arg), timeout: 5 };
 def hold($arg): { type: "command", command: ("\"$HOME/.claude/hooks/cc-hold.sh\" " + $arg), timeout: 5 };
+def nag($arg): { type: "command", command: ("\"$HOME/.claude/hooks/cc-context-nag.sh\" " + $arg), timeout: 5 };
 def norm: gsub("\""; "") | sub("^~"; "$HOME") | split($home) | join("$HOME");
 # A list, not an object: one event can want two groups with different matchers
 [
@@ -79,9 +80,10 @@ def norm: gsub("\""; "") | sub("^~"; "$HOME") | split($home) | join("$HOME");
 		{ type: "command", command: "\"$HOME/.claude/hooks/wezterm-session-map.sh\"" },
 		{ type: "command", command: "\"$HOME/.claude/bin/cc-tint\"", timeout: 5 }
 	] } },
-	{ key: "UserPromptSubmit", value: { hooks: [hook("working"), limits("prompt"), hold("prompt")] } },
+	{ key: "UserPromptSubmit", value: { hooks: [hook("working"), limits("prompt"), hold("prompt"), nag("prompt")] } },
 	{ key: "PreToolUse", value: { hooks: [limits("tool")] } },
 	{ key: "PreToolUse", value: { matcher: "SendMessage|Bash", hooks: [hold("tool")] } },
+	{ key: "PostToolUse", value: { hooks: [{ type: "command", command: "\"$HOME/.claude/hooks/cc-context-nag.sh\"", timeout: 5 }] } },
 	{ key: "Notification", value: { matcher: "permission_prompt|push_notification|worker_permission_prompt|model_refusal_fallback|quota_auto_resume_stale|quota_auto_resume_disabled|auth_storage_failure", hooks: [hook("notify")] } },
 	{ key: "Stop", value: { hooks: [hook("done")] } },
 	{ key: "SessionEnd", value: { hooks: [hook("ended")] } },

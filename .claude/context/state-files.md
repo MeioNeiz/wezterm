@@ -81,8 +81,13 @@ pruned after 8 days.
   every render; the rate fields are only its own memo for `cache/rate-limits`. Claude hands these to the
   statusLine and nowhere else: not the registry, and a transcript has tokens but not the
   window to divide by. Readers: cc-board, cc-fleet, cc-handover, wz, wezterm.lua, kev-mcp
-  stop-asks (field 1). Old files have three fields. cc-board can also scrape the visible
-  statusLine, which needs the pane on screen
+  stop-asks (field 1), cc-context-nag (fields 1-2: tokens = pct x window). Old files have
+  three fields. cc-board can also scrape the visible statusLine, which needs the pane on
+  screen
+- **`cache/context-nag/<sid>`** one number, the last threshold (thousands of tokens) the
+  context nag told this session about, so each is said once. cc-context-nag only.
+  `<sid>.typed` epoch of Jacob's last prompt there (its `prompt` mode; 30 min = attended),
+  `<sid>.told` the `.typed` stamp its one attended warning went with
 - **`cache/rate-limits`** `epoch, 5h_pct, 5h_resets, 7d_pct, 7d_resets, spend`, for
   `~/.claude`'s login; **`rate-limits-<name>`** the same for each other account
   (cc-account), the statusLine picking by its `CLAUDE_CONFIG_DIR`. `rate-limits.<pid>` is a
@@ -110,6 +115,9 @@ pruned after 8 days.
   epoch after `left_at`, or marked (LEADER+U), and not the pane he is on. First sight is a
   baseline, never unread. Leaving updates `left_at` only after 2s on the pane
   (`READ_DWELL`): passing through is not reading
+- **`cache/board-tails/tail.<pane>`** `last_line\x1fctx_pct\x1fkey` by `cc-board --tsv`:
+  a pane's screen read, reused while `key` (hook kind, since, sid, geometry) holds and the
+  hook says done or errored. Pruned to live panes on each `--tsv --all`. Reader: cc-board
 - **`cache/kev-pick`** `#<epoch>\tfrom <pane>`, then `n, pane, score, why, name`: LEADER+t's
   ranking of every pane, yours included. Written by the `pick` action and every 2s while
   `cache/cc-toast/` has a slot; cc-toast orders its stack by `score`
@@ -121,10 +129,17 @@ pruned after 8 days.
   space-separated, rewritten when a pill opens. The slot is an id; the stack is ordered by
   the pane's kev-pick score, else rank, newer first on a tie. Past five the last in that
   order goes, non-sticky first
+- **resurrect `state/live_workspaces`, `state/closed_workspaces`** (in the plugin's dir
+  under `~/Library/Application Support/wezterm/plugins/`) one name a line. The manifest is
+  what gui-startup restores, rewritten each save; a name on it that a save finds gone is
+  prepended to the closed list (max 20), which LEADER+w offers back. `state/workspace/
+  <ws>.json` is never deleted, so the files decide what returns, not the dir
 - **`fleet/actions.d/`** the shell -> Lua queue, one file per action, written aside and
   renamed in; Lua drains by name every 0.1s. `jump\t<pane>` is a toast click, run
   in-process like LEADER+t; `goto` is wz go; `tabbeside\t<new pane>\t<anchor pane>` is
-  cc-spawn's, moving a new tab right of the anchor's. The old single `fleet/actions` file
+  cc-spawn's, moving a new tab right of the anchor's; `save` is `wz rmws`'s, rewriting the
+  resurrect manifest at once, after `forget\t<ws>` takes it off the manifest and the closed
+  list; `reopen\t<ws>` restores a closed one without switching to it. The old single `fleet/actions` file
   still drains
 - **`fleet/notes.tsv`** cc-note: `sid, at, flags, progress, status`, one line per annotated
   session. Read by the statusLine, cc-fleet and the tab bar. `fleet/todo/<sid>`,
@@ -137,8 +152,9 @@ pruned after 8 days.
 - **`fleet/gathered/<receiver pane>`** `pane\tsid\tname\tepoch` per source of a gather (the
   epoch is the handover's, for ccx's grace on a `shell` source), written by cc-handover,
   read and pruned by ccx (it keeps what it could not close); reaped with the pane by
-  `cc-roster --digest`. Beside it, a plain `--new`'s `<receiver pane>.name`: the
-  source's name, which ccx moves to the receiver once it is busy (source to `-old`
+  `cc-roster --digest`. Beside it, a plain `--new`'s `<receiver pane>.name`, only when
+  cc-handover could not move the name before spawning: the source's name, which ccx
+  moves to the receiver once it is busy (source to `-old`
   first), then deletes; `ccx --held` reads the lists for cc-fleet --brief
 - **`fleet/handover/<name>-<stamp>.md`** cc-handover's briefs, each source's screen
   beside it as `<name>-<stamp>.<source>.scrollback.txt` (cc-handovers globs `*.md`, so
@@ -153,7 +169,7 @@ pruned after 8 days.
   of `sl` means the statusLine wrote it from `session_name` and it needs no transcript read.
   `cache/fleet-rows` cc-fleet's rows, 8s. `cache/jobs-seen/<id>`, `cache/job-rows`
 - **`cache/statusline/<sid>.line`** the statusLine's own: the payload key, epoch, then the
-  line's pieces before fitting. A 2s refreshInterval render with the same payload only
+  line's pieces before fitting (key starts `v2`; bump it when the layout changes). A 2s refreshInterval render with the same payload only
   refits them to `$COLUMNS`; 30s old or older than `fleet/notes.tsv` renders in full.
   `cache/statusline/<sid>` alone is its whole-transcript title scan
 - **`~/.cache/kev/cc-sort-pairs.json`** cc-sort's p(same topic) per pair, a day;

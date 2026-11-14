@@ -8,7 +8,8 @@ PATH="$PATH:/opt/homebrew/bin:/Applications/WezTerm.app/Contents/MacOS"
 
 # A workspace lives only while it has a pane, and Jacob always wants his kept: before
 # killing a workspace's last pane, open a shell tab in its window. No shell, no kill.
-if [[ ${1:-} == kill-pane ]]; then
+# WZCLI_EMPTY_OK=1 is `wz rmws` alone: deleting a workspace on purpose.
+if [[ ${1:-} == kill-pane && ${WZCLI_EMPTY_OK:-} != 1 ]]; then
 	pane=${WEZTERM_PANE:-}
 	args=("$@")
 	for ((i = 1; i < ${#args[@]}; i++)); do

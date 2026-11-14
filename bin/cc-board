@@ -22,6 +22,8 @@ readonly PANE_MAP="$HOME/.claude/wezterm-sessions"
 readonly PANE_STATE="$HOME/.claude/wezterm-state"
 # What you have read, kept by wezterm.lua: see "unread" there.
 readonly PANE_READ="$HOME/.claude/cache/pane-read"
+# --tsv's pane tails, kept between runs: each picker would otherwise re-read every screen
+readonly TAIL_CACHE="$HOME/.claude/cache/board-tails"
 readonly US=$'\x1f'
 # Cold is the prompt cache expiring; STALE_SECS only when there is no registry clock.
 readonly STALE_SECS=$((8 * 3600))
@@ -175,6 +177,7 @@ while (($#)); do
 done
 
 work=$(mktemp -d) || exit 1
+tails=$work
 # Only undone if done: --tsv must not end its output with an alt-screen restore.
 ALTSCREEN=false
 CURSOR_HIDDEN=false
@@ -259,7 +262,7 @@ is_chrome() {
 }
 
 read_pane() {
-	local pane=$1 text ctx line last=""
+	local pane=$1 key=$2 text ctx line last=""
 	text=$(wzcli get-text --pane-id "$pane" 2>/dev/null)
 	while IFS= read -r line; do
 		strip_leaders "$line"
@@ -272,7 +275,9 @@ read_pane() {
 	ctx=$(printf '%s\n' "$text" | grep -o '[0-9]\+% of [0-9]\+[kM]' | tail -1)
 	# "30% of 1M" -> "30"
 	ctx=${ctx%% *}
-	printf '%s%s%s\n' "$last" "$US" "${ctx%\%}" >"$work/tail.$pane"
+	# Written whole then moved: two --tsv runs can share $TAIL_CACHE
+	printf '%s%s%s%s%s\n' "$last" "$US" "${ctx%\%}" "$US" "$key" >"$tails/.tail.$pane.$$"
+	mv -f "$tails/.tail.$pane.$$" "$tails/tail.$pane"
 }
 
 # ---------------------------------------------------------------- the model
@@ -607,12 +612,12 @@ run_tails() {
 		[[ $p == "-" ]] && continue
 		key="${E_HKIND[i]},${E_SINCE[i]},${E_ID[i]},${E_GEOM[i]:-}"
 		k="tk_$p"
-		if ! $full && [[ ${!k:-} == "$key" && -e $work/tail.$p ]]; then
+		if ! $full && [[ ${!k:-} == "$key" && -e $tails/tail.$p ]]; then
 			case ${E_HKIND[i]} in done | errored) continue ;; esac
 		fi
 		printf -v "$k" '%s' "$key"
-		rm -f "$work/tail.$p"
-		read_pane "$p" &
+		rm -f "$tails/tail.$p"
+		read_pane "$p" "$key" &
 		pids[${#pids[@]}]=$!
 	done
 	# Only these: a bare wait would also block on a background roster fetch.
@@ -641,8 +646,8 @@ ctx_from_cache() {
 merge_tails() {
 	local i last pct
 	for ((i = 0; i < ${#E_PANE[@]}; i++)); do
-		[[ -r "$work/tail.${E_PANE[i]}" ]] || continue
-		IFS="$US" read -r last pct <"$work/tail.${E_PANE[i]}"
+		[[ -r "$tails/tail.${E_PANE[i]}" ]] || continue
+		IFS="$US" read -r last pct _ <"$tails/tail.${E_PANE[i]}"
 		# Never prompted: whatever is on screen is the startup banner.
 		[[ ${E_IDLE[i]} == "-1" ]] && last=""
 		E_LAST[i]=$last
@@ -2037,10 +2042,36 @@ load_all() {
 	refresh_git
 }
 
+# A done or errored pane's cached tail stands until its run_tails key moves. No
+# TAIL_MAX_AGE here: a picker opened minutes apart would re-read every time. What that
+# misses is a local slash command's output on a finished pane, until its next turn.
+tsv_tails() {
+	local f p key _l _c
+	mkdir -p "$TAIL_CACHE" || return 0
+	tails=$TAIL_CACHE
+	TAILS_FULL_AT=$SECONDS
+	for f in "$TAIL_CACHE"/tail.*; do
+		[[ -e $f ]] || continue
+		p=${f##*/tail.}
+		IFS="$US" read -r _l _c key <"$f" && printf -v "tk_$p" '%s' "$key"
+	done
+}
+tsv_prune() {
+	local f p ix
+	for f in "$TAIL_CACHE"/tail.*; do
+		[[ -e $f ]] || continue
+		p=${f##*/tail.}
+		ix="ix_$p"
+		[[ -n ${!ix:-} ]] || rm -f "$f"
+	done
+}
+
 # The roster plus what only a pane read gives: asks, context and closing line.
 if [[ $mode == tsv ]]; then
 	measure
+	tsv_tails
 	load_all
+	$all && tsv_prune
 	for ((i = 0; i < ${#E_PANE[@]}; i++)); do
 		# No name yet (still in its grace period), and the pickers key on the name.
 		[[ -n ${E_NAME[i]} ]] || continue

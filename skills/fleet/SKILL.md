@@ -35,10 +35,13 @@ only for a field it does not carry, and prefer `--tsv` to `--json` when you do.
 | what was handed over yesterday | `cc-handovers` (`-d 0` today) | ~1-2k |
 | what a background job ended with | `cc-fleet --job <id>` | the job's last output |
 
-`cc-fleet --brief` also names any session past 60% of its context window, fullest first
-(`cc-handover --new` is what to do about it), the idle sessions whose prompt cache has gone
+`cc-fleet --brief` also names any session past 200k tokens of context, fullest first
+(`cc-handover --new` is what to do about it; hooks/cc-context-nag.sh tells the session
+itself from 80k), the idle sessions whose prompt cache has gone
 cold with what resuming them would re-read, and background jobs (`claude --bg`, no pane)
-that have finished unseen; `cc-fleet --job <id>` shows what one ended with.
+that have finished unseen; `cc-fleet --job <id>` shows what one ended with. It lists
+servers no session, pane or launchd job owns, up over an hour and with no outside client
+(dev servers a closed session left behind). Tell Jacob; kill one only on his say-so.
 
 **"Catch me up on what they were doing" is `cc-handover`, not a pane read.** The brief is
 about half the size of both screens and carries the last prompt, queued messages, branch,
@@ -115,11 +118,12 @@ exists because "hand me the rest of this tab" otherwise takes three calls and a 
 Jacob's key for it is LEADER+G; a gather leaves `!ccx` typed in the receiver, and Enter on
 it closes the sources that have stopped. A plain `--new` closes its source itself, once the
 new session is on the brief and the source has stopped: don't close it yourself. The
-new session takes the source's name as soon as it is on the brief (the source becomes
-`<name>-old`), so messages to the name reach it, not the source.
+new session starts with the source's name (the source becomes `<name>-old` first), so
+messages to the name reach it, not the source; if the source had a draft in its box, it
+starts as `<name>-next` and takes the name once it is on the brief.
 
 **A bare word in a cc-spawn argument list ends the options** and the rest becomes the
-prompt, `--dry-run` included. Flags first; `--name <repo>-<topic>` is required.
+prompt, `--dry-run` included. Flags first; `--name <repo>-<topic>` is required, and refused while a live session holds it.
 
 Nothing is lost: closing a pane keeps the transcript, which is all a successor reads, and
 a warm session can still be resumed. Ask before closing it.

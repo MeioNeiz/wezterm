@@ -653,25 +653,42 @@ new)
 	[[ -n $account ]] && spawn+=(--account "$account")
 	[[ -n $workspace ]] && spawn+=(--workspace "$workspace")
 	# The successor takes the name, so messages addressed to it still land. Two live
-	# sessions sharing a name take each other's messages, so it starts as <name>-next, and
-	# once it is busy on the brief ccx renames the source <name>-old and then it <name>,
-	# however long a task holds the source open. A gather's receiver stands for several
-	# sessions, so it keeps a name of its own
+	# sessions sharing a name take each other's messages, so the source is renamed
+	# <name>-old first and the successor starts as <name>: nothing then types into its
+	# pane, where Jacob may already be writing. When the source cannot be typed into
+	# (a draft in its box, asking or waiting) the successor starts as <name>-next (-next2..
+	# while an earlier successor holds that) and once it is busy on the brief ccx renames
+	# the source <name>-old and then it <name>, however long a task holds the source open.
+	# A source with no pane is live outside wezterm and nothing types into it, so its
+	# successor stays -next. A gather's receiver stands for several sessions, so it keeps
+	# a name of its own
 	take_name=""
+	succ_name=""
+	gave=""
+	src_sid=${rows[0]%%$'\t'*}
 	if [[ -n $new_name ]]; then
-		spawn+=(--name "$new_name")
-	elif ! $gather && [[ $name != "${rows[0]%%$'\t'*}" ]]; then
-		if [[ $pane != "-" ]]; then
-			take_name=$name
-			spawn+=(--name "$name-next")
-		else
-			spawn+=(--name "$name")
+		succ_name=$new_name
+	elif ! $gather && [[ $name != "$src_sid" ]]; then
+		if [[ $pane != "-" ]] && ! $dry; then
+			gave=$(ccx --give-name "$pane" "$src_sid" "$name" 2>/dev/null) && succ_name=$name
 		fi
-	else
-		spawn+=(--name auto)
+		if [[ -z $succ_name ]]; then
+			live=$(cc-roster 2>/dev/null | cut -f2)
+			succ_name=$name-next
+			n=2
+			while printf '%s\n' "$live" | grep -Fxq -- "$succ_name"; do
+				succ_name=$name-next$n
+				n=$((n + 1))
+			done
+			[[ $pane != "-" ]] && take_name=$name
+		fi
 	fi
+	spawn+=(--name "${succ_name:-auto}")
 	$dry && spawn+=(--dry-run)
-	new=$("${spawn[@]}" -- "$brief") || exit 1
+	if ! new=$("${spawn[@]}" -- "$brief"); then
+		[[ -n $gave ]] && ccx --give-name "$pane" "$src_sid" "$gave" "$name" >/dev/null
+		exit 1
+	fi
 	new_sid=""
 	if ! $dry && [[ $new == *$'\t'* ]]; then
 		new_sid=${new#*$'\t'}
@@ -682,7 +699,10 @@ new)
 		printf 'brief: %s\n' "$file"
 		exit 0
 	fi
-	[[ -n $new ]] || die "could not open a pane for the handover"
+	if [[ -z $new ]]; then
+		[[ -n $gave ]] && ccx --give-name "$pane" "$src_sid" "$gave" "$name" >/dev/null
+		die "could not open a pane for the handover"
+	fi
 	write_gathered "$new"
 	if $gather; then
 		prefill_later "$new"
@@ -690,14 +710,18 @@ new)
 	elif [[ -s $GATHERED/$new && -n $take_name ]]; then
 		printf '%s\n' "$take_name" >"$GATHERED/$new.name"
 		close_later "$new"
-		echo "handed $name over to pane $new as $name-next, which takes the name once it is \
+		echo "handed $name over to pane $new as $succ_name, which takes the name once it is \
 on the brief ($name becomes $name-old); $name closes itself once it has stopped"
+	elif [[ -s $GATHERED/$new && -n $gave ]]; then
+		close_later "$new"
+		echo "handed $name over to pane $new, which has the name; $name is now $gave and \
+closes itself once it has stopped"
 	elif [[ -s $GATHERED/$new ]]; then
 		close_later "$new"
-		echo "handed $name over to pane $new as ${new_name:-$name}; $name closes itself once it has \
+		echo "handed $name over to pane $new as $succ_name; $name closes itself once it has \
 stopped"
 	else
-		echo "handed $name over to pane $new"
+		echo "handed $name over to pane $new${succ_name:+ as $succ_name}"
 	fi
 	echo "brief: $file"
 	;;

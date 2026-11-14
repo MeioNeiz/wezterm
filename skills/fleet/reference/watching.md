@@ -41,9 +41,10 @@ there. No read state: what has been seen lives in the tab bar's unread mark, not
 wz go <name>                    # focus a session, switching tab and workspace
 wz join <src> <target> --right  # move src beside target, across tabs and windows
 wz break <name>                 # move a pane out to its own tab
+wz rmws <workspace>             # delete a workspace and every pane in it
 
 wezterm cli activate-pane --pane-id N
-wezterm cli kill-pane --pane-id N
+wzcli kill-pane --pane-id N     # never bare wezterm cli: wzcli keeps a workspace's last pane
 wezterm cli adjust-pane-size --pane-id N --amount 10 Left
 wezterm cli set-tab-title --tab-id N "cutover"
 wezterm cli zoom-pane --pane-id N [--unzoom]

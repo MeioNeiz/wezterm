@@ -28,9 +28,10 @@ readonly CTX_DIR="$HOME/.claude/cache/context"
 readonly PANE_STATE="$HOME/.claude/wezterm-state"
 # What you have read, kept by wezterm.lua: see "unread" there.
 readonly PANE_READ="$HOME/.claude/cache/pane-read"
-# Past this handing a session over is a live option; past FULL it is overdue.
-readonly CTX_WARN=60
-readonly CTX_FULL=80
+# Thousands of tokens used, not %: past WARN handing a session over is overdue, past FULL
+# badly (hooks/cc-context-nag.sh FIRM and HARD; its SOFT 80k would flag nearly every row)
+readonly CTX_WARN=200
+readonly CTX_FULL=250
 # The prompt cache's life, from statusUpdatedAt, when the statusLine has not recorded the
 # real expiry (it drops to 5m in overage). Must match cc-board and wezterm.lua.
 readonly PROMPT_CACHE_TTL=3600
@@ -240,6 +241,100 @@ job_unread() {
 job_running() {
 	case $1 in running | working | starting | busy | queued) return 0 ;; esac
 	return 1
+}
+
+# Servers nothing owns any more: a TCP listener working under $HOME or a session
+# scratchpad, no claude, wezterm pane or launchd job above it, up over an hour, and no
+# client from outside its own process tree (an open browser tab counts as use). A session
+# that closes leaves its dev servers running: 4 Nov, 9 GB of them, one 36h old. One line
+# per tree, oldest first: its root pid (kill stops the tree), age, folder, listener, ports.
+ownerless_servers() {
+	command -v lsof >/dev/null || return 0
+	local uid tcp pids cwds jobs=""
+	uid=$(id -u)
+	# Each socket is an n line followed by its TST= state line
+	tcp=$(lsof -nP -a -iTCP -sTCP:LISTEN,ESTABLISHED -u "$uid" -FpnT 2>/dev/null)
+	pids=$(printf '%s\n' "$tcp" | awk '
+		/^p/ { p = substr($0, 2) }
+		$0 == "TST=LISTEN" && !(p in s) { s[p] = 1; printf "%s%s", c, p; c = "," }')
+	[[ -n $pids ]] || return 0
+	cwds=$(lsof -a -p "$pids" -d cwd -Fpn 2>/dev/null)
+	command -v launchctl >/dev/null &&
+		jobs=$(launchctl list 2>/dev/null | awk 'NR > 1 && $1 != "-" { print $1 }')
+	ps -Ao pid=,ppid=,etime=,comm= |
+		OS_TCP=$tcp OS_CWD=$cwds OS_JOBS=$jobs awk -v home="$HOME" -v uid="$uid" '
+		function base(c) { sub(/.*\//, "", c); return c }
+		function secs(e,   d, n, t) {
+			d = 0
+			if (e ~ /-/) { d = e; sub(/-.*/, "", d); sub(/^[^-]*-/, "", e) }
+			n = split(e, t, ":")
+			return d * 86400 + (n == 3 ? t[1] * 3600 + t[2] * 60 + t[3] : t[1] * 60 + t[2])
+		}
+		function owned(q) {
+			return base(cm[q]) == "claude" || cm[q] ~ /wezterm-gui/ || (q in job)
+		}
+		# The top of the tree below launchd (or a systemd --user on Linux); empty when
+		# anything on the way up owns it.
+		function root(p,   q) {
+			q = p
+			while (q in pp && pp[q] > 1 && base(cm[pp[q]]) != "systemd") {
+				if (owned(q)) return ""
+				q = pp[q]
+			}
+			return owned(q) ? "" : q
+		}
+		function lines(v, t,   n, i, p, x) {
+			n = split(ENVIRON[v], t, "\n")
+			for (i = 1; i <= n; i++) {
+				if (t[i] ~ /^p/) p = substr(t[i], 2)
+				else if (t[i] ~ /^n/) {
+					x = substr(t[i], 2)
+					if (v == "OS_CWD") cwd[p] = x
+				} else if (t[i] == "TST=LISTEN") listening(p, port(x))
+				else if (t[i] == "TST=ESTABLISHED") sock[x] = p
+			}
+		}
+		function port(s) { sub(/.*:/, "", s); return s }
+		function listening(p, q) {
+			if ((p, q) in lp) return
+			lp[p, q] = 1
+			lis[p] = 1
+			ports[p] = ports[p] (ports[p] == "" ? ":" : ",") q
+		}
+		{
+			c = $0
+			sub(/^ *[0-9]+ +[0-9]+ +[^ ]+ +/, "", c)
+			pp[$1] = $2; et[$1] = $3; cm[$1] = c
+		}
+		END {
+			n = split(ENVIRON["OS_JOBS"], t, "\n")
+			for (i = 1; i <= n; i++) job[t[i]] = 1
+			lines("OS_TCP", t); lines("OS_CWD", t)
+			for (s in sock) {
+				p = sock[s]
+				if (!(p in lis) || split(s, e, "->") != 2 || !((p, port(e[1])) in lp)) continue
+				r = root(p)
+				peer = e[2] "->" e[1]
+				if (!(peer in sock) || root(sock[peer]) != r) used[r] = 1
+			}
+			for (p in lis) {
+				r = root(p)
+				if (r == "" || (r in used) || (r in out)) continue
+				d = cwd[p]
+				if (index(d, home "/") != 1 && d !~ "^(/private)?/tmp/claude-" uid "/") continue
+				if (secs(et[r]) < 3600) continue
+				sub("^" home, "~", d)
+				# a scratchpad as the first 8 of its session id
+				if (sub("^(/private)?/tmp/claude-" uid "/[^/]*/", "", d)) {
+					i = index(d "/scratchpad", "/scratchpad")
+					d = "scratchpad of " substr(d, 1, 8) substr(d, i + 11)
+				}
+				a = secs(et[r])
+				age = a < 172800 ? int(a / 3600) "h" : int(a / 86400) "d"
+				out[r] = a "\t  " r "  " age "  " d "  " base(cm[p]) " " ports[p]
+			}
+			for (r in out) print out[r]
+		}' | sort -t$'\t' -k1,1nr | cut -f2-
 }
 
 if [[ -n $job_id ]]; then
@@ -457,6 +552,16 @@ is_warm() {
 	((rank >= 3))
 }
 
+# Into CTX_K: thousands of tokens in the session's context; empty when unknown.
+CTX_K=""
+ctx_k() {
+	local key=${1//-/_} k p w
+	CTX_K=""
+	k="cx_$key"; p=${!k:-}
+	k="cw_$key"; w=${!k:-}
+	[[ $p =~ ^[0-9]+$ && $w =~ ^[0-9]+$ ]] && CTX_K=$((p * w / 100000))
+}
+
 # Into COST: tokens a cold resume writes back. The statusLine's own figure when it gave
 # one, else used_pct of the window; empty when neither is known.
 COST=""
@@ -600,9 +705,8 @@ if [[ $mode == brief ]]; then
 		key="nn_${nm//[^A-Za-z0-9]/_}"
 		[[ -z ${!key:-} ]] && nn_keys="$nn_keys $key" && printf -v "n$key" '%s' "$nm"
 		printf -v "$key" '%s' "${!key:-}${!key:+ }$u_pane"
-		key="cx_${sid//-/_}"
-		pct=${!key:-}
-		[[ -n $pct ]] && ((pct >= CTX_WARN)) && full="$full  $nm $pct%"$'\n'
+		ctx_k "$sid"
+		[[ -n $CTX_K ]] && ((CTX_K >= CTX_WARN)) && full="$full  $nm ${CTX_K}k"$'\n'
 		[[ $kind == idle ]] || continue
 		if ! is_warm "$sid" "$rk"; then
 			resume_cost "$sid"
@@ -664,6 +768,8 @@ if [[ $mode == brief ]]; then
 			printf "  %s %dm: pid %s %s\n", $1, $2 / 60, $3, substr($4, 1, 70) }'
 		break
 	done
+	orphans=$(ownerless_servers)
+	[[ -n $orphans ]] && printf 'servers no session or pane owns (kill <pid>):\n%s\n' "$orphans"
 	if [[ -n $full ]]; then
 		printf 'near full (cc-handover --new):\n'
 		# Two leading spaces make the name field 3 and the percentage field 4.
@@ -840,12 +946,12 @@ while IFS="$US" read -r _ _ ws n wants old rank _ _ _ pane name kind detail idle
 	fi
 	[[ ,$flags, == *,hold,* ]] && label="on hold"
 	[[ $prog != "-" ]] && label="$label $prog"
-	# Fullness only once it is worth acting on; below that it crowds the state.
-	ckey="cx_$key"
-	cpct=${!ckey:-}
-	if [[ -n $cpct ]] && ((cpct >= CTX_WARN)); then
-		label="$label ${cpct}%"
-		((cpct >= CTX_FULL)) && colour=$MAUVE
+	# Fullness only once it is worth acting on; below that it crowds the state. A cold
+	# label already gives the size.
+	ctx_k "$key"
+	if [[ -n $CTX_K ]] && ((CTX_K >= CTX_WARN)); then
+		[[ $label == cold* ]] || label="$label ${CTX_K}k"
+		((CTX_K >= CTX_FULL)) && colour=$MAUVE
 	fi
 	case ",$flags," in
 	*,mute,*) glyph="◌" ;;
