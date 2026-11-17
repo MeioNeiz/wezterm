@@ -15,7 +15,7 @@ readonly CLEAN_ENV=(env
 	-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID
 	-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_MESSAGING_SOCKET
 	-u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_EXECPATH
-	-u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT
+	-u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT -u CC_SPAWN_PROMPT
 	TERM_PROGRAM=kitty FORCE_HYPERLINK=1)
 # Narrowest a Claude pane split beside another may be; wz's REFLOW_MIN is the same number
 readonly MIN_COLS=90
@@ -318,6 +318,8 @@ else
 	else
 		cmd=("${CLEAN_ENV[@]}")
 	fi
+	# cc-context-nag: the first prompt is this one, not Jacob typing
+	[[ -n $prompt ]] && cmd+=(CC_SPAWN_PROMPT=1)
 	cmd+=(claude)
 	# with no mode named, Claude starts in auto mode, which is not prompts on
 	if $ask; then cmd+=(--permission-mode default); else cmd+=(--dangerously-skip-permissions); fi

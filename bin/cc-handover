@@ -24,6 +24,12 @@ readonly PREFILL_TRIES=120
 # session still closes it
 readonly CLOSE_POLL=2
 readonly CLOSE_TRIES=900
+# --keep: the source closes once Jacob has not typed in it for this long (cc-context-nag's
+# ATTENDED, its <sid>.typed), polled every KEEP_POLL for up to KEEP_TRIES
+readonly KEEP_IDLE=600
+readonly KEEP_POLL=30
+readonly KEEP_TRIES=1440
+readonly TYPED="$HOME/.claude/cache/context-nag"
 # ccx's: how long a source whose turn is over waits on a background task that is not a
 # server (a push in flight) before it is stopped too
 readonly SHELL_GRACE=900
@@ -53,6 +59,9 @@ cc-handover - hand a session's work to a fresh one
                                      open a fresh session, seeded with it; the source
                                      closes once the new one is on the brief and it
                                      has stopped
+  cc-handover [T] --new --keep       the source stays open while Jacob types in it, and
+                                     closes 10 min after he last did (!ccx in the new
+                                     one closes it sooner)
   cc-handover [T] --new --in <pane>  open it split from that pane, in that pane's tab
   cc-handover [T] --to <pane>        paste the brief into a session already open
   cc-handover .tab --to <pane>       gather: send it, then type !ccx there (unsent) to
@@ -114,6 +123,7 @@ in_pane=""
 turns=3
 why=""
 dry=false
+keep=false
 account=""
 workspace=""
 new_name=""
@@ -122,6 +132,7 @@ while (($#)); do
 	--new) action=new ;;
 	--fork) action=fork ;;
 	--dry-run) dry=true ;;
+	--keep) keep=true ;;
 	--save) action=save ;;
 	--to) shift; to=${1:-}; action=to; [[ -n $to ]] || die "--to needs a pane" ;;
 	--in) shift; in_pane=${1:-}; [[ $in_pane =~ ^[0-9]+$ ]] || die "--in needs a pane id" ;;
@@ -425,6 +436,27 @@ task_outputs() {
 	done
 }
 
+# Detached: close_later, but only once Jacob has left the source alone for KEEP_IDLE
+keep_later() {
+	local receiver=$1 sid typed
+	(
+		for ((i = 0; i < PREFILL_TRIES; i++)); do
+			receiver_busy "$receiver" && break
+			sleep "$PREFILL_POLL"
+		done
+		for ((i = 0; i < KEEP_TRIES; i++)); do
+			[[ -s $GATHERED/$receiver ]] || exit 0
+			sid=$(cut -f2 "$GATHERED/$receiver" | head -1)
+			typed=0
+			[[ -r $TYPED/$sid.typed ]] && read -r typed <"$TYPED/$sid.typed"
+			[[ $typed =~ ^[0-9]+$ ]] || typed=0
+			(($(date +%s) - typed >= KEEP_IDLE)) && WEZTERM_PANE=$receiver ccx
+			sleep "$KEEP_POLL"
+		done
+	) </dev/null >/dev/null 2>&1 &
+	disown 2>/dev/null
+}
+
 # --- the brief ------------------------------------------------------------------------
 
 ((${#targets[@]})) || targets=(.)
@@ -704,11 +736,15 @@ new)
 		die "could not open a pane for the handover"
 	fi
 	write_gathered "$new"
-	if $gather; then
+	[[ -s $GATHERED/$new && -n $take_name ]] && printf '%s\n' "$take_name" >"$GATHERED/$new.name"
+	if $keep && [[ -s $GATHERED/$new ]]; then
+		keep_later "$new"
+		echo "handed $name over to pane $new as ${succ_name:-auto}; $name stays open while \
+Jacob uses it and closes 10 min after he last typed there"
+	elif $gather; then
 		prefill_later "$new"
 		echo "gathered ${#rows[@]} sessions into pane $new; $PREFILL is typed there to close them"
 	elif [[ -s $GATHERED/$new && -n $take_name ]]; then
-		printf '%s\n' "$take_name" >"$GATHERED/$new.name"
 		close_later "$new"
 		echo "handed $name over to pane $new as $succ_name, which takes the name once it is \
 on the brief ($name becomes $name-old); $name closes itself once it has stopped"

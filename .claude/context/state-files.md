@@ -86,8 +86,9 @@ pruned after 8 days.
   screen
 - **`cache/context-nag/<sid>`** one number, the last threshold (thousands of tokens) the
   context nag told this session about, so each is said once. cc-context-nag only.
-  `<sid>.typed` epoch of Jacob's last prompt there (its `prompt` mode; 30 min = attended),
-  `<sid>.told` the `.typed` stamp its one attended warning went with
+  `<sid>.typed` epoch of Jacob's last prompt there (its `prompt` mode; 10 min = attended,
+  hand over with `--keep`); 0 after a cc-spawn prompt (CC_SPAWN_PROMPT), which is not his.
+  Also read by cc-handover --keep, which closes the source 10 min after it
 - **`cache/rate-limits`** `epoch, 5h_pct, 5h_resets, 7d_pct, 7d_resets, spend`, for
   `~/.claude`'s login; **`rate-limits-<name>`** the same for each other account
   (cc-account), the statusLine picking by its `CLAUDE_CONFIG_DIR`. `rate-limits.<pid>` is a

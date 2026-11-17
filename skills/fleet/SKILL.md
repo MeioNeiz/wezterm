@@ -37,7 +37,7 @@ only for a field it does not carry, and prefer `--tsv` to `--json` when you do.
 
 `cc-fleet --brief` also names any session past 200k tokens of context, fullest first
 (`cc-handover --new` is what to do about it; hooks/cc-context-nag.sh tells the session
-itself from 80k), the idle sessions whose prompt cache has gone
+itself from 150k), the idle sessions whose prompt cache has gone
 cold with what resuming them would re-read, and background jobs (`claude --bg`, no pane)
 that have finished unseen; `cc-fleet --job <id>` shows what one ended with. It lists
 servers no session, pane or launchd job owns, up over an hour and with no outside client
@@ -80,6 +80,7 @@ what he asked, what he said mid-turn, the branch, the open files and the session
 ```bash
 cc-handover --new                  # fresh session in a pane to the right, seeded
 cc-handover --new --tab            # also --window, --down
+cc-handover --new --keep           # source stays open while Jacob types in it, closes 10 min after
 cc-handover d5-lca-48 --new --in 12     # split from pane 12, landing in that pane's tab
 cc-handover d5-lca-48 --new        # a different session
 cc-handover d5-lca-08 d5-lca-65 --new   # two sessions' work continuing as one
