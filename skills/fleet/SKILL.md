@@ -80,7 +80,8 @@ what he asked, what he said mid-turn, the branch, the open files and the session
 ```bash
 cc-handover --new                  # fresh session in a pane to the right, seeded
 cc-handover --new --tab            # also --window, --down
-cc-handover --new --keep           # source stays open while Jacob types in it, closes 10 min after
+cc-handover --new --keep           # source stays open while Jacob types in it, closes 10 min after;
+                                   # only when handing over unasked: when he asks, plain --new
 cc-handover d5-lca-48 --new --in 12     # split from pane 12, landing in that pane's tab
 cc-handover d5-lca-48 --new        # a different session
 cc-handover d5-lca-08 d5-lca-65 --new   # two sessions' work continuing as one

@@ -2932,9 +2932,10 @@ late.jump = fleet_jump
 
 -- Hand this pane's work over, choosing where it lands: beside this pane, a new tab, a new
 -- pane in any other tab (the work often moves to the tab where that topic lives), or pasted
--- into an idle session. cc-handover builds the brief from the transcript and cc-note; the
--- old pane stays for you to close. Handovers were typed prompts, ~5 a day, and donors went
--- at a median 332k after 80 calls above 300k (jevlab round 7). Tabs are ordered by title
+-- into an idle session. cc-handover builds the brief from the transcript and cc-note; a
+-- new session replaces the old pane, which closes once it has stopped (a paste leaves it).
+-- Handovers were typed prompts, ~5 a day, and donors went at a median 332k after 80 calls
+-- above 300k (jevlab round 7). Tabs are ordered by title
 -- words shared with this session, this workspace first. Kev ranking (cc-sort --rank) was
 -- taken out on 2026-10-01: every LEADER+H paid its 1 s wait, and in handover-dest.jsonl no
 -- pick ever went to a Kev-ranked tab. Every pick is logged there with the ranking it saw.

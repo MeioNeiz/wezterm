@@ -123,7 +123,7 @@ mkdir -p "$state" 2>/dev/null
 at="Context at ${k}k ($pct%)"
 how="cc-handover --new"
 $attended && how="cc-handover --new --keep (Jacob is using this session, so it stays open \
-while he uses it)"
+while he uses it; if he asks for the handover himself, plain --new)"
 echo "$level" >"$state/$sid"
 
 if ((level == SOFT)); then
