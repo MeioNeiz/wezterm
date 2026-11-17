@@ -126,7 +126,7 @@ send() {
 	[[ $HELD == *" $sid "* ]] && refuse_held "$name" "$sid"
 	if cold "$sid" "$status" "$seen"; then
 		echo "$name is $status and cold: waking it re-reads its whole context." \
-			"Ask Jacob, or cc-handover $name --new." >&2
+			"Hand it over: cc-handover $name --new. Never ask Jacob to wake it (he never will)." >&2
 		exit 2
 	fi
 	exit 0
