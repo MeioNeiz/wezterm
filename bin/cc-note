@@ -53,7 +53,7 @@ acts on the calling session, which is free: no lookup, no roster.
   cc-note status 'waiting on the staging deploy'
   cc-note progress 3 7
   cc-note status --for d5-lca-48 'blocked on the DNS change'
-  cc-note hold --for meiolol-d2 'gpu-box off all weekend'
+  cc-note hold --for meiolol-d2 'jompc off all weekend'
   cc-note list --json
 USAGE
 }

@@ -76,7 +76,7 @@ EXAMPLES = [  # (want, command, new output)
     (True, "npm run dev", "  VITE v5.0.0  ready in 412 ms\n  ➜  Local:   http://localhost:5173/"),
     (True, "python train.py", "Traceback (most recent call last):\n  File \"train.py\", line "
                               "88\nRuntimeError: CUDA out of memory\n$ "),
-    (True, "ssh gpu-box", "Password: "),
+    (True, "ssh jompc", "Password: "),
     (False, "tail -f app.log", "INFO GET /health 200 2ms\nINFO GET /health 200 1ms\nINFO GET "
                                "/api/items 200 14ms"),
     (False, "npm install", "added 12 packages, and audited 400 packages in 3s\n⠙ reify: timing"),

@@ -37,6 +37,9 @@ cc-spawn - start a Claude session in a new pane, with a task
                      workspace (outside wezterm: --workspace, never "default")
   --workspace <name> a new tab in that workspace's window; a new window only when the
                      workspace has none, so it is made if it does not exist
+  --workspace auto   the workspace of --cwd's repo: one named after the folder, else the
+                     one with most panes in it, else a new one named after the folder.
+                     Resolving to this pane's own workspace splits beside it as usual
   --shell            a plain shell rather than Claude, for a pane to watch things in
   --ask              leave permission prompts on (default: bypassed)
   --effort <level>   low | medium | high | xhigh | max (default: settings, xhigh). Pick it
@@ -82,6 +85,29 @@ USAGE
 die() {
 	echo "cc-spawn: $*" >&2
 	exit 1
+}
+
+# --workspace auto: "<workspace>\t<panes in the repo>", empty when none fits. A name match
+# beats a pane count (auto-topup-texts held more d5-core panes than core did), and a
+# workspace mostly about something else never counts, or one stray pane would draw the next
+repo_workspace() {
+	local root base
+	root=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || root=$1
+	root=${root%%/.claude/worktrees/*}
+	root=${root%/}
+	base=${root##*/}
+	wzcli list --format json 2>/dev/null | jq -r --arg root "$root" --arg a "$base" \
+		--arg b "${base#*-}" '
+		map(select(.workspace != "default") | {ws: .workspace,
+			cwd: ((.cwd // "") | sub("^file://[^/]*"; "") | sub("/$"; ""))})
+		| group_by(.ws)
+		| map({ws: .[0].ws, all: length,
+			n: map(select(.cwd == $root or (.cwd | startswith($root + "/")))) | length,
+			named: ((.[0].ws | ascii_downcase | gsub(" "; "-")) as $w
+				| $w == ($a | ascii_downcase) or $w == ($b | ascii_downcase))})
+		| map(select(.named or (.n > 0 and .n * 2 >= .all)))
+		| sort_by([(if .named then 0 else 1 end), -(.n / .all), -.n]) | .[0] // empty
+		| "\(.ws)\t\(.n)"' 2>/dev/null
 }
 
 cwd=""
@@ -179,6 +205,30 @@ if [[ -z $cwd ]]; then
 	[[ -n $cwd ]] || cwd=$PWD
 fi
 [[ -d $cwd ]] || die "no such directory: $cwd"
+
+if [[ $workspace == auto ]]; then
+	found=$(repo_workspace "$cwd")
+	own=""
+	[[ -n $pane ]] && own=$(wzcli list --format json 2>/dev/null | jq -r --arg p "$pane" \
+		'.[] | select(.pane_id == ($p | tonumber)) | .workspace // empty' 2>/dev/null)
+	if [[ -n $found ]]; then
+		workspace=${found%%$'\t'*}
+		echo "cc-spawn: workspace $workspace, with ${found##*$'\t'} pane(s) in that repo" >&2
+	else
+		workspace=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || workspace=$cwd
+		workspace=${workspace%%/.claude/worktrees/*}
+		workspace=${workspace%/}
+		workspace=${workspace##*/}
+		echo "cc-spawn: no workspace has $workspace open; a new one named $workspace" >&2
+	fi
+	if [[ -n $own && $workspace == "$own" ]]; then
+		workspace=""
+		where="--right"
+		split_x=false
+		$shell || $squeeze || split_x=true
+		[[ -n $listing ]] || listing=$(wzcli list --format json 2>/dev/null)
+	fi
+fi
 
 # A split halves the pane, less a column for the divider. A floor in columns, not a share
 # of the tab: the big monitor (429) fits four across, the laptop (211) two.

@@ -268,6 +268,12 @@ Two things that are not obvious and cost a while to find:
   `wezterm cli` cannot move a tab, so cc-spawn queues `tabbeside` for the GUI's
   `MoveTab`. Only the workspace on screen has a GUI window: off screen, the move waits in
   `wezterm.GLOBAL.tab_beside` until that workspace is shown. `--workspace` is exempt.
+- **`--workspace auto` finds the repo's workspace.** Sessions passed their own workspace
+  by name, so work for d5-core and d5-lca opened as tabs in `d5` (2026-11-16). Resolved
+  from the repo root (a worktree counts as its repo): a workspace named after the folder,
+  with or without its first `-` segment (`core` for d5-core); else the one with the largest
+  share of its panes in the repo, at least half, so one stray pane does not draw the next;
+  else a new workspace named after the folder. The caller's own workspace splits beside.
 - **every spawned session starts with `--dangerously-skip-permissions`**, which is how
   every agent here is run. A pane that stopped to ask does show as `asking` on the board,
   so it is not invisible, it is just wall clock nobody is spending. `--ask` opts one out.

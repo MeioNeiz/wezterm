@@ -137,12 +137,18 @@ cc-spawn --name api-auth-guard 'read src/auth.ts and list every path that skips 
 cc-spawn --name api-flaky-test --tab --cwd ~/work/api 'run the failing test and say why'
 cc-spawn --shell                   # a plain pane to watch something in
 cc-spawn --workspace api --cwd ~/work/api '...'   # a tab in that workspace's window
+cc-spawn --workspace auto --cwd ~/work/api '...'  # the workspace that repo lives in
 cc-spawn --ask '...'               # leave permission prompts on
 cc-spawn --worktree=auth-guard '...'    # its own checkout, its own branch
 cc-spawn --dry-run '...'
 cc-spawn --effort low 'verify the email draft at ... against docs/...'
 cc-spawn --account personal '...'  # the other claude.ai login (default: the folder's)
 ```
+
+**Work in another repo goes in that repo's workspace: `--workspace auto`**, never a
+workspace name guessed or copied from your own. It picks the one named after the folder,
+else the one mostly in that repo, else makes one named after the folder, and says which on
+stderr; your own workspace resolves to a split beside you.
 
 **Two accounts, chosen by folder.** `~/.claude/accounts` maps folders to a claude.ai
 login (cc-account); a session keeps the one it started on and its statusLine names it.
@@ -200,7 +206,7 @@ cc-note status 'waiting on the staging deploy'   # shows on its statusLine and c
 cc-note progress 3 7
 cc-note log '...'           # log --tail 20
 cc-note mute                # stop it counting towards "wants you elsewhere"
-cc-note hold 'gpu-box off till Mon'    # waiting off-machine: only Jacob wakes it
+cc-note hold 'jompc off till Mon'    # waiting off-machine: only Jacob wakes it
 cc-note show --for d5-lca-48
 cc-note list --json
 ```
